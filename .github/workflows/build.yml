@@ -1,0 +1,114 @@
+# Автоматическая сборка DryerCalc на настоящей Windows (GitHub Actions).
+#  * каждый push в main и каждый pull request: тесты → DryerCalc.exe + установщик → самопроверка exe →
+#    файлы в «Artifacts» прогона (вкладка Actions → прогон → Artifacts, хранятся 30 дней);
+#  * тег vX.Y.Z (например v0.6.0): то же плюс GitHub Release с exe, установщиком и инструкцией.
+name: Сборка DryerCalc
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # нужен только для создания релиза по тегу
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Тесты, exe, установщик (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Зависимости (точные версии)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Тесты
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python tests/test_model.py
+          python tests/test_features.py
+
+      - name: Версия из app/__init__.py
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path app/__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$v") {
+            throw "Тег ${{ github.ref_name }} не совпадает с версией программы v$v (app/__init__.py)"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Сборка exe (один файл) и папки для установщика
+        run: |
+          pyinstaller --noconfirm --clean DryerCalc.spec
+          pyinstaller --noconfirm DryerCalc_dir.spec
+
+      - name: Самопроверка собранного exe
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $report = Join-Path $PWD "dist\selftest.txt"
+          $p = Start-Process -FilePath "dist\DryerCalc.exe" -ArgumentList "--selftest", "`"$report`"" -Wait -PassThru
+          Get-Content $report -Encoding utf8
+          if ($p.ExitCode -ne 0 -or -not (Select-String -Path $report -Pattern "RESULT: OK" -Quiet)) {
+            throw "Самопроверка exe не прошла (код $($p.ExitCode))"
+          }
+
+      - name: Установщик (NSIS)
+        shell: pwsh
+        run: |
+          python tools/make_manual.py dist
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y --no-progress
+            $env:Path += ";${env:ProgramFiles(x86)}\NSIS"
+          }
+          makensis /DVERSION=${{ steps.ver.outputs.version }} installer.nsi
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Файлы прогона
+        uses: actions/upload-artifact@v4
+        with:
+          name: DryerCalc-${{ steps.ver.outputs.version }}-build${{ github.run_number }}
+          path: |
+            dist/DryerCalc.exe
+            dist/DryerCalc_Setup.exe
+            dist/Инструкция DryerCalc.txt
+            dist/selftest.txt
+            dist/selftest_*.png
+          retention-days: 30
+
+      - name: Релиз (только по тегу vX.Y.Z)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: DryerCalc ${{ steps.ver.outputs.version }}
+          body: |
+            DryerCalc ${{ steps.ver.outputs.version }} — собрано и проверено автоматически на Windows.
+            * DryerCalc_Setup.exe — установщик (ярлыки, быстрый запуск, права администратора не нужны);
+            * DryerCalc.exe — переносная версия одним файлом;
+            * «Инструкция DryerCalc.txt» — инструкция для пользователя.
+            Данные прежних версий сохраняются (%APPDATA%\DryerCalc).
+          files: |
+            dist/DryerCalc.exe
+            dist/DryerCalc_Setup.exe
+            dist/Инструкция DryerCalc.txt

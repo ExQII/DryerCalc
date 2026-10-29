@@ -1,0 +1,20 @@
+# сборка
+build/
+dist/
+*.spec.bak
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# данные и отчёты самопроверки (база пользователя не хранится в репозитории)
+*.db
+*.db.tmp
+selftest*.txt
+selftest*.png
+error.log
+# редакторы и ОС
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

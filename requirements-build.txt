@@ -1,0 +1,8 @@
+# Точные версии, с которыми собирается и проверяется DryerCalc (build_exe.bat и GitHub Actions).
+# Для запуска из исходников хватает requirements.txt.
+PySide6-Essentials==6.9.3
+shiboken6==6.9.3
+openpyxl==3.1.5
+et_xmlfile==2.0.0
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
