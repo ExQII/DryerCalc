@@ -1,7 +1,7 @@
 # Автоматическая сборка DryerCalc на настоящей Windows (GitHub Actions).
 #  * каждый push в main и каждый pull request: тесты → DryerCalc.exe + установщик → самопроверка exe →
 #    файлы в «Artifacts» прогона (вкладка Actions → прогон → Artifacts, хранятся 30 дней);
-#  * тег vX.Y.Z (например v0.6.0) или ручной запуск (Actions → «Сборка DryerCalc» → Run workflow) с галочкой
+#  * тег vX.Y.Z (например v0.6.1) или ручной запуск (Actions → «Сборка DryerCalc» → Run workflow) с галочкой
 #    «Выпустить релиз»: то же плюс GitHub Release v<версия> с exe, установщиком и инструкцией
 #    (при ручном запуске тег v<версия> создаётся автоматически на собранном коммите).
 name: Сборка DryerCalc
@@ -100,6 +100,7 @@ jobs:
             dist/DryerCalc.exe
             dist/DryerCalc_Setup.exe
             dist/Инструкция DryerCalc.txt
+            dist/Правила работы DryerCalc.txt
             dist/selftest.txt
             dist/selftest_*.png
           retention-days: 30
@@ -115,9 +116,11 @@ jobs:
             DryerCalc ${{ steps.ver.outputs.version }} — собрано и проверено автоматически на Windows.
             * DryerCalc_Setup.exe — установщик (ярлыки, быстрый запуск, права администратора не нужны);
             * DryerCalc.exe — переносная версия одним файлом;
-            * «Инструкция DryerCalc.txt» — инструкция для пользователя.
+            * «Инструкция DryerCalc.txt» — инструкция для пользователя (где какая кнопка);
+            * «Правила работы DryerCalc.txt» — как правильно вести журнал и работать с программой.
             Данные прежних версий сохраняются (%APPDATA%\DryerCalc).
           files: |
             dist/DryerCalc.exe
             dist/DryerCalc_Setup.exe
             dist/Инструкция DryerCalc.txt
+            dist/Правила работы DryerCalc.txt

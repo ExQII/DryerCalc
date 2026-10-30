@@ -1,4 +1,4 @@
-"""Вкладка «Справка»: инструкция для пользователя и техническое описание (интернет не нужен)."""
+"""Вкладка «Справка»: инструкция, правила работы и техническое описание (интернет не нужен)."""
 from __future__ import annotations
 
 import shutil
@@ -10,7 +10,13 @@ from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPla
 from .resources import resource_path
 
 MANUAL = "docs/manual_ru.txt"
+RULES = "docs/rules_ru.txt"
 README = "README.md"
+
+# (файл в программе, подвкладка, имя файла при сохранении, фильтр)
+DOCS = ((MANUAL, "Инструкция для пользователя", "Инструкция DryerCalc.txt", "Текст (*.txt)"),
+        (RULES, "Как правильно работать", "Правила работы DryerCalc.txt", "Текст (*.txt)"),
+        (README, "Для инженера (как устроены модели)", "DryerCalc — техническое описание.md", "Markdown (*.md)"))
 
 
 class HelpTab(QWidget):
@@ -20,38 +26,40 @@ class HelpTab(QWidget):
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Найти:"))
         self.find = QLineEdit()
-        self.find.setPlaceholderText("слово из инструкции, например «рециркуляция» — Enter: следующее")
+        self.find.setPlaceholderText("слово из текста, например «рециркуляция» — Enter: следующее")
         self.find.returnPressed.connect(self._find_next)
         bar.addWidget(self.find, 1)
         b = QPushButton("Найти далее")
         b.clicked.connect(self._find_next)
         bar.addWidget(b)
-        b = QPushButton("Сохранить инструкцию в файл…")
-        b.clicked.connect(lambda: self._save(MANUAL, "Инструкция DryerCalc.txt", "Текст (*.txt)"))
-        bar.addWidget(b)
-        b = QPushButton("Сохранить техническое описание…")
-        b.clicked.connect(lambda: self._save(README, "DryerCalc — техническое описание.md", "Markdown (*.md)"))
+        b = QPushButton("Сохранить в файл…")
+        b.setToolTip("Сохранить открытый документ (например, на флешку или чтобы распечатать)")
+        b.clicked.connect(self._save_current)
         bar.addWidget(b)
         lay.addLayout(bar)
         self.tabs = QTabWidget()
-        self.manual = QPlainTextEdit()
-        self.manual.setReadOnly(True)
         mono = QFont("Consolas")
         mono.setStyleHint(QFont.Monospace)
         mono.setPointSize(10)
-        self.manual.setFont(mono)
-        self.tabs.addTab(self.manual, "Инструкция для пользователя")
+        self.manual = QPlainTextEdit()
+        self.rules = QPlainTextEdit()
+        for w in (self.manual, self.rules):
+            w.setReadOnly(True)
+            w.setFont(mono)
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(False)
-        self.tabs.addTab(self.view, "Для инженера (как устроены модели)")
+        self.widgets = (self.manual, self.rules, self.view)
+        for w, (_, title, _, _) in zip(self.widgets, DOCS):
+            self.tabs.addTab(w, title)
         lay.addWidget(self.tabs, 1)
         self._loaded = False
 
     def on_show(self) -> None:
         if self._loaded:
             return
-        src = resource_path(MANUAL)
-        self.manual.setPlainText(src.read_text(encoding="utf-8-sig") if src.exists() else "Файл инструкции не найден.")
+        for w, (rel, _, _, _) in zip((self.manual, self.rules), DOCS):
+            src = resource_path(rel)
+            w.setPlainText(src.read_text(encoding="utf-8-sig") if src.exists() else f"Файл {rel} не найден.")
         src = resource_path(README)
         if src.exists():
             self.view.setMarkdown(src.read_text(encoding="utf-8"))
@@ -63,12 +71,16 @@ class HelpTab(QWidget):
         text = self.find.text().strip()
         if not text:
             return
-        w = self.manual if self.tabs.currentIndex() == 0 else self.view
+        w = self.widgets[self.tabs.currentIndex()]
         if not w.find(text):
             cur = w.textCursor()
             cur.movePosition(cur.MoveOperation.Start)
             w.setTextCursor(cur)
             w.find(text)
+
+    def _save_current(self) -> None:
+        rel, _, name, flt = DOCS[self.tabs.currentIndex()]
+        self._save(rel, name, flt)
 
     def _save(self, rel: str, name: str, flt: str) -> None:
         src = resource_path(rel)

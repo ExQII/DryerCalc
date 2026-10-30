@@ -22,7 +22,7 @@ a = Analysis(
     ["run.py"],
     pathex=[],
     binaries=[],
-    datas=[("examples/journal_sample_oct2026.csv", "examples"), ("assets/dryer.png", "assets"), ("README.md", "."), ("docs/manual_ru.txt", "docs")],
+    datas=[("examples/journal_sample_oct2026.csv", "examples"), ("assets/dryer.png", "assets"), ("README.md", "."), ("docs/manual_ru.txt", "docs"), ("docs/rules_ru.txt", "docs")],
     hiddenimports=[],
     hookspath=[],
     runtime_hooks=[],

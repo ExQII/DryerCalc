@@ -16,7 +16,7 @@ RequestExecutionLevel user
 !define APPNAME "DryerCalc"
 !define APPTITLE "DryerCalc — расчёт сушки кукурузы"
 !ifndef VERSION
-  !define VERSION "0.6.0"
+  !define VERSION "0.6.1"
 !endif
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
 
@@ -55,10 +55,12 @@ Section "DryerCalc" SecMain
   SetOutPath "$INSTDIR"
   File /r "dist\DryerCalc\*"
   File "/oname=Инструкция DryerCalc.txt" "dist\Инструкция DryerCalc.txt"
+  File "/oname=Правила работы DryerCalc.txt" "dist\Правила работы DryerCalc.txt"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   CreateDirectory "$SMPROGRAMS\DryerCalc"
   CreateShortcut "$SMPROGRAMS\DryerCalc\DryerCalc.lnk" "$INSTDIR\DryerCalc.exe" "" "$INSTDIR\DryerCalc.exe" 0
   CreateShortcut "$SMPROGRAMS\DryerCalc\Инструкция DryerCalc.lnk" "$INSTDIR\Инструкция DryerCalc.txt"
+  CreateShortcut "$SMPROGRAMS\DryerCalc\Правила работы DryerCalc.lnk" "$INSTDIR\Правила работы DryerCalc.txt"
   CreateShortcut "$SMPROGRAMS\DryerCalc\Удалить DryerCalc.lnk" "$INSTDIR\uninstall.exe"
   CreateShortcut "$DESKTOP\DryerCalc.lnk" "$INSTDIR\DryerCalc.exe" "" "$INSTDIR\DryerCalc.exe" 0
   WriteRegStr HKCU "Software\${APPNAME}" "InstallDir" "$INSTDIR"

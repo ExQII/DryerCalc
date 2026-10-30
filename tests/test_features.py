@@ -534,6 +534,51 @@ def test_operator_mode_shows_only_shift_tabs():
     win.close()
 
 
+
+# ---------------------------------------------------------------------------
+# «Правила работы» (docs/rules_ru.txt): то, что там написано о разборе журнала, должно оставаться правдой.
+# Если тест упал после изменения программы — обновите разделы 4–8, 10 и 20 правил.
+# ---------------------------------------------------------------------------
+
+def _jr(ts, wi=None, wo=None, d=35, note=""):
+    return {"ts": "25.10.26 " + ts, "w_in": wi, "w_out": wo, "t_a1": 29 if wi else None, "t_a2": 33 if wi else None,
+            "t_up": 60, "t_low": 55, "d": d, "note": note, "batch": "К-07", "pass_no": 1, "t_amb": None, "rh": None}
+
+
+def test_rules_doc_journal_claims_hold():
+    from app.calibration import prepare
+    from app.reminders import drying_active
+    base = [_jr("08:00", note="Запуск"), _jr("08:30", 32.4, 30.8), _jr("09:00", 32.1, 30.3)]
+    segs = lambda rows: [r["seg"] for r in prepare(rows)[0]]  # noqa: E731
+    flags = lambda rows, k: [bool(r[k]) for r in prepare(rows)[0]]  # noqa: E731
+    # слова-ловушки (раздел 5.3)
+    assert flags(base + [_jr("09:30", 32, 29, note="на выходе хорошо охлаждено")], "burner_off")[-1]
+    assert flags(base + [_jr("09:30", note="рециркуляция"), _jr("10:00", note="Закончили рециркуляцию")], "recirc")[-1]
+    assert not flags(base + [_jr("09:30", note="рециркуляция"), _jr("10:00", note="Запуск подачи с 1 с.")], "recirc")[-1]
+    assert segs(base + [_jr("09:30", 32, 29, note="открыли люк, почистили")])[-1] == 1
+    for ok_note in ("на выходе холодное", "чистка люка", "вентилятор 2 вместо 1", "отгрузка", "проба", "без пробы",
+                    "перемер", "испр.: было 2,1", "D 35→38 по «Сейчас»", "возврат воздуха", "нория стоит"):
+        rows = base + [_jr("09:30", 32, 29, note=ok_note)]
+        assert segs(rows)[-1] == 0 and not flags(rows, "burner_off")[-1] and not flags(rows, "recirc")[-1], ok_note
+    # перерыв > 1,5 ч режет проход, строка «без пробы» — нет (раздел 4.3)
+    assert segs(base + [_jr("11:00", 32, 26)])[-1] == 1
+    assert segs(base + [_jr("10:00", note="без пробы"), _jr("11:00", 32, 26)])[-1] == 0
+    # забытая строка «из прошлого» в конце режет проход на следующей записи (раздел 8)
+    late = base + [_jr("09:30", 32, 29), _jr("10:00", 32, 28), _jr("08:45", 32, 30), _jr("10:30", 32, 27)]
+    assert segs(late)[-1] == 1
+    # «Остановка» без пробы глушит напоминания; после «Запуск» «выгружено» считается заново (раздел 6.3)
+    stop = base + [_jr("09:10", note="Остановка: силос 1 полный, осталось 210 т")]
+    assert not drying_active(stop, datetime(2026, 10, 25, 9, 40))[0]
+    run = stop + [_jr("09:50", note="Запуск"), _jr("10:00", 32, 29), _jr("10:30", 32, 28)]
+    st = live_state(run, P)
+    assert st.start == datetime(2026, 10, 25, 9, 50) and abs(st.unloaded - q_at(P, 35) * 40 / 60) < 1e-6
+    # сам файл правил на месте и содержит ключевые разделы
+    text = open(os.path.join(ROOT, "docs", "rules_ru.txt"), encoding="utf-8-sig").read()
+    for key in ("СЛОВА-ЛОВУШКИ", "ЗАДАНИЕ НА СУШКУ ПАРТИИ", "ЧЕК-ЛИСТЫ", "ОДИН КОМПЬЮТЕР, ОДНА БАЗА"):
+        assert key in text, key
+    assert max(len(line) for line in text.splitlines()) <= 101
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):

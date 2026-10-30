@@ -151,6 +151,7 @@ def run(out_path: str) -> int:
         check([k for k, _, _ in msgs] == ["sample"], f"напоминание «пора внести пробу»: {len(msgs)}")
         win.tab_help.on_show()
         check("ШПАРГАЛКА" in win.tab_help.manual.toPlainText(), "инструкция для пользователя встроена в «Справку»")
+        check("СЛОВА-ЛОВУШКИ" in win.tab_help.rules.toPlainText(), "правила работы встроены в «Справку»")
         # --- v0.6: режим сушильщика, PIN, замечания, статистика пилота ---
         from . import pilot as _pilot
         win.apply_mode(_pilot.OPERATOR)
