@@ -105,6 +105,16 @@ jobs:
             dist/selftest_*.png
           retention-days: 30
 
+      # GitHub выбрасывает кириллицу из имён файлов релиза («Инструкция DryerCalc.txt» → «DryerCalc.txt»),
+      # и два текстовых файла получили бы одно имя — поэтому в релиз они идут с латинскими именами.
+      - name: Файлы для релиза (латинские имена)
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/release | Out-Null
+          Copy-Item "dist/Инструкция DryerCalc.txt" dist/release/Instrukciya_DryerCalc.txt
+          Copy-Item "dist/Правила работы DryerCalc.txt" dist/release/Pravila_raboty_DryerCalc.txt
+
       - name: Релиз (по тегу vX.Y.Z или по галочке при ручном запуске)
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
         uses: softprops/action-gh-release@v2
@@ -116,11 +126,12 @@ jobs:
             DryerCalc ${{ steps.ver.outputs.version }} — собрано и проверено автоматически на Windows.
             * DryerCalc_Setup.exe — установщик (ярлыки, быстрый запуск, права администратора не нужны);
             * DryerCalc.exe — переносная версия одним файлом;
-            * «Инструкция DryerCalc.txt» — инструкция для пользователя (где какая кнопка);
-            * «Правила работы DryerCalc.txt» — как правильно вести журнал и работать с программой.
+            * Instrukciya_DryerCalc.txt — инструкция для пользователя (где какая кнопка);
+            * Pravila_raboty_DryerCalc.txt — правила: как правильно вести журнал и работать с программой.
+            (Установщик кладёт оба файла с русскими именами и создаёт ярлыки в «Пуске».)
             Данные прежних версий сохраняются (%APPDATA%\DryerCalc).
           files: |
             dist/DryerCalc.exe
             dist/DryerCalc_Setup.exe
-            dist/Инструкция DryerCalc.txt
-            dist/Правила работы DryerCalc.txt
+            dist/release/Instrukciya_DryerCalc.txt
+            dist/release/Pravila_raboty_DryerCalc.txt
