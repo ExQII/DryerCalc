@@ -46,6 +46,8 @@ from datetime import datetime, timedelta
 from math import exp
 from typing import List, Optional, Sequence, Tuple
 
+import numpy as np
+
 
 @dataclass
 class DryerParams:
@@ -353,6 +355,81 @@ def solve_pass(p: DryerParams, c: Conditions, w_in: float, m_in: float, d: float
         time_h=time_h, rate=rate, residence_min=p.m_dryer / q * 60.0, t_proc=c.t_proc,
         t_grain=grain_temp(p, c.t_proc, w_in),
     )
+
+
+# ----------------------------------------------------------------------------
+# То же для массивов (numpy): калибровка и «прогноз против факта» считают проход для сотен–тысяч
+# наблюдений сразу. Арифметика та же, что в solve_pass, результаты совпадают до округления double.
+# ----------------------------------------------------------------------------
+
+def q_at_arr(p: DryerParams, d) -> np.ndarray:
+    """q_at для массива D."""
+    d = np.maximum(np.asarray(d, dtype=float), 0.0)
+    tb = _table(p)
+    if tb is None:
+        return p.q100 * d / 100.0
+    xs, ys = np.asarray(tb[0]), np.asarray(tb[1])
+    out = np.interp(d, xs, ys)
+    out = np.where(d <= xs[0], ys[0] * d / xs[0] if xs[0] > 0 else ys[0], out)
+    if len(xs) >= 2 and xs[-1] > xs[-2]:
+        slope = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+        out = np.where(d >= xs[-1], ys[-1] + slope * (d - xs[-1]), out)
+    else:
+        out = np.where(d >= xs[-1], ys[-1], out)
+    return np.maximum(out, 0.0)
+
+
+def water_rate_arr(p: DryerParams, w_avg, t_proc, t_amb, rh) -> np.ndarray:
+    """water_rate для массивов."""
+    x_w = np.maximum(np.asarray(w_avg, dtype=float) - p.w_eq, 0.05) / max(p.w_ref - p.w_eq, 0.1)
+    x_t = np.maximum(np.asarray(t_proc, dtype=float) - p.t_amb_ref, 1.0) / max(p.t_ref - p.t_amb_ref, 1.0)
+    return (p.r_ref * p.rate_scale * (x_w ** p.b_w) * (x_t ** p.b_dt)
+            * np.exp(p.b_amb * (np.asarray(t_amb, dtype=float) - p.t_amb_ref) / 10.0)
+            * np.exp(p.b_rh * (np.asarray(rh, dtype=float) - p.rh_ref) / 30.0))
+
+
+def solve_out_arr(p: DryerParams, w_in, d, t_proc, t_amb, rh) -> Tuple[np.ndarray, np.ndarray]:
+    """Влажность на выходе прохода (истинная, %) и Q (т/ч) для массивов входа — как solve_pass(...).w_out."""
+    w_in = np.asarray(w_in, dtype=float)
+    d = np.clip(np.asarray(d, dtype=float), 1.0, 100.0)
+    t_proc, t_amb, rh = (np.broadcast_to(np.asarray(x, dtype=float), w_in.shape) for x in (t_proc, t_amb, rh))
+    q = q_at_arr(p, d)
+    if p.model_kind == "physics":
+        from .physics import pass_out_arr
+        return pass_out_arr(p, w_in, d, t_proc, t_amb, rh), q
+    active = w_in > p.w_eq + 0.05
+    # множитель R, не зависящий от w (порядок умножений как в water_rate)
+    x_t = np.maximum(t_proc - p.t_amb_ref, 1.0) / max(p.t_ref - p.t_amb_ref, 1.0)
+    k_t = (x_t ** p.b_dt)
+    k_amb = np.exp(p.b_amb * (t_amb - p.t_amb_ref) / 10.0)
+    k_rh = np.exp(p.b_rh * (rh - p.rh_ref) / 30.0)
+    w_den = max(p.w_ref - p.w_eq, 0.1)
+    base = p.r_ref * p.rate_scale
+
+    def excess(w_out_: np.ndarray) -> np.ndarray:
+        need = q * (w_in - w_out_) / (100.0 - w_in)
+        x_w = np.maximum(0.5 * (w_in + w_out_) - p.w_eq, 0.05) / w_den
+        return need - base * (x_w ** p.b_w) * k_t * k_amb * k_rh
+
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        lo = np.full_like(w_in, p.w_eq)
+        hi = w_in.copy()
+        at_eq = excess(lo) <= 0
+        for _ in range(70):
+            mid = 0.5 * (lo + hi)
+            pos = excess(mid) > 0
+            lo = np.where(pos, mid, lo)
+            hi = np.where(pos, hi, mid)
+        w_out = np.where(active, np.where(at_eq, p.w_eq, 0.5 * (lo + hi)), w_in)
+    return w_out, q
+
+
+def pass_rate_arr(w_in, w_out, q) -> np.ndarray:
+    """Расход влаги прохода (т воды/ч) при m_вх = 1 т — как solve_pass(...).rate."""
+    m_out = (100.0 - np.asarray(w_in, dtype=float)) / (100.0 - np.asarray(w_out, dtype=float))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        time_h = m_out / q
+        return np.where(time_h > 0, (1.0 - m_out) / time_h, 0.0)
 
 
 def d_for_target(p: DryerParams, c: Conditions, w_in: float, w_target: float) -> float:

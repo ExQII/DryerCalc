@@ -146,46 +146,42 @@ def rate_sigma_from_backtest(bt: Dict, model_kind: str) -> Optional[Tuple[float,
 # Прогноз против факта
 # ----------------------------------------------------------------------------
 
-def _rows_by_segment(rows: List[Dict]) -> Tuple[Dict[int, List[int]], List[Dict]]:
-    from .calibration import prepare
-    prep, _ = prepare(rows)
-    segs: Dict[int, List[int]] = {}
-    for i, r in enumerate(prep):
-        segs.setdefault(r["seg"], []).append(i)
-    return segs, prep
-
-
-def _seg_eval(test_rows: List[Dict], p: mdl.DryerParams) -> Optional[Dict]:
-    from .calibration import observe_all, segment_summary
-    obs, _, _ = observe_all(test_rows, p)
-    segs = segment_summary(obs, p)
-    if not segs:
-        return None
-    # в тестовых строках один проход, но prepare мог разделить его — берём самый длинный участок
-    return max(segs, key=lambda s: s["n"])
+def _seg_eval(obs_seg: List[Dict], p: mdl.DryerParams, arr=None) -> Optional[Dict]:
+    """Сводка одного прохода (наблюдения одного участка журнала) по модели p."""
+    from .calibration import segment_summary
+    segs = segment_summary(obs_seg, p, arr)
+    return max(segs, key=lambda s: s["n"]) if segs else None
 
 
 def backtest(rows: List[Dict], p: mdl.DryerParams, half_life_days: float = 0.0, weather=None,
-             max_segments: int = 15, min_rows: int = 12, progress=None) -> Dict:
+             max_segments: int = 15, min_rows: int = 12, progress=None, cancelled=None) -> Dict:
     """По каждому проходу журнала (в порядке времени):
     * «текущая» — ошибка съёма текущими параметрами (обе модели);
     * «прогноз» — модель откалибрована только по проходам ДО этого и предсказывает его (как было бы в жизни).
-    """
-    from .calibration import calibrate
+
+    Журнал разбирается один раз: наблюдения (пары «вход в t − τ / выход в t») не зависят от
+    подбираемых параметров модели, поэтому калибровка «до прохода» идёт по готовым наблюдениям
+    предыдущих проходов. progress(k, n) — ход расчёта; cancelled() → True — прервать."""
+    from .calibration import _obs_arr, calibrate_obs, observe_all, prepare
     if weather is not None:
         rows = weather.fill_rows(rows)
-    segs, prep = _rows_by_segment(rows)
+    prep, _ = prepare(rows)
+    obs_all, _, _ = observe_all(rows, p)
+    seg_rows: Dict[int, List[Dict]] = {}
+    for r in prep:
+        seg_rows.setdefault(r["seg"], []).append(r)
     seg_start: Dict[int, datetime] = {}
-    for s, idxs in segs.items():
-        dts = [prep[i]["dt"] for i in idxs if prep[i].get("dt") is not None]
+    for s, lst in seg_rows.items():
+        dts = [r["dt"] for r in lst if r.get("dt") is not None]
         if dts:
             seg_start[s] = min(dts)
+    obs_by_seg: Dict[int, List[Dict]] = {}
+    for o in obs_all:
+        obs_by_seg.setdefault(o["seg"], []).append(o)
     order = []
-    for s, idxs in segs.items():
-        data = [i for i in idxs if prep[i].get("w_out") is not None]
-        if len(data) >= min_rows:
-            dts = [prep[i]["dt"] for i in idxs if prep[i].get("dt") is not None]
-            order.append((min(dts) if dts else datetime.min, s))
+    for s, lst in seg_rows.items():
+        if sum(1 for r in lst if r.get("w_out") is not None) >= min_rows:
+            order.append((seg_start.get(s, datetime.min), s))
     order.sort()
     order = order[-max_segments:] if max_segments else order
     p_emp = replace(p, model_kind="empirical")
@@ -194,29 +190,34 @@ def backtest(rows: List[Dict], p: mdl.DryerParams, half_life_days: float = 0.0, 
     for k, (t0, s) in enumerate(order):
         if progress:
             progress(k, len(order))
-        idxs = set(segs[s])
-        test = [rows[i] for i in sorted(idxs)]
+        if cancelled and cancelled():
+            break
+        test = obs_by_seg.get(s, [])
+        if not test:
+            continue
+        arr = _obs_arr(test)
         row: Dict = {"seg": s, "start": t0}
-        cur_e = _seg_eval(test, p_emp)
-        cur_p = _seg_eval(test, p_phys)
+        cur_e = _seg_eval(test, p_emp, arr)
+        cur_p = _seg_eval(test, p_phys, arr)
         if cur_e is None:
             continue
         row.update({"n": cur_e["n"], "w_in": cur_e["w_in"], "w_out": cur_e["w_out"], "d": cur_e["d"],
                     "t": cur_e["t"], "dw_obs": cur_e["dw_obs"], "cur_emp": cur_e["dw_pred"],
                     "cur_phys": cur_p["dw_pred"] if cur_p else None,
                     "end": cur_e["end"]})
-        train_idx = sorted(i for ss, ii in segs.items() if seg_start.get(ss) is not None and seg_start[ss] < t0
-                           for i in ii)
-        if train_idx:
+        train = [o for o in obs_all if seg_start.get(o["seg"]) is not None and seg_start[o["seg"]] < t0]
+        if train:
             try:
-                fit, _ = calibrate([rows[i] for i in train_idx], p, half_life_days=half_life_days)
-                fe = _seg_eval(test, replace(fit, model_kind="empirical"))
-                fp = _seg_eval(test, replace(fit, model_kind="physics"))
+                fit, _ = calibrate_obs(train, p, half_life_days=half_life_days, report=False)
+                fe = _seg_eval(test, replace(fit, model_kind="empirical"), arr)
+                fp = _seg_eval(test, replace(fit, model_kind="physics"), arr)
                 row["fc_emp"] = fe["dw_pred"] if fe else None
                 row["fc_phys"] = fp["dw_pred"] if fp else None
             except ValueError:
                 pass
         out.append(row)
+    if progress:
+        progress(len(order), len(order))
 
     def mae(key: str) -> Optional[float]:
         e = [abs(r[key] - r["dw_obs"]) for r in out if r.get(key) is not None]

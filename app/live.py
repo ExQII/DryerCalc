@@ -1,8 +1,10 @@
 """Режим «по факту»: состояние текущего прохода по журналу, прогноз окончания и подсказка разгрузки D.
 
-* Текущий проход — последний участок журнала (участки делятся примечаниями «Остановка», «Запуск»,
-  «Закончился …», сменой партии/прохода и перерывами больше 1,5 ч).
-* Выгружено с начала прохода = Σ Q(D) · Δt по строкам журнала (D переносится вперёд, как в журнале).
+* Текущий проход — последний участок журнала с пробами вместе с предыдущими участками того же прохода:
+  участки, разделённые только остановкой/пуском или перерывом, при тех же «Партия» и «Проход» — один проход
+  (calibration.pass_of_segment). Новый проход начинают «Закончился …», «открыли с …», смена партии/прохода.
+* Выгружено с начала прохода = Σ Q(D) · Δt по строкам журнала (D переносится вперёд, как в журнале); время от
+  строки «Остановка» до строки «Запуск» не считается, рециркуляция и охлаждение тоже.
 * Поправка по факту: модель сравнивается с последними (до 6, то есть ~3 ч) замерами выхода этого прохода
   (пары «вход в t − τ / выход в t»); средняя разница, ослабленная коэффициентом n/(n+3), прибавляется к
   прогнозу. Так учитывается то, чего модель не знает (погода, партия, состояние сушилки), но один
@@ -46,7 +48,7 @@ class LiveState:
 
 def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = None, weather=None,
                corr_window: int = 6) -> LiveState:
-    from .calibration import _t_proc, observe_all, prepare
+    from .calibration import STOP_STEMS, _t_proc, observe_all, pass_of_segment, prepare
     st = LiveState()
     if weather is not None:
         rows = weather.fill_rows(rows)
@@ -62,11 +64,13 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.message = "В журнале нет замеров влажности."
         return st
     seg = data_segs[-1]
-    rs = [r for r in prep if r["seg"] == seg and r.get("dt") is not None]
+    pass_of = pass_of_segment(prep)
+    chain = {s for s, first in pass_of.items() if first == pass_of[seg]}      # участки этого прохода
+    rs = [r for r in prep if r["seg"] in chain and r.get("dt") is not None]
     if not rs:
         st.message = "У последнего прохода нет времени проб."
         return st
-    st.seg = seg
+    st.seg = pass_of[seg]
     st.start, st.last = rs[0]["dt"], rs[-1]["dt"]
     for r in rs:
         if r.get("w_in") is not None:
@@ -89,16 +93,22 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.series.append((r["dt"], r.get("w_in"), r.get("w_out")))
     end = max(now, st.last) if now else st.last
     unloaded = 0.0
+    stopped = False
     for a, b in zip(rs, rs[1:] + [None]):
+        note = (a.get("note") or "").lower()
+        if any(w in note for w in STOP_STEMS):
+            stopped = True
+        elif "запуск" in note:
+            stopped = False
         t_next = b["dt"] if b is not None else end
-        if a.get("d_f") is not None and not a.get("recirc") and not a.get("burner_off"):
+        if a.get("d_f") is not None and not stopped and not a.get("recirc") and not a.get("burner_off"):
             unloaded += mdl.q_at(p, a["d_f"]) * max((t_next - a["dt"]).total_seconds(), 0.0) / 3600.0
     st.unloaded = unloaded
     st.recirc = bool(rs[-1].get("recirc"))
     st.burner_off = bool(rs[-1].get("burner_off"))
     st.hours = (end - st.start).total_seconds() / 3600.0
     # поправка по последним наблюдениям этого прохода
-    seg_rows = [rows[i] for i, r in enumerate(prep) if r["seg"] == seg]
+    seg_rows = [rows[i] for i, r in enumerate(prep) if r["seg"] in chain]
     obs, _, _ = observe_all(seg_rows, p)
     obs = [o for o in obs if o.get("dt") is not None][-corr_window:]
     if obs:

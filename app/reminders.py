@@ -41,7 +41,7 @@ class ReminderCfg:
 
 def drying_active(rows: List[Dict], now: datetime) -> Tuple[bool, Optional[datetime], Optional[int]]:
     """(идёт ли сушка, время последней пробы с влажностью, номер участка)."""
-    from .calibration import prepare
+    from .calibration import pass_of_segment, prepare
     prep, reliable = prepare(rows)
     if not prep or not reliable:
         return False, None, None
@@ -55,7 +55,7 @@ def drying_active(rows: List[Dict], now: datetime) -> Tuple[bool, Optional[datet
     # «Закончился 2 с., сушим с 1 с.» с пробой — это начало нового прохода, а не остановка
     stopped = bool(last.get("burner_off")) or (any(w in note for w in STOP_WORDS) and not has_data)
     fresh = (now - last["dt"]) <= timedelta(hours=8)
-    return (not stopped) and fresh, last_sample, last["seg"]
+    return (not stopped) and fresh, last_sample, pass_of_segment(prep).get(last["seg"], last["seg"])
 
 
 def check(rows: List[Dict], now: datetime, state: Dict, cfg: ReminderCfg, pass_end: Optional[datetime] = None,

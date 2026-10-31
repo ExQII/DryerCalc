@@ -153,31 +153,45 @@ def season_meter_shift(batches: Sequence[Dict]) -> Tuple[Optional[float], Option
 
 def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[datetime], end: Optional[datetime]
                     ) -> Dict:
-    """Проходы журнала между start и end: длительность, средние W, D, T, съём."""
-    from .calibration import _t_proc, prepare
+    """Проходы журнала между start и end: длительность, средние W, D, T, съём.
+
+    Проход с остановкой внутри (участки с теми же «Партия»/«Проход», разделённые «Остановка»/«Запуск») — одна
+    строка; длительность и выгрузка считаются без времени простоя."""
+    from .calibration import STOP_STEMS, _t_proc, pass_of_segment, prepare
     prep, reliable = prepare(rows)
     if not reliable:
         return {"passes": [], "hours": 0.0, "note": "в журнале не распознано время"}
+    pass_of = pass_of_segment(prep)
     sel = [r for r in prep if r.get("dt") is not None and (start is None or r["dt"] >= start)
            and (end is None or r["dt"] <= end)]
     segs: Dict[int, List[Dict]] = {}
     for r in sel:
-        segs.setdefault(r["seg"], []).append(r)
+        segs.setdefault(pass_of.get(r["seg"], r["seg"]), []).append(r)
     passes = []
     for s, lst in sorted(segs.items()):
         data = [r for r in lst if r.get("w_in") is not None or r.get("w_out") is not None]
         if len(data) < 2:
             continue
         t0, t1 = data[0]["dt"], data[-1]["dt"]
-        hours = (t1 - t0).total_seconds() / 3600.0
+        hours = 0.0                      # сумма по участкам с пробами (без простоя между ними)
+        for sub in sorted({r["seg"] for r in data}):
+            dts = [r["dt"] for r in data if r["seg"] == sub]
+            hours += (max(dts) - min(dts)).total_seconds() / 3600.0
         win = [r["w_in"] for r in data if r.get("w_in") is not None]
         wout = [r["w_out"] for r in data if r.get("w_out") is not None]
         ds = [r["d_f"] for r in data if r.get("d_f") is not None]
         ts = [x for x in (_t_proc(r, p.temp_source) for r in data) if x is not None]
         unloaded = 0.0
-        for a, b in zip(data, data[1:]):
-            if a.get("d_f") is not None and not a.get("recirc") and not a.get("burner_off"):
-                unloaded += mdl.q_at(p, a["d_f"]) * (b["dt"] - a["dt"]).total_seconds() / 3600.0
+        stopped = False
+        span = [r for r in lst if t0 <= r["dt"] <= t1]
+        for a, b in zip(span, span[1:]):
+            note = (a.get("note") or "").lower()
+            if any(w in note for w in STOP_STEMS):
+                stopped = True
+            elif "запуск" in note:
+                stopped = False
+            if a.get("d_f") is not None and not stopped and not a.get("recirc") and not a.get("burner_off"):
+                unloaded += mdl.q_at(p, a["d_f"]) * max((b["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
         w_in_avg = sum(win) / len(win) if win else None
         w_out_avg = sum(wout) / len(wout) if wout else None
         tgs = [0.5 * (r["t_a1"] + r["t_a2"]) for r in data if r.get("t_a1") is not None and r.get("t_a2") is not None]

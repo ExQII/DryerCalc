@@ -31,7 +31,9 @@ from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .model import Conditions, DryerParams, q_at, solve_pass, true_from_read
+import numpy as np
+
+from .model import DryerParams, pass_rate_arr, q_at, solve_out_arr, true_from_read
 
 FIELDS = ["ts", "w_in", "w_out", "t_a1", "t_a2", "t_up", "t_low", "d", "note", "batch", "pass_no", "t_amb", "rh"]
 TEXT_FIELDS = {"ts", "batch", "note"}
@@ -401,6 +403,134 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
     return prep, reliable
 
 
+STOP_STEMS = ("остановк",)
+# слова, после которых начинается именно НОВЫЙ проход (смена силоса, окончание), а не продолжение после остановки
+PASS_END_STEMS = ("закончил", "открыл", "переключ", "загрузка", "зачистка", "набираем", "снимаем") + RECIRC_WORDS
+
+
+def pass_of_segment(prep: List[Dict]) -> Dict[int, int]:
+    """Участок журнала -> номер первого участка его прохода.
+
+    Участки (prepare) режутся и остановкой/пуском, и перерывом > 1,5 ч — для калибровки это правильно (после
+    остановки связь «вход − τ / выход» начинается заново). Но для учёта «выгружено», напоминаний и сводок по
+    партиям проход один: участок B продолжает проход участка A, если у первой строки B те же непустые «Партия» и
+    «Проход», что у A, и её примечание не начинает новый проход («Закончился…», «открыли с…», «переключ…»,
+    «рециркуляция» и т. п.). Без заполненных «Партия»/«Проход» участки не объединяются."""
+    first: Dict[int, Dict] = {}
+    last: Dict[int, Dict] = {}
+    order: List[int] = []
+    for r in prep:
+        s = r["seg"]
+        if s not in first:
+            first[s] = r
+            order.append(s)
+        last[s] = r
+    out: Dict[int, int] = {}
+    for i, s in enumerate(order):
+        out[s] = s
+        if i == 0:
+            continue
+        a, b = last[order[i - 1]], first[s]
+        key_b = ((b.get("batch") or "").strip(), b.get("pass_no"))
+        key_a = ((a.get("batch") or "").strip(), a.get("pass_no"))
+        note = (b.get("note") or "").lower()
+        if (key_b[0] and key_b[1] is not None and key_a == key_b and not a.get("recirc")
+                and not any(w in note for w in PASS_END_STEMS)):
+            out[s] = out[order[i - 1]]
+    return out
+
+
+def chronological_issues(rows: List[Dict]) -> List[int]:
+    """Номера строк с явной датой, которые стоят в журнале раньше более поздних по времени строк
+    (строка «из прошлого», дописанная в конец). Строки без даты не проверяются: их дата выводится по порядку."""
+    times, _ = assign_times(rows)
+    bad: List[int] = []
+    latest: Optional[datetime] = None
+    for i, (r, dt) in enumerate(zip(rows, times)):
+        if dt is None:
+            continue
+        d, _t = parse_ts(r.get("ts"))
+        if d is not None and latest is not None and dt < latest - timedelta(minutes=1):
+            bad.append(i)
+        latest = dt if latest is None or dt > latest else latest
+    return bad
+
+
+def chronological_order(rows: List[Dict]) -> List[int]:
+    """Порядок строк по времени (устойчивый: равные и строки без времени остаются за своими соседями)."""
+    times, _ = assign_times(rows)
+    return sorted(range(len(rows)), key=lambda i: (times[i] or datetime.min, i))
+
+
+def insert_position(rows: List[Dict], ts) -> int:
+    """Куда вставить строку со временем ts (с датой), чтобы журнал остался по порядку времени."""
+    d, t = parse_ts(ts)
+    if d is None or t is None or not rows:
+        return len(rows)
+    new_dt = datetime.combine(d, t)
+    times, _ = assign_times(rows)
+    pos = len(rows)
+    for i in range(len(rows) - 1, -1, -1):
+        if times[i] is not None and times[i] <= new_dt:
+            return i + 1
+        if times[i] is not None:
+            pos = i
+    return pos
+
+
+# ----------------------------------------------------------------------------
+# Слова-ловушки в примечании: программа ищет основы слов («охлажд», «рецирк», «открыл»…) где угодно в тексте,
+# поэтому обычный комментарий может нечаянно стать командой. Явные события — по образцам ниже; на всё остальное
+# со словами-командами программа переспрашивает.
+# ----------------------------------------------------------------------------
+
+_EVENT_PATTERNS = [re.compile(x, re.I) for x in (
+    r"^\s*остановк\w*\b(?!.*(рецирк|охлажд|включ|вкл\.?\s*т))",
+    r"^\s*запуск\w*\b(?!.*(рецирк|охлажд|откл))",
+    r"^\s*закончил\w*\b(?!.*(рецирк|охлажд|включ|вкл\.?\s*т))",
+    r"^\s*открыли?\s+(с\b|с\.|силос|из\s+силос)",
+    r"^\s*переключ\w*\s+(на\s+)?(с\b|с\.|силос|подач)",
+    r"^\s*(загрузка|зачистка)(\s+(сушилки|шахты|силоса?)\b.*)?\s*[.,;:!]?\s*$",
+    r"^\s*(набираем|снимаем)\s+(с\b|с\.|в\b|из\b|силос)",
+    r"^\s*(начали\s+)?рециркуляци\w*\b(?!.*(воздух|закончил|конец|стоп|откл))",
+    r"^\s*(начали\s+)?охлаждение\b",
+    r"^\s*откл\w*\.?\s*(т\.?\s*б\.?|блоки|горелк\w*|топк\w*)(\s*[.,;:!]|\s*$)",
+    r"^\s*(вкл\w*\.?\s*т\.?\s*б\.?|включил\w*\s+(т\.?\s*б|блоки|горелк|топк))",
+)]
+
+_STEM_MEANING = (
+    (("рецирк",), "рециркуляция: дальше зерно ходит по кругу, из силоса не подаётся, «выгружено» не растёт"),
+    (("охлажд",), "горелки выключены (охлаждение): строки до «Запуск» не идут в калибровку, «Сейчас» пишет "
+                  "«идёт охлаждение»"),
+    (("остановк",), "остановка сушилки: новый участок журнала, напоминания затихают"),
+    (("запуск",), "пуск: новый участок журнала, горелки работают"),
+    (("закончил", "открыл", "переключ", "загрузка", "зачистка", "набираем", "снимаем"),
+     "новый участок журнала — для программы это начало нового прохода"),
+    (("включ", "вкл. т", "вкл т"), "горелки снова включены"),
+)
+
+
+def note_meaning(note: str) -> List[str]:
+    """Что программа поймёт из примечания (по основам слов)."""
+    n = (note or "").lower()
+    out = [text for stems, text in _STEM_MEANING if any(w in n for w in stems)]
+    if "откл" in n and any(w in n for w in ("т.б", "т. б", "тб", "блок", "горел", "топ")) and not any(
+            "охлаждение" in t for t in out):
+        out.append("горелки выключены: строки до «Запуск» не идут в калибровку")
+    return out
+
+
+def note_trap(note: str) -> Optional[List[str]]:
+    """None — примечание без слов-команд или явное событие по образцу; иначе — что поймёт программа
+    (повод переспросить: возможно, это обычный комментарий со словом-ловушкой)."""
+    meaning = note_meaning(note)
+    if not meaning:
+        return None
+    if any(p.search(note or "") for p in _EVENT_PATTERNS):
+        return None
+    return meaning
+
+
 def _t_proc(row: Dict, source: str) -> Optional[float]:
     if source == "block":
         vals = [x for x in (row.get("t_up_f"), row.get("t_low_f")) if x is not None]
@@ -485,7 +615,7 @@ def observe_all(rows: List[Dict], p: DryerParams, use_lag: Optional[bool] = None
 
 
 # ----------------------------------------------------------------------------
-# Небольшая математика без numpy (матрицы 2×2…4×4, десятки–сотни строк)
+# Небольшая математика
 # ----------------------------------------------------------------------------
 
 def _mean(xs: Sequence[float]) -> float:
@@ -499,40 +629,45 @@ def _median(xs: Sequence[float]) -> float:
 
 
 def _std(xs: Sequence[float]) -> float:
-    """Стандартное отклонение (генеральное, как у numpy.std)."""
-    m = _mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+    """Стандартное отклонение (генеральное)."""
+    return float(np.std(np.asarray(xs, dtype=float)))
 
 
-def _solve(a: List[List[float]], b: List[float]) -> List[float]:
-    """Решение A·x = b методом Гаусса с выбором главного элемента."""
-    n = len(b)
-    m = [list(map(float, a[i])) + [float(b[i])] for i in range(n)]
-    for c in range(n):
-        piv = max(range(c, n), key=lambda r: abs(m[r][c]))
-        if abs(m[piv][c]) < 1e-14:
-            raise ValueError("вырожденная система при подборе параметров")
-        m[c], m[piv] = m[piv], m[c]
-        for r in range(c + 1, n):
-            f = m[r][c] / m[c][c]
-            if f:
-                for k in range(c, n + 1):
-                    m[r][k] -= f * m[c][k]
-    x = [0.0] * n
-    for i in range(n - 1, -1, -1):
-        x[i] = (m[i][n] - sum(m[i][k] * x[k] for k in range(i + 1, n))) / m[i][i]
-    return x
+def _solve(a, b) -> List[float]:
+    """Решение A·x = b (LU-разложение с выбором главного элемента, LAPACK)."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    try:
+        if np.linalg.cond(a) > 1e14:
+            raise np.linalg.LinAlgError
+        return np.linalg.solve(a, b).tolist()
+    except np.linalg.LinAlgError:
+        raise ValueError("вырожденная система при подборе параметров") from None
+
+
+def _obs_arr(obs: Sequence[Dict]) -> Dict[str, np.ndarray]:
+    from .physics import obs_arrays
+    return obs_arrays(obs)
+
+
+def predict_out(p: DryerParams, obs: Sequence[Dict], arr: Optional[Dict[str, np.ndarray]] = None
+                ) -> Tuple[np.ndarray, np.ndarray]:
+    """Модельная влажность на выходе (истинная) и Q для всех наблюдений сразу: как solve_pass(...)."""
+    a = arr if arr is not None else _obs_arr(obs)
+    return solve_out_arr(p, a["w_in"], a["d"], a["t_proc"], a["t_amb"], a["rh"])
 
 
 # ----------------------------------------------------------------------------
 # Калибровка
 # ----------------------------------------------------------------------------
 
-def _features(obs: List[Dict], p: DryerParams) -> Dict[str, List[float]]:
-    fw = [math.log(max(o["w_avg"] - p.w_eq, 0.05) / max(p.w_ref - p.w_eq, 0.1)) for o in obs]
-    ft = [math.log(max(o["t_proc"] - p.t_amb_ref, 1.0) / max(p.t_ref - p.t_amb_ref, 1.0)) for o in obs]
-    famb = [(o["t_amb"] - p.t_amb_ref) / 10.0 for o in obs]
-    frh = [(o["rh"] - p.rh_ref) / 30.0 for o in obs]
+def _features(obs: List[Dict], p: DryerParams) -> Dict[str, np.ndarray]:
+    def col(k: str) -> np.ndarray:
+        return np.fromiter((o[k] for o in obs), dtype=float, count=len(obs))
+    fw = np.log(np.maximum(col("w_avg") - p.w_eq, 0.05) / max(p.w_ref - p.w_eq, 0.1))
+    ft = np.log(np.maximum(col("t_proc") - p.t_amb_ref, 1.0) / max(p.t_ref - p.t_amb_ref, 1.0))
+    famb = (col("t_amb") - p.t_amb_ref) / 10.0
+    frh = (col("rh") - p.rh_ref) / 30.0
     return {"b_w": fw, "b_dt": ft, "b_amb": famb, "b_rh": frh}
 
 
@@ -552,19 +687,21 @@ def recency_weights(obs: Sequence[Dict], half_life_days: float) -> List[float]:
     return out
 
 
-def segment_summary(obs: List[Dict], p: DryerParams) -> List[Dict]:
+def segment_summary(obs: List[Dict], p: DryerParams, arr: Optional[Dict[str, np.ndarray]] = None) -> List[Dict]:
     """Сводка по участкам журнала: наблюдаемый и модельный съём за проход."""
     out: List[Dict] = []
-    segs: Dict[int, List[Dict]] = {}
-    for o in obs:
-        segs.setdefault(o["seg"], []).append(o)
-    for s, lst in sorted(segs.items()):
-        if len(lst) < 4:
+    segs: Dict[int, List[int]] = {}
+    for i, o in enumerate(obs):
+        segs.setdefault(o["seg"], []).append(i)
+    if not any(len(ii) >= 4 for ii in segs.values()):
+        return out
+    a = arr if arr is not None else _obs_arr(obs)
+    dw_pred_all = a["w_in"] - predict_out(p, obs, a)[0]          # модель — один раз для всех наблюдений
+    for s, ii in sorted(segs.items()):
+        if len(ii) < 4:
             continue
-        pred = []
-        for o in lst:
-            c = Conditions(o["t_proc"], o["t_amb"], o["rh"])
-            pred.append(o["w_in"] - solve_pass(p, c, o["w_in"], 1.0, o["d"]).w_out)
+        lst = [obs[i] for i in ii]
+        pred = dw_pred_all[np.asarray(ii)].tolist()
         dts = [o["dt"] for o in lst if o["dt"] is not None]
         out.append({
             "seg": s, "n": len(lst),
@@ -587,56 +724,63 @@ def calibrate(rows: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days
     half_life_days > 0 — свежие наблюдения весят больше (вес 0,5^(возраст/полураспад)).
     weather — WeatherSeries: пустые T/RH наружные в журнале заполняются из таблицы погоды.
     """
-    from .physics import calibrate_physics
     if weather is not None:
         rows = weather.fill_rows(rows)
     obs, skipped, lag = observe_all(rows, p)
+    return calibrate_obs(obs, p, lam, half_life_days, skipped=skipped, lag=lag, n_rows=len(rows))
+
+
+def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days: float = 0.0,
+                  skipped: Optional[Dict[str, int]] = None, lag: bool = True, n_rows: Optional[int] = None,
+                  report: bool = True) -> Tuple[DryerParams, Dict]:
+    """Калибровка по готовым наблюдениям (observe_all). report=False — без сводок и текста (для проверки
+    модели, где калибровка повторяется для каждого прохода)."""
+    from .physics import calibrate_physics
+    skipped = skipped or {}
     n = len(obs)
+    n_rows = n if n_rows is None else n_rows
     if n < 3:
         raise ValueError(
-            f"Пригодных строк {n} из {len(rows)} (нужно хотя бы 3). Отброшено: {skipped or 'нет'}. "
+            f"Пригодных строк {n} из {n_rows} (нужно хотя бы 3). Отброшено: {skipped or 'нет'}. "
             f"Проверьте: время пробы, влага вход/выход, разгрузка D и температура выбранного источника "
             f"({'блоки' if p.temp_source == 'block' else 'зерно'}); выход отстаёт от входа на "
             f"{p.lag_k * p.m_dryer / max(q_at(p, 35), 1e-9):.1f} ч при D=35, эти часы в начале каждого прохода не используются.")
 
-    wts_all = recency_weights(obs, half_life_days)
-    y = [math.log(o["r"]) for o in obs]
+    wts_all = np.asarray(recency_weights(obs, half_life_days), dtype=float)
+    y = np.log(np.fromiter((o["r"] for o in obs), dtype=float, count=n))
     feats = _features(obs, p)
     prior = {"b_w": p.b_w, "b_dt": p.b_dt, "b_amb": p.b_amb, "b_rh": p.b_rh}
     has_rh = sum(o["has_rh"] for o in obs) >= 0.5 * n
     has_amb = sum(o["has_amb"] for o in obs) >= 0.5 * n
 
     def fit(idx: List[int]):
-        m = len(idx)
+        """Взвешенная регрессия ln R с регуляризацией к априорным показателям (ridge к prior)."""
+        ii = np.asarray(idx, dtype=int)
+        m = len(ii)
         use: List[str] = []
         if m >= 12:
             for k in feats:
-                if _std([feats[k][i] for i in idx]) > 0.02:
+                if float(np.std(feats[k][ii])) > 0.02:
                     use.append(k)
         if "b_rh" in use and not has_rh:
             use.remove("b_rh")
         if "b_amb" in use and not has_amb:
             use.remove("b_amb")
-        wt = [wts_all[i] for i in idx]
-        y_adj = []
-        for i in idx:
-            v = y[i]
-            for k in feats:
-                if k not in use:
-                    v -= prior[k] * feats[k][i]
-            y_adj.append(v)
-        cols = [[1.0] * m] + [[feats[k][i] for i in idx] for k in use]     # столбцы матрицы X
-        pen = [0.0] + [lam] * len(use)
-        b_prior = [0.0] + [prior[k] for k in use]
-        dim = len(cols)
-        a = [[sum(wt[t] * cols[r][t] * cols[c][t] for t in range(m)) + (pen[r] if r == c else 0.0) for c in range(dim)]
-             for r in range(dim)]
-        rhs = [sum(wt[t] * cols[r][t] * y_adj[t] for t in range(m)) + pen[r] * b_prior[r] for r in range(dim)]
+        wt = wts_all[ii]
+        y_adj = y[ii].copy()
+        for k in feats:
+            if k not in use:
+                y_adj -= prior[k] * feats[k][ii]
+        x = np.column_stack([np.ones(m)] + [feats[k][ii] for k in use])      # матрица X
+        pen = np.array([0.0] + [lam] * len(use))
+        b_prior = np.array([0.0] + [prior[k] for k in use])
+        a = x.T @ (wt[:, None] * x) + np.diag(pen)
+        rhs = x.T @ (wt * y_adj) + pen * b_prior
         beta = _solve(a, rhs)
         coef = dict(prior)
         for k, v in zip(use, beta[1:]):
             coef[k] = float(v)
-        res = [y_adj[t] - sum(beta[c] * cols[c][t] for c in range(dim)) for t in range(m)]
+        res = (y_adj - x @ np.asarray(beta)).tolist()
         return float(beta[0]), coef, res, use
 
     idx = list(range(n))
@@ -654,7 +798,8 @@ def calibrate(rows: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days
                 b0, coef, res, use = fit(idx)
 
     used = [obs[i] for i in idx]
-    used_w = [wts_all[i] for i in idx]
+    used_w = wts_all[np.asarray(idx, dtype=int)].tolist()
+    used_arr = _obs_arr(used)
     emp = replace(p, model_kind="empirical", r_ref=math.exp(b0), b_w=coef["b_w"], b_dt=coef["b_dt"],
                   b_amb=coef["b_amb"], b_rh=coef["b_rh"])
     # κ не подбирается: на журнале октября подбор κ улучшал описание (±0,48 против ±0,51 п.п. по проходам),
@@ -663,35 +808,31 @@ def calibrate(rows: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days
     phys = replace(p, model_kind="physics", eta=eta, kappa=kappa)
 
     def errors(par: DryerParams) -> Tuple[float, float, float]:
-        errs = []
-        for o in used:
-            c = Conditions(o["t_proc"], o["t_amb"], o["rh"])
-            pred = solve_pass(par, c, o["w_in"], 1.0, o["d"]).w_out
-            errs.append(pred - o["w_out"])
-        return _mean([abs(e) for e in errs]), _mean(errs), max(abs(e) for e in errs)
+        errs = predict_out(par, used, used_arr)[0] - used_arr["w_out"]
+        return float(np.mean(np.abs(errs))), float(np.mean(errs)), float(np.max(np.abs(errs)))
 
-    mae_old, bias_old, _ = errors(replace(p, model_kind="empirical"))
     mae, bias, mx = errors(emp)
-    rmse_ln = math.sqrt(_mean([r * r for r in res]))
-    segs = segment_summary(used, emp)
-    segs_phys = segment_summary(used, phys)
-    seg_mae = _mean([abs(s["dw_pred"] - s["dw_obs"]) for s in segs]) if segs else float("nan")
-    seg_mae_phys = _mean([abs(s["dw_pred"] - s["dw_obs"]) for s in segs_phys]) if segs_phys else float("nan")
     stamp = f"{datetime.now():%d.%m.%Y}"
     w_txt = f", вес свежих: полураспад {half_life_days:g} сут" if half_life_days and half_life_days > 0 else ""
     new_p = replace(emp, model_kind=p.model_kind, eta=eta, kappa=kappa, calibrated=True,
                     calib_info=f"{stamp}, строк {len(used)}, ошибка w_вых ±{mae:.2f} п.п.{w_txt}",
                     phys_info=f"{stamp}, строк {len(used)}, η = {eta:.2f}, κ = {kappa:.2f}, ошибка w_вых ±{phys_rep['mae']:.2f} п.п.")
-    active = new_p
-    pairs = []
-    for o in used:
-        c = Conditions(o["t_proc"], o["t_amb"], o["rh"])
-        pairs.append((o["r"], solve_pass(active, c, o["w_in"], 1.0, o["d"]).rate))
+    if not report:
+        return new_p, {"n_used": len(used), "mae": mae, "bias": bias, "phys_mae": phys_rep["mae"], "eta": eta,
+                       "kappa": kappa}
+    mae_old, bias_old, _ = errors(replace(p, model_kind="empirical"))
+    rmse_ln = math.sqrt(_mean([r * r for r in res]))
+    segs = segment_summary(used, emp, used_arr)
+    segs_phys = segment_summary(used, phys, used_arr)
+    seg_mae = _mean([abs(s["dw_pred"] - s["dw_obs"]) for s in segs]) if segs else float("nan")
+    seg_mae_phys = _mean([abs(s["dw_pred"] - s["dw_obs"]) for s in segs_phys]) if segs_phys else float("nan")
+    w_pred, q_pred = predict_out(new_p, used, used_arr)
+    pairs = list(zip(used_arr["r"].tolist(), pass_rate_arr(used_arr["w_in"], w_pred, q_pred).tolist()))
 
     skipped_txt = f" ({', '.join(f'{k}: {v}' for k, v in skipped.items())})" if skipped else ""
     n_amb = sum(o["has_amb"] for o in used)
     lines = [
-        f"Строк в журнале: {len(rows)}; использовано: {len(used)}; выбросов: {n_out}; "
+        f"Строк в журнале: {n_rows}; использовано: {len(used)}; выбросов: {n_out}; "
         f"отброшено: {sum(skipped.values())}{skipped_txt}",
         ("Лаг выхода от входа учтён: τ = %.1f ч при D=35." % (p.lag_k * p.m_dryer / max(q_at(p, 35), 1e-9)))
         if lag else "Времени в журнале нет или оно не распознано: лаг не учитывается (вход и выход берутся из одной строки).",
@@ -730,7 +871,7 @@ def calibrate(rows: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days
     if min(mae, phys_rep["mae"]) > 0.5:
         lines.append("Ошибка выше 0,5 п.п.: проверьте Q(D), вместимость сушилки (лаг), источник температуры "
                      "и поправку влагомера на выходе.")
-    return new_p, {"text": "\n".join(lines), "n": len(rows), "n_used": len(used), "mae": mae,
+    return new_p, {"text": "\n".join(lines), "n": n_rows, "n_used": len(used), "mae": mae,
                    "bias": bias, "pairs": pairs, "segments": segs, "seg_mae": seg_mae, "lag": lag,
                    "phys_mae": phys_rep["mae"], "phys_bias": phys_rep["bias"], "segments_phys": segs_phys,
                    "seg_mae_phys": seg_mae_phys, "eta": eta, "kappa": kappa, "used": used}

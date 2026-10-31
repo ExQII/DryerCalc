@@ -20,8 +20,10 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from . import model as mdl
-from .calibration import FIELDS, HEADERS_RU, TEXT_FIELDS, calibrate, read_journal, to_float, write_template
+from .calibration import (FIELDS, HEADERS_RU, TEXT_FIELDS, calibrate, chronological_issues, chronological_order,
+                          insert_position, note_trap, read_journal, to_float, write_template)
 from . import backup as bkp
+from . import worker
 from .plots import SimplePlot
 from .resources import resource_path
 from .storage import Storage, default_dir
@@ -768,12 +770,28 @@ class MainWindow(QMainWindow):
         self.qe_box = qe
         lay.addWidget(qe)
 
+        self.order_bar = QWidget()
+        ob = QHBoxLayout(self.order_bar)
+        ob.setContentsMargins(0, 0, 0, 0)
+        self.order_lbl = QLabel()
+        self.order_lbl.setWordWrap(True)
+        ob.addWidget(self.order_lbl, 1)
+        b_sort = QPushButton("Упорядочить по времени")
+        b_sort.clicked.connect(self._sort_journal)
+        ob.addWidget(b_sort)
+        self.order_bar.setVisible(False)
+        lay.addWidget(self.order_bar)
+
         split = QSplitter(Qt.Vertical)
         self.tbl_j = QTableWidget(0, len(FIELDS))
         self.tbl_j.setHorizontalHeaderLabels([HEADERS_RU[f] for f in FIELDS])
         self.tbl_j.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.tbl_j.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_j.itemChanged.connect(self._journal_changed)
+        self._rows_cache: Optional[List[Dict]] = None
+        jm = self.tbl_j.model()
+        for sig in (jm.dataChanged, jm.rowsInserted, jm.rowsRemoved, jm.rowsMoved, jm.modelReset, jm.layoutChanged):
+            sig.connect(self._invalidate_rows)
         split.addWidget(self.tbl_j)
 
         bottom = QSplitter(Qt.Horizontal)
@@ -797,6 +815,7 @@ class MainWindow(QMainWindow):
 
     def _load_journal_into_table(self) -> None:
         self._append_rows(self.storage.load_journal())
+        self._check_order()
         self._qe_prefill()
         QTimer.singleShot(0, self.tbl_j.scrollToBottom)      # свежие записи — внизу, их и показываем
 
@@ -840,15 +859,96 @@ class MainWindow(QMainWindow):
         if bad:
             QMessageBox.warning(self, "Быстрый ввод", "Не число: " + ", ".join(bad))
             return
-        self._append_rows([row])
+        if row["note"] and not self._confirm_note(row["note"]):
+            self.qe["note"].setFocus()
+            self.qe["note"].selectAll()
+            return
+        rows_now = self._table_to_rows()
+        pos = insert_position(rows_now, row["ts"])
+        if pos < len(rows_now):
+            self._insert_rows(pos, [row])
+            self.statusBar().showMessage(
+                f"Строка {row['ts']} вставлена на своё место по времени (строка {pos + 1} журнала).", 15000)
+            self.tbl_j.scrollToItem(self.tbl_j.item(pos, 0))
+            self.tbl_j.selectRow(pos)
+        else:
+            self._append_rows([row])
+            self.tbl_j.scrollToBottom()
         self._save_journal()
         self.storage.log_event("sample", {"ts": row["ts"], "late_min": round(
             (datetime.now() - self.qe_time.dateTime().toPython()).total_seconds() / 60.0, 1)})
-        self.tbl_j.scrollToBottom()
-        self.qe_time.setDateTime(self.qe_time.dateTime().addSecs(30 * 60))
+        if pos < len(rows_now):
+            self._qe_prefill_time()
+        else:
+            self.qe_time.setDateTime(self.qe_time.dateTime().addSecs(30 * 60))
         for key in ("w_in", "w_out", "t_a1", "t_a2", "note"):
             self.qe[key].clear()
         self.qe["w_in"].setFocus()
+
+    def _confirm_note(self, note: str) -> bool:
+        """Примечание со словом-командой не по образцу события — переспросить (слова-ловушки)."""
+        meaning = note_trap(note)
+        if not meaning:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Примечание")
+        box.setText(f"В примечании «{note}» есть слово, которое программа понимает как событие:")
+        box.setInformativeText(
+            "\n".join("• " + m for m in meaning)
+            + "\n\nЕсли это просто комментарий — перепишите его другими словами (например, «на выходе холодное» "
+              "вместо «охлаждено», «чистка люка» вместо «открыли люк», «Запуск подачи с 1 с.» вместо «закончили "
+              "рециркуляцию»). Подробно — «Справка» → «Как правильно работать», раздел 5.")
+        yes = box.addButton("Да, это событие", QMessageBox.YesRole)
+        box.addButton("Нет, исправлю примечание", QMessageBox.NoRole)
+        box.exec()
+        return box.clickedButton() is yes
+
+    def _qe_prefill_time(self) -> None:
+        """Время следующей пробы = последняя запись журнала + 30 мин."""
+        from .calibration import assign_times
+        times, reliable = assign_times(self._table_to_rows())
+        last = max((t for t in times if t is not None), default=None)
+        if reliable and last is not None:
+            self.qe_time.setDateTime(last + timedelta(minutes=30))
+
+    def _insert_rows(self, pos: int, rows: List[Dict]) -> None:
+        self._loading = True
+        try:
+            for k, r in enumerate(rows):
+                i = pos + k
+                self.tbl_j.insertRow(i)
+                for j, f in enumerate(FIELDS):
+                    v = r.get(f)
+                    txt = "" if v is None else (str(v) if f in TEXT_FIELDS else f"{v:g}")
+                    self.tbl_j.setItem(i, j, QTableWidgetItem(txt))
+        finally:
+            self._loading = False
+
+    def _check_order(self, rows: Optional[List[Dict]] = None) -> None:
+        """Показать предупреждение, если в журнале есть строки «из прошлого» не на своём месте."""
+        rows = self._table_to_rows() if rows is None else rows
+        bad = chronological_issues(rows)
+        if bad:
+            th = theme_for(self)
+            shown = ", ".join(f"{i + 1} ({rows[i].get('ts')})" for i in bad[:4]) + (" …" if len(bad) > 4 else "")
+            self.order_lbl.setText(
+                f"⚠ Строки не по порядку времени: {shown}. Программа читает журнал сверху вниз — такая строка режет "
+                f"проход на части. Нажмите «Упорядочить по времени».")
+            self.order_lbl.setStyleSheet(f"color:{th.error}; font-weight:bold;")
+        self.order_bar.setVisible(bool(bad))
+
+    def _sort_journal(self) -> None:
+        rows = self._table_to_rows()
+        order = chronological_order(rows)
+        if order == list(range(len(rows))):
+            self.order_bar.setVisible(False)
+            return
+        moved = sum(1 for k, i in enumerate(order) if k != i)
+        self.tbl_j.setRowCount(0)
+        self._append_rows([rows[i] for i in order])
+        self._save_journal()
+        self.statusBar().showMessage(f"Журнал упорядочен по времени (переставлено строк: {moved}).", 10000)
 
     def _blank_pdf(self) -> None:
         dlg = QDialog(self)
@@ -886,11 +986,20 @@ class MainWindow(QMainWindow):
                               batch.text().strip(), pass_no.text().strip())
         QMessageBox.information(self, "Бланк журнала", f"Сохранено: {path}\nЛистов: {n}. Откройте файл и распечатайте.")
 
-    def _journal_changed(self, *_args) -> None:
+    def _journal_changed(self, it=None, *_args) -> None:
         if not self._loading:
             self._save_timer.start()
+            if it is not None and FIELDS[it.column()] == "note":
+                meaning = note_trap(it.text())
+                if meaning:
+                    self.statusBar().showMessage(
+                        f"⚠ Примечание «{it.text()}» программа поймёт как событие: {meaning[0]}. Если это просто "
+                        f"комментарий — перепишите другими словами (Справка → «Как правильно работать», раздел 5).",
+                        30000)
 
     def _append_rows(self, rows: List[Dict]) -> None:
+        cache = getattr(self, "_rows_cache", None)
+        first = self.tbl_j.rowCount()
         self._loading = True
         try:
             for r in rows:
@@ -907,10 +1016,22 @@ class MainWindow(QMainWindow):
                     self.tbl_j.setItem(i, j, QTableWidgetItem(txt))
         finally:
             self._loading = False
+        if cache is not None:               # дописали в конец — дочитать только новые строки
+            self._rows_cache = cache + self._read_table_rows(first)
+
+    def _invalidate_rows(self, *_a) -> None:
+        self._rows_cache = None
 
     def _table_to_rows(self) -> List[Dict]:
+        """Строки журнала из таблицы. Разбор таблицы кэшируется до её следующего изменения (на журнале сезона —
+        тысячи строк, а читают его и напоминания, и «Сейчас», и сохранение); наружу — копии строк."""
+        if getattr(self, "_rows_cache", None) is None:
+            self._rows_cache = self._read_table_rows()
+        return [dict(r) for r in self._rows_cache]
+
+    def _read_table_rows(self, start: int = 0) -> List[Dict]:
         rows: List[Dict] = []
-        for i in range(self.tbl_j.rowCount()):
+        for i in range(start, self.tbl_j.rowCount()):
             row: Dict = {}
             empty = True
             for j, f in enumerate(FIELDS):
@@ -927,7 +1048,9 @@ class MainWindow(QMainWindow):
         return rows
 
     def _save_journal(self) -> None:
-        self.storage.replace_journal(self._table_to_rows())
+        rows = self._table_to_rows()
+        self.storage.replace_journal(rows)
+        self._check_order(rows)
         if not getattr(self, "_ready", False):
             return
         self.tab_check.mark_dirty()
@@ -1156,18 +1279,26 @@ class MainWindow(QMainWindow):
         QApplication.alert(self, 0)
 
     def _auto_calibrate(self) -> None:
-        """Тихая перекалибровка после правок журнала (включается на вкладке «Проверка модели»)."""
-        try:
-            new_p, rep = calibrate(self._table_to_rows(), self.params, half_life_days=self.tab_check.half_life(),
-                                   weather=self.weather_series())
-        except Exception:  # noqa: BLE001
+        """Тихая перекалибровка после правок журнала (включается на вкладке «Проверка модели»), в фоне."""
+        if getattr(self, "_cal_job", None) is not None:
+            self._auto_timer.start()          # идёт другая калибровка — попробовать позже
             return
-        if rep["n_used"] < 12:
-            return
-        from dataclasses import replace as _replace
-        new_p = _replace(new_p, calib_info=new_p.calib_info + " (автоматически)")
-        self.set_params(new_p)
-        self.report.setPlainText(rep["text"])
+        base = self.params
+
+        def done(res) -> None:
+            self._cal_job = None
+            new_p, rep = res
+            if rep["n_used"] < 12 or self.params is not base:    # мало данных или параметры уже поменяли
+                return
+            from dataclasses import replace as _replace
+            self.set_params(_replace(new_p, calib_info=new_p.calib_info + " (автоматически)"))
+            self.report.setPlainText(rep["text"])
+
+        def failed(_e) -> None:
+            self._cal_job = None
+
+        self._cal_job = worker.start(calibrate, self._table_to_rows(), base, half_life_days=self.tab_check.half_life(),
+                                     weather=self.weather_series(), on_done=done, on_error=failed)
 
     def _import_journal(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Импорт журнала", "", "Журнал (*.csv *.xlsx *.xlsm)")
@@ -1225,17 +1356,33 @@ class MainWindow(QMainWindow):
             self._save_timer.start()
 
     def _calibrate(self) -> None:
+        """Калибровка в фоне: окно не замирает; по готовности — отчёт и вопрос «Применить?»."""
+        if getattr(self, "_cal_job", None) is not None:
+            return
         rows = self._table_to_rows()
         self._save_journal()
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            new_p, rep = calibrate(rows, self.params, half_life_days=self.tab_check.half_life(),
-                                   weather=self.weather_series())
-        except Exception as e:  # noqa: BLE001
-            QApplication.restoreOverrideCursor()
+        btn = self.j_buttons["Калибровать модель"]
+        btn.setEnabled(False)
+        self.statusBar().showMessage("Калибровка модели по журналу…")
+        self._auto_timer.stop()
+
+        def finish() -> None:
+            self._cal_job = None
+            btn.setEnabled(True)
+            self.statusBar().clearMessage()
+
+        def failed(e) -> None:
+            finish()
             QMessageBox.warning(self, "Калибровка", str(e))
-            return
-        QApplication.restoreOverrideCursor()
+
+        def done(res) -> None:
+            finish()
+            self._calibrated(*res)
+
+        self._cal_job = worker.start(calibrate, rows, self.params, half_life_days=self.tab_check.half_life(),
+                                     weather=self.weather_series(), on_done=done, on_error=failed)
+
+    def _calibrated(self, new_p: mdl.DryerParams, rep: Dict) -> None:
         self.report.setPlainText(rep["text"])
         self.plot_cal.clear()
         if rep["pairs"]:
@@ -1755,6 +1902,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         try:
+            worker.cancel_all()
+            worker.wait_all(5000)
             self._save_timer.stop()
             self._save_journal()
             self._save_ui_state()

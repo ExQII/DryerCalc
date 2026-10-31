@@ -20,7 +20,7 @@ from app.backup import auto_backup, check_db, copy_db, restore_into  # noqa: E40
 from app.batches import balance, batches_from_journal, fuel_metrics, fuel_rate_from_batches, mix, schedule  # noqa: E402
 from app.calibration import calibrate, read_journal, recency_weights  # noqa: E402
 from app.live import live_forecast, live_state  # noqa: E402
-from app.model import Conditions, DryerParams, d_for_target, plan_by_passes, q_at, solve_pass, water_rate  # noqa: E402
+from app.model import Conditions, DryerParams, d_for_target, plan_by_passes, q_at, solve_pass, water_rate  # noqa: E402,F401
 from app.storage import Storage  # noqa: E402
 from app.weather import WeatherSeries, classify_header, merge_points, read_weather  # noqa: E402
 
@@ -536,6 +536,50 @@ def test_operator_mode_shows_only_shift_tabs():
 
 
 # ---------------------------------------------------------------------------
+# v0.7: расчёт по массивам (numpy) совпадает со скалярным solve_pass / pass_out
+# ---------------------------------------------------------------------------
+
+def test_vectorized_model_matches_scalar():
+    import random
+    from app.model import pass_rate_arr, q_at_arr, solve_out_arr
+    rnd = random.Random(7)
+    n = 400
+    w_in = [rnd.uniform(8.0, 40.0) for _ in range(n)] + [8.02, 8.05, 9.0, 45.0]
+    d = [rnd.uniform(-5.0, 110.0) for _ in range(n)] + [0.5, 1.0, 100.0, 150.0]
+    t_proc = [rnd.uniform(20.0, 90.0) for _ in range(len(w_in))]
+    t_amb = [rnd.choice([10.0, rnd.uniform(-15.0, 35.0)]) for _ in range(len(w_in))]
+    rh = [rnd.uniform(20.0, 100.0) for _ in range(len(w_in))]
+    table = [[10, 6.0], [35, 18.0], [60, 31.5], [100, 50.0]]
+    variants = [P, replace(P, model_kind="physics"), replace(P, q_table=table),
+                replace(P, model_kind="physics", q_table=table, kappa=0.7, eta=0.9, rate_scale=1.2),
+                replace(P, b_amb=0.08, b_rh=-0.3, rate_scale=0.8)]
+    for par in variants:
+        wo, q = solve_out_arr(par, w_in, d, t_proc, t_amb, rh)
+        rate = pass_rate_arr(w_in, wo, q)
+        for i in range(len(w_in)):
+            ps = solve_pass(par, Conditions(t_proc[i], t_amb[i], rh[i]), w_in[i], 1.0, d[i])
+            assert abs(ps.w_out - wo[i]) < 1e-9, (par.model_kind, i, ps.w_out, wo[i])
+            assert abs(ps.q - q[i]) < 1e-12 and abs(ps.rate - rate[i]) < 1e-9
+        dd = [-1.0, 0.0, 3.0, 10.0, 35.0, 59.9, 100.0, 120.0]
+        assert all(abs(q_at(par, x) - y) < 1e-12 for x, y in zip(dd, q_at_arr(par, dd)))
+
+
+def test_physics_batch_matches_scalar_pass_out():
+    import random
+    from app.physics import PhysBatch, pass_out
+    rnd = random.Random(11)
+    obs = [(rnd.uniform(12, 38), rnd.uniform(5, 100), rnd.uniform(35, 85), rnd.uniform(-10, 30), rnd.uniform(30, 95))
+           for _ in range(300)]
+    for eta, kappa in ((0.52, 1.0), (1.7, 0.4), (0.05, 0.9)):
+        b = PhysBatch(P, [o[0] for o in obs], [o[1] for o in obs], [o[2] for o in obs], [o[3] for o in obs],
+                      [o[4] for o in obs], kappa)
+        out = b.out(eta)
+        for o, v in zip(obs, out):
+            ref = pass_out(P, Conditions(o[2], o[3], o[4]), o[0], o[1], eta, kappa)
+            assert abs(ref - v) < 1e-9, (o, ref, v)
+
+
+# ---------------------------------------------------------------------------
 # «Правила работы» (docs/rules_ru.txt): то, что там написано о разборе журнала, должно оставаться правдой.
 # Если тест упал после изменения программы — обновите разделы 4–8, 10 и 20 правил.
 # ---------------------------------------------------------------------------
@@ -546,7 +590,7 @@ def _jr(ts, wi=None, wo=None, d=35, note=""):
 
 
 def test_rules_doc_journal_claims_hold():
-    from app.calibration import prepare
+    from app.calibration import chronological_issues, chronological_order, insert_position, note_trap, prepare
     from app.reminders import drying_active
     base = [_jr("08:00", note="Запуск"), _jr("08:30", 32.4, 30.8), _jr("09:00", 32.1, 30.3)]
     segs = lambda rows: [r["seg"] for r in prepare(rows)[0]]  # noqa: E731
@@ -563,15 +607,37 @@ def test_rules_doc_journal_claims_hold():
     # перерыв > 1,5 ч режет проход, строка «без пробы» — нет (раздел 4.3)
     assert segs(base + [_jr("11:00", 32, 26)])[-1] == 1
     assert segs(base + [_jr("10:00", note="без пробы"), _jr("11:00", 32, 26)])[-1] == 0
-    # забытая строка «из прошлого» в конце режет проход на следующей записи (раздел 8)
+    # строка «из прошлого» в конце журнала режет проход (поэтому программа вставляет её на место — раздел 8)
     late = base + [_jr("09:30", 32, 29), _jr("10:00", 32, 28), _jr("08:45", 32, 30), _jr("10:30", 32, 27)]
     assert segs(late)[-1] == 1
-    # «Остановка» без пробы глушит напоминания; после «Запуск» «выгружено» считается заново (раздел 6.3)
-    stop = base + [_jr("09:10", note="Остановка: силос 1 полный, осталось 210 т")]
+    assert chronological_issues(late) == [5]
+    fixed = [late[i] for i in chronological_order(late)]
+    assert [r["ts"][-5:] for r in fixed] == ["08:00", "08:30", "08:45", "09:00", "09:30", "10:00", "10:30"]
+    assert chronological_issues(fixed) == [] and segs(fixed)[-1] == 0
+    assert insert_position(late[:5], "25.10.26 08:45") == 2 and insert_position(late[:5], "25.10.26 11:00") == 5
+    # «Остановка» без пробы глушит напоминания; после «Запуск» проход продолжается: «выгружено» не обнуляется,
+    # время остановки не считается (раздел 6.3)
+    stop = base + [_jr("09:10", note="Остановка: силос 1 полный")]
     assert not drying_active(stop, datetime(2026, 10, 25, 9, 40))[0]
     run = stop + [_jr("09:50", note="Запуск"), _jr("10:00", 32, 29), _jr("10:30", 32, 28)]
     st = live_state(run, P)
-    assert st.start == datetime(2026, 10, 25, 9, 50) and abs(st.unloaded - q_at(P, 35) * 40 / 60) < 1e-6
+    assert st.start == datetime(2026, 10, 25, 8, 0)
+    assert abs(st.unloaded - q_at(P, 35) * (70 + 40) / 60) < 1e-6, st.unloaded
+    assert drying_active(run, datetime(2026, 10, 25, 10, 40))[2] == drying_active(base, datetime(2026, 10, 25, 9, 5))[2]
+    # другой номер прохода после остановки — уже новый проход
+    other = stop + [dict(_jr("09:50", note="Запуск"), pass_no=2), dict(_jr("10:00", 32, 29), pass_no=2),
+                    dict(_jr("10:30", 32, 28), pass_no=2)]
+    st2 = live_state(other, P)
+    assert st2.start == datetime(2026, 10, 25, 9, 50) and abs(st2.unloaded - q_at(P, 35) * 40 / 60) < 1e-6
+    # слова-ловушки: программа переспрашивает (раздел 5.3), явные события — нет
+    for trap in ("зерно на выходе хорошо охлаждено", "закончили рециркуляцию", "рециркуляция воздуха",
+                 "открыли люк, почистили", "переключили вентилятор", "загрузка машины", "снимаем пробу",
+                 "отключили блок управления нории"):
+        assert note_trap(trap), trap
+    for ev in ("Запуск, сушим с 2 с. в 1 с.", "Закончился 2 с., сушим с 1 с.", "Остановка: силос 1 полный",
+               "рециркуляция", "охлаждение", "Откл. т.б.", "Запуск подачи с 1 с.", "открыли с 1 с.",
+               "Остановка, закончили партию К-07", "без пробы", "D 35→38 по «Сейчас»", "на выходе холодное"):
+        assert note_trap(ev) is None, ev
     # сам файл правил на месте и содержит ключевые разделы
     text = open(os.path.join(ROOT, "docs", "rules_ru.txt"), encoding="utf-8-sig").read()
     for key in ("СЛОВА-ЛОВУШКИ", "ЗАДАНИЕ НА СУШКУ ПАРТИИ", "ЧЕК-ЛИСТЫ", "ОДИН КОМПЬЮТЕР, ОДНА БАЗА"):

@@ -1,56 +1,62 @@
-"""Простой график на QPainter: линии, точки, горизонтальные линии, сетка, подписи осей.
+"""Графики программы на pyqtgraph: масштаб колесом мыши, сдвиг левой кнопкой, значения под курсором,
+двойной щелчок — показать всё, правая кнопка — меню (показать всё, сохранить / скопировать картинку).
 
-Заменяет pyqtgraph + numpy (около 20 МБ в собранном .exe) — для трёх графиков программы этого достаточно.
+Интерфейс прежний (SimplePlot: add_line, add_points, add_hline, set_labels, set_title, include_zero, clear),
+поэтому вкладки программы не зависят от того, чем рисуется график. Цвета берутся из темы (светлая/тёмная) по
+смыслу линии: «line», «target», «ref», «dot».
 """
 from __future__ import annotations
 
-import math
+import os
 from typing import List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt
-from PySide6.QtGui import QBrush, QFont, QFontMetrics, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QSizePolicy, QWidget
+os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 
-from .theme import theme_for
+import numpy as np  # noqa: E402
+import pyqtgraph as pg  # noqa: E402
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer  # noqa: E402
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPen  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSizePolicy, QWidget  # noqa: E402
 
+from .theme import theme_for  # noqa: E402
 
-def nice_ticks(lo: float, hi: float, target: int = 6) -> Tuple[List[float], float]:
-    """Деления «круглыми» числами (шаг 1·2·2,5·5·10 · 10^k) в пределах [lo, hi]."""
-    if not (hi - lo > 1e-12):
-        hi = lo + 1.0
-    raw = (hi - lo) / max(target, 1)
-    mag = 10.0 ** math.floor(math.log10(raw))
-    step = mag * 10.0
-    for m in (1.0, 2.0, 2.5, 5.0, 10.0):
-        if m * mag >= raw - 1e-12:
-            step = m * mag
-            break
-    t = math.ceil(lo / step - 1e-9) * step
-    ticks: List[float] = []
-    while t <= hi + step * 1e-9:
-        ticks.append(round(t, 10))
-        t += step
-    return ticks, step
+pg.setConfigOptions(antialias=True, useNumba=False, exitCleanup=False)
 
 
-def _tick_text(value: float, step: float) -> str:
-    dec = 0
-    while dec < 6 and abs(step * 10 ** dec - round(step * 10 ** dec)) > 1e-9:
-        dec += 1
-    text = f"{value:.{dec}f}"
-    return "0" if text in ("-0", "-0.0", "-0.00") else text
+def fmt_num(v: float) -> str:
+    """Число для подписи: до двух знаков после запятой, десятичная запятая."""
+    if abs(v) >= 100:
+        s = f"{v:.0f}"
+    elif abs(v) >= 10:
+        s = f"{v:.1f}"
+    else:
+        s = f"{v:.2f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s.replace(".", ",").replace("-", "−")
+
+
+class _Axis(pg.AxisItem):
+    """Подписи делений с десятичной запятой."""
+
+    def tickStrings(self, values, scale, spacing):  # noqa: N802
+        return [s.replace(".", ",").replace("-", "−") for s in super().tickStrings(values, scale, spacing)]
 
 
 class _Series:
     def __init__(self, kind: str, xs: Sequence[float], ys: Sequence[float], color: str, width: float, dashed: bool):
-        self.kind, self.xs, self.ys, self.color, self.width, self.dashed = kind, list(xs), list(ys), color, width, dashed
+        self.kind, self.color, self.width, self.dashed = kind, color, width, dashed
+        self.xs = np.asarray(list(xs), dtype=float)
+        self.ys = np.asarray(list(ys), dtype=float)
 
 
-class SimplePlot(QWidget):
-    """Белый график с рамкой, серой сеткой и подписями осей."""
+class SimplePlot(pg.PlotWidget):
+    """График с сеткой, подписями осей и подсказкой значений под курсором."""
+
+    HELP = "Колесо мыши — масштаб, левая кнопка — сдвиг, двойной щелчок — показать всё, правая кнопка — меню."
 
     def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
+        super().__init__(parent, axisItems={"bottom": _Axis("bottom"), "left": _Axis("left")})
         self._series: List[_Series] = []
         self._hlines: List[Tuple[float, str, bool]] = []
         self._title = ""
@@ -58,54 +64,127 @@ class SimplePlot(QWidget):
         self._ylabel = ""
         self._zero_x = False
         self._zero_y = False
+        pi = self.getPlotItem()
+        pi.setMenuEnabled(False)          # своё меню на русском вместо английского меню pyqtgraph
+        pi.hideButtons()
+        self.vb = pi.getViewBox()
+        self.vb.setMenuEnabled(False)
+        pi.showGrid(x=True, y=True, alpha=0.3)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(260, 170)
-        self.setAutoFillBackground(False)
+        self._marker = pg.ScatterPlotItem(size=12, symbol="o")
+        self._tip = pg.TextItem(anchor=(0, 1))
+        self._redraw_timer = QTimer(self)
+        self._redraw_timer.setSingleShot(True)
+        self._redraw_timer.setInterval(0)
+        self._redraw_timer.timeout.connect(self._redraw)
+        self.scene().sigMouseMoved.connect(self._on_move)
+        self.scene().sigMouseClicked.connect(self._on_click)
+        self._apply_theme()
 
-    # --- API ------------------------------------------------------------
-    def clear(self) -> None:
+    # --- API (как у прежнего SimplePlot) --------------------------------
+    def clear(self) -> None:  # noqa: D401 — совместимость: очищает данные графика
         self._series.clear()
         self._hlines.clear()
         self._title = ""
-        self.update()
+        self._schedule()
 
     def set_labels(self, x_label: str, y_label: str) -> None:
         self._xlabel, self._ylabel = x_label, y_label
-        self.update()
+        self._apply_labels()
 
     def set_title(self, text: str) -> None:
         self._title = text
-        self.update()
+        self._apply_labels()
 
     def include_zero(self, x: bool = False, y: bool = False) -> None:
         self._zero_x, self._zero_y = x, y
-        self.update()
+        self._schedule()
 
     def add_line(self, xs: Sequence[float], ys: Sequence[float], color: str = "line", width: float = 2.0,
                  dashed: bool = False) -> None:
         self._series.append(_Series("line", xs, ys, color, width, dashed))
-        self.update()
+        self._schedule()
 
     def add_points(self, xs: Sequence[float], ys: Sequence[float], color: str = "dot", size: float = 6.0) -> None:
         self._series.append(_Series("points", xs, ys, color, size, False))
-        self.update()
+        self._schedule()
 
     def add_hline(self, y: float, color: str = "target", dashed: bool = True) -> None:
         self._hlines.append((float(y), color, dashed))
-        self.update()
+        self._schedule()
 
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(520, 300)
 
-    # --- диапазоны ------------------------------------------------------
+    def show_all(self) -> None:
+        """Вернуть масштаб по данным (как до масштабирования мышью)."""
+        x0, x1, y0, y1 = self._data_range()
+        # по оси X только целые (номер прохода) — и деления целые
+        xs = [s.xs for s in self._series if len(s.xs)]
+        ax = self.getPlotItem().getAxis("bottom")
+        if xs and all(np.all(np.mod(a, 1.0) == 0) for a in xs) and 0 < x1 - x0 <= 40:
+            step = max(1, int(np.ceil((x1 - x0) / 10)))
+            ax.setTickSpacing(major=step, minor=step)
+        else:
+            ax.setTickSpacing()
+        self.vb.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=0.0)
+
+    # --- оформление -----------------------------------------------------
+    def _schedule(self) -> None:
+        self._redraw_timer.start()
+
+    def _apply_theme(self) -> None:
+        th = theme_for(self)
+        self.setBackground(th.plot_bg)
+        pi = self.getPlotItem()
+        font = self.font()
+        for name in ("bottom", "left"):
+            ax = pi.getAxis(name)
+            ax.setPen(pg.mkPen(th.plot_ink, width=1))
+            ax.setTextPen(pg.mkPen(th.plot_ink))
+            ax.setStyle(tickFont=font, maxTickLevel=1)
+        self._tip.fill = pg.mkBrush(QColor(th.plot_bg.red(), th.plot_bg.green(), th.plot_bg.blue(), 230))
+        self._tip.border = pg.mkPen(th.plot_grid)
+        self._tip.setColor(th.plot_ink)
+        self._apply_labels()
+        self._redraw()
+
+    def _apply_labels(self) -> None:
+        th = theme_for(self)
+        pi = self.getPlotItem()
+        pt = max(self.font().pointSizeF(), 7.0)
+        style = {"color": th.plot_ink.name(), "font-size": f"{pt:.0f}pt"}
+        fm = QFontMetrics(QFont(self.font().family(), int(round(pt))))
+        room = {"bottom": max(self.vb.width(), self.width() - 80), "left": max(self.vb.height(), 60)}
+        for side, text in (("bottom", self._xlabel), ("left", self._ylabel)):
+            if text:
+                # длинная подпись не обрезается краем, а сокращается с «…» (полная — в подсказке под курсором)
+                pi.setLabel(side, fm.elidedText(text, Qt.ElideRight, int(room[side]) - 6), **style)
+            else:
+                pi.getAxis(side).showLabel(False)
+        if self._title:
+            pi.setTitle(self._title, color=th.plot_ink.name(), size=f"{pt:.0f}pt")
+        else:
+            pi.setTitle(None)
+
+    def resizeEvent(self, ev) -> None:  # noqa: N802
+        super().resizeEvent(ev)
+        if hasattr(self, "_series"):
+            QTimer.singleShot(0, self._apply_labels)
+
+    def changeEvent(self, ev) -> None:  # noqa: N802 — тема Windows или шрифт поменялись на ходу
+        super().changeEvent(ev)
+        if hasattr(self, "_series") and ev.type() in (QEvent.PaletteChange, QEvent.StyleChange, QEvent.FontChange):
+            self._apply_theme()
+
     def _data_range(self) -> Tuple[float, float, float, float]:
-        xs = [x for s in self._series for x in s.xs]
-        ys = [y for s in self._series for y in s.ys] + [h[0] for h in self._hlines]
-        if not xs:
-            xs = [0.0, 1.0]
-        if not ys:
-            ys = [0.0, 1.0]
-        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        xs = [s.xs[np.isfinite(s.xs)] for s in self._series if len(s.xs)]
+        ys = [s.ys[np.isfinite(s.ys)] for s in self._series if len(s.ys)]
+        xs = np.concatenate(xs) if xs else np.array([])
+        ys = np.concatenate(ys + [np.array([h[0] for h in self._hlines])]) if (ys or self._hlines) else np.array([])
+        x0, x1 = (float(xs.min()), float(xs.max())) if xs.size else (0.0, 1.0)
+        y0, y1 = (float(ys.min()), float(ys.max())) if ys.size else (0.0, 1.0)
         if self._zero_x:
             x0 = min(x0, 0.0)
         if self._zero_y:
@@ -116,121 +195,97 @@ class SimplePlot(QWidget):
             y1 = y0 + 1.0
         pad_y = 0.05 * (y1 - y0)
         pad_x = 0.0 if self._zero_x else 0.03 * (x1 - x0)
-        y_lo = y0 if (self._zero_y and y0 == 0.0) else y0 - pad_y      # от нуля — без запаса снизу
+        y_lo = y0 if (self._zero_y and y0 == 0.0) else y0 - pad_y
         return x0 - pad_x, x1 + pad_x, y_lo, y1 + pad_y
 
-    # --- рисование ------------------------------------------------------
-    def paintEvent(self, _event) -> None:  # noqa: N802
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setRenderHint(QPainter.TextAntialiasing, True)
-        w, h = self.width(), self.height()
+    def _redraw(self) -> None:
         th = theme_for(self)
-        p.fillRect(0, 0, w, h, th.plot_bg)
-        ink = th.plot_ink
-        grid = th.plot_grid
-
-        base = QFont(self.font())
-        small = QFont(base)
-        small.setPointSizeF(max(base.pointSizeF() - 1.0, 7.0))
-        title_font = QFont(base)
-        title_font.setPointSizeF(base.pointSizeF() + 1.0)
-        fm_t = QFontMetrics(small)
-        fm_title = QFontMetrics(title_font)
-        label_h = fm_t.height()
-
-        x_lo, x_hi, y_lo, y_hi = self._data_range()
-
-        # приблизительная область для выбора числа делений
-        approx_w = max(w - 80, 120)
-        approx_h = max(h - 90, 60)
-        xt, xstep = nice_ticks(x_lo, x_hi, int(min(max(approx_w / 70, 3), 10)))
-        yt, ystep = nice_ticks(y_lo, y_hi, int(min(max(approx_h / 38, 3), 8)))
-        y_labels = [_tick_text(v, ystep) for v in yt]
-        x_labels = [_tick_text(v, xstep) for v in xt]
-        ytick_w = max((fm_t.horizontalAdvance(s) for s in y_labels), default=20)
-
-        left = 10 + (label_h + 4 if self._ylabel else 0) + ytick_w + 8
-        right = 16
-        top = 10 + (fm_title.height() + 8 if self._title else 0)
-        bottom = 8 + label_h + 6 + (label_h + 4 if self._xlabel else 0)
-        pw, ph = w - left - right, h - top - bottom
-        if pw < 40 or ph < 30:
-            p.end()
-            return
-        rect = QRectF(left, top, pw, ph)
-
-        def sx(x: float) -> float:
-            return rect.left() + (x - x_lo) / (x_hi - x_lo) * rect.width()
-
-        def sy(y: float) -> float:
-            return rect.bottom() - (y - y_lo) / (y_hi - y_lo) * rect.height()
-
-        # сетка и подписи делений
-        p.setFont(small)
-        p.setPen(QPen(grid, 1))
-        for v in xt:
-            x = sx(v)
-            p.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
-        for v in yt:
-            y = sy(v)
-            p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
-        p.setPen(QPen(ink, 1))
-        for v, s in zip(xt, x_labels):
-            x = sx(v)
-            p.drawText(QRectF(x - 30, rect.bottom() + 4, 60, label_h), Qt.AlignHCenter | Qt.AlignTop, s)
-        for v, s in zip(yt, y_labels):
-            y = sy(v)
-            p.drawText(QRectF(rect.left() - ytick_w - 6, y - label_h / 2, ytick_w, label_h),
-                       Qt.AlignRight | Qt.AlignVCenter, s)
-
-        # данные (с обрезкой по области графика)
-        p.save()
-        p.setClipRect(rect.adjusted(-1, -1, 1, 1))
+        pi = self.getPlotItem()
+        pi.clear()
         for yv, color, dashed in self._hlines:
-            pen = QPen(th.role(color), 1.5)
-            pen.setStyle(Qt.DashLine if dashed else Qt.SolidLine)
-            p.setPen(pen)
-            p.drawLine(QPointF(rect.left(), sy(yv)), QPointF(rect.right(), sy(yv)))
+            pen = pg.mkPen(th.role(color), width=1.5)
+            if dashed:
+                pen.setStyle(Qt.DashLine)
+            pi.addItem(pg.InfiniteLine(pos=yv, angle=0, pen=pen))
         for s in self._series:
             if s.kind == "line" and len(s.xs) >= 2:
-                pen = QPen(th.role(s.color), s.width)
+                pen = pg.mkPen(th.role(s.color), width=s.width)
                 pen.setStyle(Qt.DashLine if s.dashed else Qt.SolidLine)
                 pen.setJoinStyle(Qt.RoundJoin)
                 pen.setCapStyle(Qt.RoundCap)
-                p.setPen(pen)
-                p.setBrush(Qt.NoBrush)
-                path = QPainterPath(QPointF(sx(s.xs[0]), sy(s.ys[0])))
-                for x, y in zip(s.xs[1:], s.ys[1:]):
-                    path.lineTo(sx(x), sy(y))
-                p.drawPath(path)
-            elif s.kind == "points":
-                p.setPen(QPen(th.plot_bg, 0.8))
-                p.setBrush(QBrush(th.role(s.color)))
-                r = s.width / 2.0
-                for x, y in zip(s.xs, s.ys):
-                    p.drawEllipse(QPointF(sx(x), sy(y)), r, r)
-        p.restore()
+                pi.addItem(pg.PlotCurveItem(s.xs, s.ys, pen=pen))
+            elif s.kind == "points" and len(s.xs):
+                pi.addItem(pg.ScatterPlotItem(s.xs, s.ys, size=s.width, symbol="o",
+                                              pen=pg.mkPen(th.plot_bg, width=0.8), brush=pg.mkBrush(th.role(s.color))))
+        self._marker.setPen(pg.mkPen(th.plot_ink, width=1.5))
+        self._marker.setBrush(pg.mkBrush(None))
+        self._marker.setData([], [])
+        self._tip.setVisible(False)
+        pi.addItem(self._marker, ignoreBounds=True)
+        pi.addItem(self._tip, ignoreBounds=True)
+        self._marker.setZValue(100)
+        self._tip.setZValue(101)
+        self.show_all()
 
-        # рамка
-        p.setPen(QPen(ink, 1))
-        p.setBrush(Qt.NoBrush)
-        p.drawRect(rect)
+    # --- мышь -----------------------------------------------------------
+    def _on_move(self, pos) -> None:
+        if not self._series or not self.vb.sceneBoundingRect().contains(pos):
+            self._marker.setData([], [])
+            self._tip.setVisible(False)
+            return
+        p = self.vb.mapSceneToView(pos)
+        pxw, pxh = self.vb.viewPixelSize()
+        if not pxw or not pxh:
+            return
+        best = None
+        for s in self._series:
+            if not len(s.xs):
+                continue
+            d2 = ((s.xs - p.x()) / pxw) ** 2 + ((s.ys - p.y()) / pxh) ** 2
+            i = int(np.nanargmin(d2)) if np.isfinite(d2).any() else -1
+            if i >= 0 and (best is None or d2[i] < best[0]):
+                best = (float(d2[i]), float(s.xs[i]), float(s.ys[i]))
+        if best is None or best[0] > 22.0 ** 2:
+            self._marker.setData([], [])
+            self._tip.setVisible(False)
+            return
+        _, x, y = best
+        self._marker.setData([x], [y])
+        xl = self._xlabel or "x"
+        yl = self._ylabel or "y"
+        self._tip.setText(f"{yl}: {fmt_num(y)}\n{xl}: {fmt_num(x)}")
+        # подсказка — с той стороны от точки, где больше места
+        (vx0, vx1), (vy0, vy1) = self.vb.viewRange()
+        self._tip.setAnchor((1.0 if x > 0.5 * (vx0 + vx1) else 0.0, 0.0 if y > 0.5 * (vy0 + vy1) else 1.0))
+        self._tip.setPos(x, y)
+        self._tip.setVisible(True)
 
-        # заголовок и подписи осей
-        if self._title:
-            p.setFont(title_font)
-            text = fm_title.elidedText(self._title, Qt.ElideRight, int(w - 20))
-            p.drawText(QRectF(10, 6, w - 20, fm_title.height() + 2), Qt.AlignHCenter | Qt.AlignVCenter, text)
-        p.setFont(small)
-        if self._xlabel:
-            p.drawText(QRectF(rect.left(), h - label_h - 4, rect.width(), label_h), Qt.AlignHCenter | Qt.AlignVCenter,
-                       fm_t.elidedText(self._xlabel, Qt.ElideRight, int(rect.width())))
-        if self._ylabel:
-            p.save()
-            p.translate(12 + label_h / 2, rect.center().y())
-            p.rotate(-90)
-            p.drawText(QRectF(-rect.height() / 2, -label_h / 2, rect.height(), label_h), Qt.AlignHCenter | Qt.AlignVCenter,
-                       fm_t.elidedText(self._ylabel, Qt.ElideRight, int(rect.height())))
-            p.restore()
-        p.end()
+    def _on_click(self, ev) -> None:
+        if ev.button() == Qt.LeftButton and ev.double():
+            self.show_all()
+            ev.accept()
+        elif ev.button() == Qt.RightButton:
+            ev.accept()
+            self._menu(ev.screenPos().toPoint())
+
+    def _menu(self, global_pos) -> None:
+        m = QMenu(self)
+        m.addAction("Показать всё", self.show_all)
+        m.addSeparator()
+        m.addAction("Сохранить картинку (PNG)…", self._save_png)
+        m.addAction("Копировать картинку", lambda: QApplication.clipboard().setPixmap(self.grab()))
+        m.addSeparator()
+        hint = m.addAction(self.HELP)
+        hint.setEnabled(False)
+        m.exec(global_pos)
+
+    def _save_png(self) -> None:
+        name = (self._title or self._ylabel or "график").split(";")[0].split(":")[0].strip()[:40] or "график"
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить график", f"{name}.png", "Картинка PNG (*.png)")
+        if path:
+            self._marker.setData([], [])
+            self._tip.setVisible(False)
+            self.grab().save(path, "PNG")
+
+    def pen_for(self, role: str, width: float = 2.0) -> QPen:
+        return pg.mkPen(theme_for(self).role(role), width=width)

@@ -73,6 +73,8 @@ def run(out_path: str) -> int:
         win._append_rows(rows)
         win._qe_prefill()
         win._calibrate()
+        from . import worker as _worker
+        _worker.wait_all()
         check("откалибрована" in win.banner.text(), "кнопка «Калибровать модель» отработала, баннер: " + win.banner.text()[:40])
         check(0.2 < win.params.eta < 1.5, f"физическая модель откалибрована: η = {win.params.eta:.2f}")
         win._apply_settings()
@@ -126,6 +128,7 @@ def run(out_path: str) -> int:
         check(st is not None and st.ok and "D =" in win.tab_live.summary.text(),
               f"«Сейчас»: проход {st.batch if st else '?'}, выгружено {st.unloaded:.0f} т" if st else "«Сейчас» не посчитан")
         win.tab_check.refresh()
+        _worker.wait_all()
         check(win.tab_check.tbl.rowCount() == 4, f"проверка модели: проходов {win.tab_check.tbl.rowCount()}")
         check(0.02 <= win.params.rate_sigma <= 0.3 and "проверка" in win.params.rate_sigma_info,
               f"допуск прогнозов по проверке: σ = {win.params.rate_sigma * 100:.1f} %")
@@ -172,6 +175,45 @@ def run(out_path: str) -> int:
         xl_p = os.path.join(tmp, "pilot.xlsx")
         _pilot.export_xlsx(xl_p, st_p, win.storage.load_events())
         check(os.path.getsize(xl_p) > 3000, f"отчёт пилота Excel: {os.path.getsize(xl_p)} байт")
+        # --- v0.7: numpy и pyqtgraph внутри exe, расчёт по массивам, журнал по порядку, слова-ловушки, графики ---
+        import numpy as _np
+        import pyqtgraph as _pg
+        from .model import Conditions as _C, solve_out_arr as _soa
+        _wo, _q = _soa(new_p, [30.0, 24.0], [35.0, 50.0], 60.0, 10.0, 70.0)
+        _ws = [mdl.solve_pass(new_p, _C(60.0, 10.0, 70.0), w, 1.0, d).w_out for w, d in ((30.0, 35.0), (24.0, 50.0))]
+        check(max(abs(a - b) for a, b in zip(_wo, _ws)) < 1e-9,
+              f"numpy {_np.__version__}, pyqtgraph {_pg.__version__}: расчёт по массивам совпадает со скалярным")
+        from .calibration import note_trap as _trap
+        check(bool(_trap("зерно на выходе хорошо охлаждено")) and _trap("Остановка: силос полный") is None,
+              "слова-ловушки в примечании распознаются")
+        from PySide6.QtCore import QDateTime as _QDT
+        n_before = win.tbl_j.rowCount()
+        last_ts = win.tbl_j.item(n_before - 1, 0).text()
+        mid_ts = win.tbl_j.item(n_before // 2, 0).text()
+        mid = _QDT.fromString(mid_ts, "dd.MM.yy HH:mm").addSecs(5 * 60)
+        win.qe_time.setDateTime(mid)
+        win.qe["w_in"].setText("30,1")
+        win.qe["w_out"].setText("25,2")
+        win.qe["note"].setText("")
+        win._qe_add()
+        pos = next((i for i in range(win.tbl_j.rowCount()) if win.tbl_j.item(i, 0).text() == mid.toString("dd.MM.yy HH:mm")), -1)
+        check(win.tbl_j.rowCount() == n_before + 1 and 0 < pos < n_before and win.tbl_j.item(n_before, 0).text() == last_ts
+              and not win.order_bar.isVisibleTo(win),
+              f"забытая проба {mid.toString('HH:mm')} встала на своё место (строка {pos + 1} из {n_before + 1})")
+        win.tbl_j.removeRow(pos)
+        win._save_journal()
+        pl = win.plot
+        pl.show_all()
+        app.processEvents()
+        (x0, x1), _ = pl.vb.viewRange()
+        pl.vb.scaleBy((0.5, 0.5))
+        app.processEvents()
+        (z0, z1), _ = pl.vb.viewRange()
+        pl.show_all()
+        app.processEvents()
+        (r0, r1), _ = pl.vb.viewRange()
+        check(z1 - z0 < 0.6 * (x1 - x0) and abs((r1 - r0) - (x1 - x0)) < 1e-6 * max(1.0, x1 - x0),
+              "интерактивный график: масштаб и «показать всё»")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

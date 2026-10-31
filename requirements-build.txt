@@ -4,5 +4,10 @@ PySide6-Essentials==6.9.3
 shiboken6==6.9.3
 openpyxl==3.1.5
 et_xmlfile==2.0.0
+# numpy 1.26.x: базовый набор команд процессора SSE3 — работает и на старых компьютерах (numpy ≥ 2.4 требует
+# x86-64-v2, процессоры примерно с 2009 г.); результаты расчётов от версии numpy не зависят
+numpy==1.26.4
+pyqtgraph==0.14.0
+colorama==0.4.6
 pyinstaller==6.22.3
 pyinstaller-hooks-contrib==2026.9

@@ -3,10 +3,12 @@
 # Папка для установщика — DryerCalc_dir.spec
 import os
 
-# Минимальная сборка: графики рисуются своим кодом (app/plots.py), расчёты без numpy — поэтому numpy, pyqtgraph,
-# OpenGL и сетевые модули Qt в exe не нужны (ужимают файл с ~50 до ~27 МБ).
+# v0.7: расчёты на numpy, графики на pyqtgraph. Не нужны: OpenGL (pyqtgraph рисует 2D через QPainter), сетевые и
+# прочие модули Qt, matplotlib/scipy, части pyqtgraph для 3D, Jupyter, консоли, примеров.
 EXCLUDES = [
-    "numpy", "pyqtgraph", "matplotlib", "scipy", "tkinter", "unittest", "ssl", "_ssl", "_hashlib",
+    "matplotlib", "scipy", "pandas", "tkinter", "unittest", "ssl", "_ssl", "_hashlib",
+    "pyqtgraph.examples", "pyqtgraph.opengl", "pyqtgraph.jupyter", "pyqtgraph.flowchart", "pyqtgraph.console",
+    "pyqtgraph.dockarea", "OpenGL", "IPython", "jupyter_rfb", "cupy", "numba", "h5py", "PyQt5", "PyQt6", "PySide2",
     "PySide6.QtOpenGL", "PySide6.QtOpenGLWidgets", "PySide6.QtSvg", "PySide6.QtQml", "PySide6.QtQuick",
     "PySide6.QtDBus", "PySide6.QtDesigner", "PySide6.QtHelp", "PySide6.QtSql", "PySide6.QtTest",
     "PySide6.QtConcurrent", "PySide6.QtXml", "PySide6.QtNetwork", "PySide6.QtPrintSupport",

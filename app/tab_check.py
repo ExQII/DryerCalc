@@ -6,9 +6,10 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush
-from PySide6.QtWidgets import (QApplication, QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
+from PySide6.QtWidgets import (QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
                                QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget)
 
+from . import worker
 from .analysis import backtest, drift_text, rate_sigma_from_backtest
 from .doe import explored_passes, suggest, typical_regime
 from .plots import SimplePlot
@@ -25,6 +26,7 @@ class CheckTab(QWidget):
         self.win = win
         self._dirty = True
         self._doe_dirty = True
+        self._job = None
         tabs = QTabWidget()
         self.sub = tabs
         QVBoxLayout(self).addWidget(tabs)
@@ -63,6 +65,7 @@ class CheckTab(QWidget):
         b = QPushButton("Пересчитать проверку")
         b.clicked.connect(self.refresh)
         right.addWidget(b)
+        self.btn_recalc = b
         right.addStretch(1)
         top.addLayout(right)
         top.addStretch(1)
@@ -102,15 +105,44 @@ class CheckTab(QWidget):
             self.refresh_doe()
 
     def refresh(self) -> None:
+        """Проверка модели считается в фоне (на журнале сезона — около секунды, на старом компьютере дольше);
+        окно при этом не замирает, ход расчёта виден в сводке."""
         th = theme_for(self)
         self.hint.setStyleSheet(f"color:{th.muted};")
+        if self._job is not None:
+            self._dirty = True          # уже считается — пересчитать по свежим данным, когда закончит
+            return
         self._dirty = False
-        rows = self.win.journal_rows()
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.btn_recalc.setEnabled(False)
+        self.summary.setText("Считаю проверку модели…")
+        self._job = worker.start(backtest, self.win.journal_rows(), self.win.params, self.half.value(),
+                                 self.win.weather_series(), with_progress=True,
+                                 on_done=self._show_backtest, on_error=self._backtest_failed,
+                                 on_progress=self._progress)
+
+    def _progress(self, k: int, n: int) -> None:
+        if n:
+            self.summary.setText(f"Считаю проверку модели… проход {min(k + 1, n)} из {n}")
+
+    def _finish_job(self) -> None:
+        self._job = None
+        self.btn_recalc.setEnabled(True)
+        if self._dirty and self.isVisible() and self.sub.currentIndex() == 0:
+            self.refresh()
+
+    def _backtest_failed(self, exc) -> None:
+        th = theme_for(self)
+        self.summary.setText(f"<span style='color:{th.error}'>Проверка модели не удалась: {exc}</span>")
+        self._finish_job()
+
+    def _show_backtest(self, bt) -> None:
         try:
-            bt = backtest(rows, self.win.params, self.half.value(), self.win.weather_series())
+            self._fill_backtest(bt)
         finally:
-            QApplication.restoreOverrideCursor()
+            self._finish_job()
+
+    def _fill_backtest(self, bt) -> None:
+        th = theme_for(self)
         data = bt["rows"]
         self.tbl.setRowCount(len(data))
         for i, r in enumerate(data):
