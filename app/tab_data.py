@@ -5,10 +5,10 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Dict, List
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-                               QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
+                               QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
-from .analysis import meter_bias
+from .analysis import batch_meter_points, combine_meter, meter_bias
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import to_num
@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 W_HEADERS = ["Дата-время (дд.мм.гггг чч:мм)", "T наружная, °C", "RH наружная, %", "Источник"]
 M_HEADERS = ["Дата-время", "Выходной влагомер сушилки, %", "Та же проба после охлаждения / лаборатория, %",
              "T зерна по датчикам сушилки, °C (необяз.)", "Разница, п.п.", "Примечание"]
+MB_HEADERS = ["Партия", "Проб выхода", "Выгружено, т", "Влагомер (средн.), %", "Лаборатория, %", "Разница, п.п.",
+              "T зерна, °C", "Замечание"]
 
 
 class DataTab(QWidget):
@@ -233,12 +235,29 @@ class DataTab(QWidget):
         self.m_stat.setTextFormat(Qt.RichText)
         lay.addWidget(self.m_stat)
         split = QSplitter(Qt.Horizontal)
+        left = QSplitter(Qt.Vertical)
         self.tbl_m = QTableWidget(0, len(M_HEADERS))
         self.tbl_m.setHorizontalHeaderLabels(M_HEADERS)
         self.tbl_m.horizontalHeader().setStretchLastSection(True)
         self.tbl_m.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_m.itemChanged.connect(self._m_edited)
-        split.addWidget(self.tbl_m)
+        left.addWidget(self.tbl_m)
+        bw = QWidget()
+        bl = QVBoxLayout(bw)
+        bl.setContentsMargins(0, 0, 0, 0)
+        self.cb_mb = QCheckBox("Учитывать партии: средний выходной влагомер последнего прохода против лабораторной "
+                               "W готовой партии (вкладка «Партии и очередь»)")
+        self.cb_mb.setChecked(True)
+        self.cb_mb.stateChanged.connect(lambda _s: self._m_stats())
+        bl.addWidget(self.cb_mb)
+        self.tbl_mb = QTableWidget(0, len(MB_HEADERS))
+        self.tbl_mb.setHorizontalHeaderLabels(MB_HEADERS)
+        self.tbl_mb.horizontalHeader().setStretchLastSection(True)
+        self.tbl_mb.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        bl.addWidget(self.tbl_mb)
+        left.addWidget(bw)
+        left.setSizes([330, 200])
+        split.addWidget(left)
         self.plot_m = SimplePlot()
         self.plot_m.set_labels("показание выходного влагомера, %", "показание − после охлаждения, п.п.")
         split.addWidget(self.plot_m)
@@ -301,35 +320,73 @@ class DataTab(QWidget):
         self.m_hint.setStyleSheet(f"color:{th.muted};")
         r = meter_bias(self._pairs())
         p = self.win.params
+        points = batch_meter_points(self.win.storage.get_list("batches"), self.win.journal_rows(), p)
+        comb = combine_meter(r, points, self.cb_mb.isChecked())
+        self._fill_mb(points)
         cur = p.out_bias
-        txt = r["text"] + (f"<br>Сейчас в модели: <b>a = {cur:+.2f}</b>" +
-                           (f", k_w = {p.out_kw:+.3f}" if p.out_kw else "") +
-                           (f", k_t = {p.out_kt:+.3f}" if p.out_kt else "") + ".")
-        if r.get("ci") and r.get("choice") == "M0" and not (r["ci"][0] <= cur <= r["ci"][1]):
-            txt += f" <span style='color:{th.error}'>— вне доверительного интервала, стоит применить новую.</span>"
+        txt = r["text"]
+        if points and self.cb_mb.isChecked() and comb["n_batches"]:
+            sdb = f", разброс между партиями ±{comb['sd_batches']:.2f}" if comb.get("sd_batches") is not None else \
+                "; пока партий меньше трёх, разброс принят ±0,4 п.п."
+            txt += (f"<br>По партиям ({comb['n_batches']}): поправка {comb['a_batches']:+.2f} п.п. "
+                    f"(±{1.96 * comb['se_batches']:.2f} при 95 %{sdb}).")
+            if comb["source"] == "пары и партии":
+                txt += (f"<br><b>Вместе: a = {comb['a']:+.2f} ± {1.96 * comb['se']:.2f} п.п.</b> (вес партий "
+                        f"{100 * comb['share_batches']:.0f} %).")
+            if comb["warn"]:
+                txt += f"<br><span style='color:{th.error}'>⚠ {comb['warn']}</span>"
+        elif not points:
+            txt += ("<br>Партий с лабораторной W после охлаждения пока нет — впишите её на вкладке «Партии и очередь», "
+                    "это ещё один независимый источник поправки.")
+        txt += (f"<br>Сейчас в модели: <b>a = {cur:+.2f}</b>" + (f", k_w = {p.out_kw:+.3f}" if p.out_kw else "")
+                + (f", k_t = {p.out_kt:+.3f}" if p.out_kt else "") + ".")
+        if comb.get("a") is not None and comb.get("se") and abs(cur - comb["a"]) > 1.96 * comb["se"]:
+            txt += f" <span style='color:{th.error}'>— вне 95 % интервала, стоит применить новую.</span>"
         self.m_stat.setText(txt)
         self.plot_m.clear()
         pts = [(q["reading"], q["reading"] - q["ref"]) for q in self._pairs()
                if q.get("reading") is not None and q.get("ref") is not None]
-        if pts:
-            self.plot_m.add_points([a for a, _ in pts], [b for _, b in pts], "dot", 7)
-            xs = [min(a for a, _ in pts), max(a for a, _ in pts)]
+        bpts = [(x["read"], x["diff"]) for x in points if x.get("diff") is not None] if self.cb_mb.isChecked() else []
+        if pts or bpts:
+            if pts:
+                self.plot_m.add_points([a for a, _ in pts], [b for _, b in pts], "dot", 7)
+            if bpts:
+                self.plot_m.add_points([a for a, _ in bpts], [b for _, b in bpts], "target", 12)
+            allx = [a for a, _ in pts + bpts]
+            xs = [min(allx), max(allx)]
             if xs[1] - xs[0] < 1e-6:
                 xs = [xs[0] - 1, xs[0] + 1]
-            if "a" in r and r["a"] is not None:
-                self.plot_m.add_line(xs, [r["a"] + r.get("kw", 0.0) * (x - 20.0) for x in xs], "line", 2)
+            if comb.get("a") is not None:
+                self.plot_m.add_line(xs, [comb["a"] + comb["kw"] * (x - 20.0) for x in xs], "line", 2)
             self.plot_m.add_line(xs, [p.out_bias + p.out_kw * (x - 20.0) for x in xs], "target", 1.5, dashed=True)
-            self.plot_m.set_title("точки — пары; синяя — рекомендуемая поправка; красный пунктир — сейчас в модели")
+            self.plot_m.set_title("точки — пары; крупные красные — партии; синяя — рекомендуемая поправка; "
+                                  "красный пунктир — сейчас в модели")
         self._m_result = r
+        self._m_comb = comb
+
+    def _fill_mb(self, points) -> None:
+        self.tbl_mb.setRowCount(len(points))
+        for i, x in enumerate(points):
+            cells = [x["name"], str(x["n"]), f"{x['mass']:.0f}" if x["mass"] else "—",
+                     "—" if x["read"] is None else f"{x['read']:.2f}", f"{x['lab']:.1f}",
+                     "—" if x["diff"] is None else f"{x['diff']:+.2f}", "—" if x["t"] is None else f"{x['t']:.0f}",
+                     x["note"]]
+            for j, v in enumerate(cells):
+                self.tbl_mb.setItem(i, j, QTableWidgetItem(v))
+        self.tbl_mb.resizeColumnsToContents()
 
     def _m_apply(self) -> None:
-        r = getattr(self, "_m_result", None) or meter_bias(self._pairs())
-        if "mean" not in r:
-            QMessageBox.information(self, "Поправка влагомера", "Нет пар с обоими значениями.")
+        self._m_stats()
+        r, comb = self._m_result, self._m_comb
+        if comb.get("a") is None:
+            QMessageBox.information(self, "Поправка влагомера", "Нет ни пар с обоими значениями, ни партий с "
+                                                                 "лабораторной влажностью.")
             return
-        a, kw, kt = round(r["a"], 2), round(r.get("kw", 0.0), 3), round(r.get("kt", 0.0), 3)
-        if r.get("n", 0) < 5 and QMessageBox.question(
-                self, "Поправка влагомера", f"Пар всего {r.get('n', 0)} — оценка ненадёжная. Всё равно применить?") != QMessageBox.Yes:
+        a, kw, kt = round(comb["a"], 2), round(comb.get("kw", 0.0), 3), round(comb.get("kt", 0.0), 3)
+        n_info = r.get("n", 0) + 4 * comb.get("n_batches", 0)        # партия по весу ≈ нескольким парам
+        if n_info < 5 and QMessageBox.question(
+                self, "Поправка влагомера", f"Данных мало (пар {r.get('n', 0)}, партий {comb.get('n_batches', 0)}) — "
+                                            f"оценка ненадёжная. Всё равно применить?") != QMessageBox.Yes:
             return
         form = f"{a:+.2f}" + (f" {kw:+.3f}·(W − 20)" if kw else "") + (f" {kt:+.3f}·(T − 30)" if kt else "")
         p = self.win.params

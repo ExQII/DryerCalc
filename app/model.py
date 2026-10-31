@@ -43,8 +43,8 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta
-from math import exp
-from typing import List, Optional, Sequence, Tuple
+from math import exp, log, sqrt
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -89,6 +89,12 @@ class DryerParams:
     rate_sigma: float = 0.05  # относит. ошибка скорости сушки (1σ) — по проверке прогноза на журнале
     rate_sigma_info: str = "стартовая: прогноз 3 проходов октября, ±5 %"
     rate_scale: float = 1.0   # множитель скорости сушки (только для расчёта допусков; в настройках всегда 1)
+    # --- v0.8: честные допуски (заполняются калибровкой) ---
+    unc_feats: Optional[List[str]] = None         # коэффициенты ln R, для которых известна ковариация («const», «b_w»…)
+    unc_cov: Optional[List[List[float]]] = None   # их ковариация (с поправкой на зависимость строк внутри прохода)
+    unc_lev: float = 0.0      # типичная дисперсия ln R по строкам журнала — её уже покрывает rate_sigma
+    struct_base: float = 0.10  # типичное относит. расхождение эмпирической и физической моделей на проходах журнала
+    explored: Optional[dict] = None   # изученные диапазоны журнала: {"d": [мин, макс], "t": [...], "w": [...]}
 
     @classmethod
     def from_dict(cls, d: dict) -> "DryerParams":
@@ -578,6 +584,116 @@ Z90 = 1.645   # двусторонний 90 % интервал
 def scaled(p: DryerParams, k: float) -> DryerParams:
     from dataclasses import replace
     return replace(p, rate_scale=max(k, 0.05))
+
+
+# ----------------------------------------------------------------------------
+# Честные допуски: σ скорости сушки растёт там, где модель опирается на экстраполяцию
+# ----------------------------------------------------------------------------
+#
+#   σ² = σ_проверки² + σ_коэфф² + σ_структ²
+#
+# σ_проверки (rate_sigma) — относительная ошибка честных прогнозов съёма на журнале («прогноз против факта»):
+#   так модель ошибается в режимах, похожих на изученные.
+# σ_коэфф — разброс подобранных коэффициентов ln R (ковариация регрессии, с поправкой на то, что строки одного
+#   прохода не независимы), но только СВЕРХ типичного для строк журнала: внутри изученного он уже входит в
+#   σ_проверки, а при уходе W, T, погоды от изученного растёт.
+# σ_структ — превышение расхождения эмпирической и физической моделей над типичным на проходах журнала (половина
+#   превышения как 1σ). Эмпирическая модель не знает о времени пребывания зерна иначе как через баланс, физическая
+#   знает через кинетику сушки: там, где они начинают расходиться сильнее обычного (D, T, W за пределами журнала),
+#   ни одной из них нельзя верить так же, как внутри.
+
+def _feat_vec(p: DryerParams, w_avg: float, t_proc: float, t_amb: float, rh: float) -> List[float]:
+    out: List[float] = []
+    for k in p.unc_feats or []:
+        if k == "const":
+            out.append(1.0)
+        elif k == "b_w":
+            out.append(log(max(w_avg - p.w_eq, 0.05) / max(p.w_ref - p.w_eq, 0.1)))
+        elif k == "b_dt":
+            out.append(log(max(t_proc - p.t_amb_ref, 1.0) / max(p.t_ref - p.t_amb_ref, 1.0)))
+        elif k == "b_amb":
+            out.append((t_amb - p.t_amb_ref) / 10.0)
+        elif k == "b_rh":
+            out.append((rh - p.rh_ref) / 30.0)
+        else:
+            out.append(0.0)
+    return out
+
+
+def param_sigma(p: DryerParams, w_avg: float, t_proc: float, t_amb: float, rh: float) -> float:
+    """σ_коэфф: относительная неопределённость скорости сушки из-за разброса коэффициентов, сверх типичной."""
+    if not p.unc_feats or not p.unc_cov:
+        return 0.0
+    f = np.asarray(_feat_vec(p, w_avg, t_proc, t_amb, rh))
+    c = np.asarray(p.unc_cov, dtype=float)
+    if c.shape != (len(f), len(f)):
+        return 0.0
+    v = float(f @ c @ f)
+    return sqrt(max(v - p.unc_lev, 0.0))
+
+
+def struct_sigma(p: DryerParams, dw_main: float, dw_other: float) -> float:
+    """σ_структ: половина превышения относительного расхождения моделей над типичным на журнале."""
+    if dw_main <= 0.05:
+        return 0.0
+    delta = abs(dw_other - dw_main) / max(dw_main, 0.5)
+    return 0.5 * max(delta - p.struct_base, 0.0)
+
+
+def explored_flags(p: DryerParams, d_vals: Sequence[float], t_vals: Sequence[float], w_vals: Sequence[float]) -> List[str]:
+    """Что выходит за изученные журналом диапазоны (с небольшим запасом)."""
+    ex = p.explored or {}
+    out: List[str] = []
+    for key, vals, unit, margin, name in (("d", d_vals, " с", 2.0, "D"), ("t", t_vals, " °C", 2.0, "T блоков"),
+                                          ("w", w_vals, " %", 1.0, "W вх")):
+        rng = ex.get(key)
+        if not rng or not vals:
+            continue
+        lo, hi = float(rng[0]), float(rng[1])
+        bad = [v for v in vals if v < lo - margin or v > hi + margin]
+        if bad:
+            shown = " / ".join(f"{v:.0f}" for v in bad[:5])
+            out.append(f"{name} {shown}{unit} (изучено {lo:.0f}–{hi:.0f})")
+    return out
+
+
+def other_model_final(p: DryerParams, plan: "Plan", c: Conditions, t_list: Optional[Sequence[float]] = None) -> float:
+    """Итоговая влажность того же плана (те же D по проходам) по второй модели."""
+    from dataclasses import replace
+    other = replace(p, model_kind="empirical" if p.model_kind == "physics" else "physics")
+    w, m = plan.passes[0].w_in, plan.passes[0].m_in
+    for k, ps in enumerate(plan.passes, start=1):
+        r = solve_pass(other, _cond_k(c, t_list, k), w, m, ps.d, k)
+        w, m = r.w_out, r.m_out
+    return w
+
+
+def plan_sigma(p: DryerParams, plan: "Plan", c: Conditions, w_other_final: Optional[float] = None
+               ) -> Tuple[float, Dict]:
+    """σ скорости сушки для плана: √(σ_проверки² + σ_коэфф² + σ_структ²) и из чего она сложилась."""
+    num = den = 0.0
+    for ps in plan.passes:
+        s = param_sigma(p, 0.5 * (ps.w_in + ps.w_out), ps.t_proc, c.t_amb, c.rh)
+        num += s * s * max(ps.time_h, 1e-6)
+        den += max(ps.time_h, 1e-6)
+    s_par = sqrt(num / den) if den else 0.0
+    s_str = 0.0
+    if w_other_final is not None and plan.passes:
+        w0 = plan.passes[0].w_in
+        s_str = struct_sigma(p, w0 - plan.w_final, w0 - w_other_final)
+    s_tot = sqrt(max(p.rate_sigma, 0.0) ** 2 + s_par ** 2 + s_str ** 2)
+    flags = explored_flags(p, [x.d for x in plan.passes], [x.t_proc for x in plan.passes], [x.w_in for x in plan.passes])
+    return s_tot, {"check": p.rate_sigma, "param": s_par, "struct": s_str, "flags": flags}
+
+
+def sigma_text(info: Dict) -> str:
+    z = Z90 * 100
+    tot = sqrt(info["check"] ** 2 + info["param"] ** 2 + info["struct"] ** 2)
+    txt = (f"Допуск 90 %: скорость сушки ±{z * tot:.0f} % = √(проверка на журнале {z * info['check']:.0f}² + "
+           f"коэффициенты {z * info['param']:.0f}² + расхождение моделей {z * info['struct']:.0f}²)")
+    if info.get("flags"):
+        txt += ". Вне изученного: " + "; ".join(info["flags"])
+    return txt
 
 
 def time_range(build, p: DryerParams, z: float = Z90) -> Tuple[float, float]:

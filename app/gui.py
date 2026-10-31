@@ -597,7 +597,12 @@ class MainWindow(QMainWindow):
             builders.append(lambda pp: mdl.plan_manual(pp, c, m0, w0, wk, manual, start, t_list=t_list, cool=cool))
         plans = plans + extra
         self.plans = plans
-        self.plan_ranges = [mdl.time_range(b, p) for b in builders]
+        # честный допуск: σ скорости сушки по каждому сценарию — проверка на журнале + разброс коэффициентов +
+        # расхождение моделей сверх обычного (растёт вне изученных режимов)
+        from dataclasses import replace as _replace
+        self.plan_other = [mdl.other_model_final(p, pl, c, t_list) for pl in plans]
+        self.plan_sigmas = [mdl.plan_sigma(p, pl, c, wo) for pl, wo in zip(plans, self.plan_other)]
+        self.plan_ranges = [mdl.time_range(b, _replace(p, rate_sigma=sg)) for b, (sg, _) in zip(builders, self.plan_sigmas)]
 
         fuel, price, unit = self.in_fuel.value(), self.in_fuel_price.value(), self.in_fuel_unit.text().strip()
         self.tbl_sc.setRowCount(len(plans))
@@ -618,8 +623,11 @@ class MainWindow(QMainWindow):
             lo, hi = self.plan_ranges[i]
             time_txt = fmt_hours(pl.total_time_h) + f" ({lo:.0f}–{hi:.0f})"
             level, text = self._limit_check(pl, level, text)
-            w_other = self._other_model_final(pl, c, t_list)
+            w_other = self.plan_other[i]
             other_txt = f"{w_other:.1f} %" + (" ⚠" if abs(w_other - pl.w_final) > 1.0 else "")
+            sig, sig_info = self.plan_sigmas[i]
+            if sig_info["flags"]:
+                text += "; вне изученного: " + ", ".join(f.split(" (")[0] for f in sig_info["flags"])
             cells = [
                 title,
                 " / ".join(f"{x.dw:.1f}" for x in pl.passes),
@@ -627,10 +635,13 @@ class MainWindow(QMainWindow):
                 time_txt, end, f"{pl.water_total:.1f}", fuel_txt, other_txt, text,
             ]
             bg, fg = th.level(level)
+            tip = mdl.sigma_text(sig_info)
             for j, txt in enumerate(cells):
                 it = item(txt)
                 it.setBackground(QBrush(bg))
                 it.setForeground(QBrush(fg))
+                if j in (3, 7, 8):
+                    it.setToolTip(tip)
                 if i == rec and is_auto:
                     it.setFont(bold)
                 self.tbl_sc.setItem(i, j, it)
@@ -653,14 +664,7 @@ class MainWindow(QMainWindow):
         return level, text
 
     def _other_model_final(self, pl: mdl.Plan, c: mdl.Conditions, t_list) -> float:
-        from dataclasses import replace as _replace
-        other = _replace(self.params, model_kind="empirical" if self.params.model_kind == "physics" else "physics")
-        w, m = pl.passes[0].w_in, pl.passes[0].m_in
-        for k, ps in enumerate(pl.passes, start=1):
-            ck = mdl.Conditions(float(t_list[min(k, len(t_list)) - 1]), c.t_amb, c.rh) if t_list else c
-            r = mdl.solve_pass(other, ck, w, m, ps.d, k)
-            w, m = r.w_out, r.m_out
-        return w
+        return mdl.other_model_final(self.params, pl, c, t_list)
 
     def _calc_weather(self) -> None:
         ws = self.weather_series()
@@ -681,6 +685,9 @@ class MainWindow(QMainWindow):
             return
         pl = self.plans[rows[0].row()]
         rng = self.plan_ranges[rows[0].row()] if rows[0].row() < len(getattr(self, "plan_ranges", [])) else None
+        sig = getattr(self, "plan_sigmas", [])
+        if rows[0].row() < len(sig):
+            self.status.setText(mdl.sigma_text(sig[rows[0].row()][1]) + ".")
         self.tbl_det.setRowCount(len(pl.passes))
         for i, ps in enumerate(pl.passes):
             read = mdl.read_from_true(self.params, ps.w_out, ps.t_grain or None)
@@ -1787,6 +1794,9 @@ class MainWindow(QMainWindow):
         new = mdl.DryerParams(q100=mdl.q_at(tmp, 100.0), q_table=table, temp_source=self.s_src.currentData(),
                               calibrated=old.calibrated, calib_info=old.calib_info, phys_info=old.phys_info,
                               model_kind=self.s_model.currentData(), rate_sigma=sigma, rate_sigma_info=sigma_info,
+                              # данные для допусков описывают журнал, а не поля формы — переносим как есть
+                              unc_feats=old.unc_feats, unc_cov=old.unc_cov, unc_lev=old.unc_lev,
+                              struct_base=old.struct_base, explored=old.explored,
                               **vals)
         q_changed = any(abs(mdl.q_at(new, d) - mdl.q_at(old, d)) > 1e-6 for d in (20, 35, 60, 100))
         if q_changed or any(getattr(new, k) != getattr(old, k) for k in self._MODEL_KEYS):

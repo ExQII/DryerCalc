@@ -135,8 +135,17 @@ class RecircTab(QWidget):
         active = "physics" if p.model_kind == "physics" else "empirical"
         res = {k: mdl.recirc(replace(p, model_kind=k), c, m, w0, wk) for k in ("empirical", "physics")}
         main = res[active]
+        # честный допуск: проверка на журнале + разброс коэффициентов + расхождение моделей сверх обычного
+        other_k = "physics" if active == "empirical" else "empirical"
+        s_par = mdl.param_sigma(p, 0.5 * (w0 + wk), c.t_proc, c.t_amb, c.rh)
+        h_main, h_other = res[active].hours, res[other_k].hours
+        s_str = (0.5 * max(abs(h_other - h_main) / h_main - p.struct_base, 0.0)
+                 if h_main and h_other else 0.0)          # относит. расхождение времени ≈ расхождению скорости
+        sig = (p.rate_sigma ** 2 + s_par ** 2 + s_str ** 2) ** 0.5
+        self.sigma_info = {"check": p.rate_sigma, "param": s_par, "struct": s_str,
+                           "flags": mdl.explored_flags(p, [], [c.t_proc], [w0])}
         lo_hi = []
-        for k in (1.0 + mdl.Z90 * p.rate_sigma, 1.0 - mdl.Z90 * p.rate_sigma):
+        for k in (1.0 + mdl.Z90 * sig, 1.0 - mdl.Z90 * sig):
             r = mdl.recirc(mdl.scaled(replace(p, model_kind=active), k), c, m, w0, wk)
             lo_hi.append(r.hours)
         cool_h = (main.m_end / mdl.q_full(p)) if self.cool.isChecked() and mdl.q_full(p) > 0 else 0.0
@@ -152,6 +161,7 @@ class RecircTab(QWidget):
             end = start + timedelta(hours=main.hours)
             lines.append(f"Досушка {w0:g} → {wk:g} %: <b>{fmt_hours(main.hours)}</b>{rng} по {name[active]} модели — "
                          f"к <b>{end:%d.%m %H:%M}</b>.")
+            self.summary.setToolTip(mdl.sigma_text(self.sigma_info))
             oh = res[other].hours
             lines.append(f"По {name[other]} модели: " + (fmt_hours(oh) if oh is not None else "не досушить за 48 ч") + ".")
             lines.append(f"Испарится ≈ {main.water:.1f} т воды; масса станет {main.m_end:.1f} т "

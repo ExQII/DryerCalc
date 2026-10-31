@@ -87,23 +87,24 @@ def meter_bias(pairs: Sequence[Dict]) -> Dict:
         sd = math.sqrt(sum((d - mean) ** 2 for d in diffs) / (n - 1))
         se = sd / math.sqrt(n)
         half = t975(n - 1) * se
-        res.update({"sd": sd, "se": se, "ci": (mean - half, mean + half), "half": half})
+        res.update({"sd": sd, "se": se, "ci": (mean - half, mean + half), "half": half, "se_a": se})
     # M1
     xr = [a for a, _, _ in use]
     if n >= 4 and max(xr) - min(xr) >= 2.0:
         beta, se_b, s_res = _ols([[1.0, a - 20.0] for a in xr], diffs)
-        res["m1"] = {"a": beta[0], "kw": beta[1], "se_kw": se_b[1], "sd": s_res}
+        res["m1"] = {"a": beta[0], "kw": beta[1], "se_kw": se_b[1], "sd": s_res, "se_a": se_b[0]}
         if n >= 10 and abs(beta[1]) > 2.0 * se_b[1]:
-            res.update({"choice": "M1", "a": beta[0], "kw": beta[1]})
+            res.update({"choice": "M1", "a": beta[0], "kw": beta[1], "se_a": se_b[0]})
     # M2
     with_t = [(a, b, t) for a, b, t in use if t is not None]
     if len(with_t) >= 5 and len(with_t) >= 0.7 * n:
         ts = [t for _, _, t in with_t]
         if max(ts) - min(ts) >= 5.0:
             beta, se_b, s_res = _ols([[1.0, a - 20.0, t - 30.0] for a, _, t in with_t], [a - b for a, b, _ in with_t])
-            res["m2"] = {"a": beta[0], "kw": beta[1], "kt": beta[2], "se_kw": se_b[1], "se_kt": se_b[2], "sd": s_res}
+            res["m2"] = {"a": beta[0], "kw": beta[1], "kt": beta[2], "se_kw": se_b[1], "se_kt": se_b[2], "sd": s_res,
+                         "se_a": se_b[0]}
             if len(with_t) >= 12 and abs(beta[2]) > 2.0 * se_b[2]:
-                res.update({"choice": "M2", "a": beta[0], "kw": beta[1], "kt": beta[2]})
+                res.update({"choice": "M2", "a": beta[0], "kw": beta[1], "kt": beta[2], "se_a": se_b[0]})
     if n < 2:
         res["text"] = f"Одна пара: поправка {mean:+.2f} п.п., оценить точность нельзя."
     else:
@@ -129,6 +130,135 @@ def meter_bias(pairs: Sequence[Dict]) -> Dict:
                (f", k_w = {res['kw']:+.3f}" if res["choice"] != "M0" else "") + \
                (f", k_t = {res['kt']:+.3f}" if res["choice"] == "M2" else "") + "."
         res["text"] = txt
+    return res
+
+
+# ----------------------------------------------------------------------------
+# Поправка влагомера по партиям: лабораторная влажность готовой партии против показаний выходного влагомера
+# ----------------------------------------------------------------------------
+
+BATCH_SD_PRIOR = 0.4    # п.п.: ожидаемый разброс оценки по одной партии, пока партий меньше трёх (отбор пробы из
+                        # силоса, лаборатория, охлаждение/хранение)
+
+
+def batch_meter_points(batches: Sequence[Dict], rows: List[Dict], p: mdl.DryerParams) -> List[Dict]:
+    """По каждой партии с лабораторной W после охлаждения — средневзвешенное по выгрузке показание выходного влагомера
+    за последний проход партии (то, что ушло в силос готовой партии), против лабораторной влажности.
+
+    В расчёт идут строки последнего прохода с работающими горелками (охлаждение — другой режим влагомера, его
+    показания не используются; масса охлаждения обычно — одна загрузка шахты). Разница «показание − лаборатория» —
+    одна оценка поправки влагомера на средних для партии влажности и температуре зерна."""
+    from .batches import parse_when
+    from .calibration import STOP_STEMS, pass_of_segment, prepare
+    prep, reliable = prepare(rows)
+    if not reliable:
+        return []
+    pass_of = pass_of_segment(prep)
+    out: List[Dict] = []
+    for b in batches:
+        lab = _f(b.get("w_out"))
+        t0, t1 = parse_when(str(b.get("start") or "")), parse_when(str(b.get("end") or ""))
+        if lab is None or t0 is None or t1 is None:
+            continue
+        pt: Dict = {"name": str(b.get("name") or ""), "lab": lab, "read": None, "t": None, "diff": None, "n": 0,
+                    "mass": 0.0, "note": ""}
+        sel = [r for r in prep if r.get("dt") is not None and t0 <= r["dt"] <= t1]
+        data = [r for r in sel if r.get("w_out") is not None and not r.get("recirc") and not r.get("burner_off")]
+        if not data:
+            pt["note"] = "нет проб выхода за время партии"
+            out.append(pt)
+            continue
+        last = pass_of[data[-1]["seg"]]
+        lst = [r for r in sel if pass_of[r["seg"]] == last]
+        rd = [r for r in lst if r.get("w_out") is not None and not r.get("recirc") and not r.get("burner_off")]
+        hours = [(r["dt"] - lst[0]["dt"]).total_seconds() / 3600.0 for r in rd]
+        vals = [r["w_out"] for r in rd]
+        temps = [0.5 * (r["t_a1"] + r["t_a2"]) if r.get("t_a1") is not None and r.get("t_a2") is not None else None
+                 for r in rd]
+        mass = s_w = s_t = m_t = 0.0
+        stopped = False
+        for a, nb in zip(lst, lst[1:]):
+            note = (a.get("note") or "").lower()
+            if any(w in note for w in STOP_STEMS):
+                stopped = True
+            elif "запуск" in note:
+                stopped = False
+            if a.get("d_f") is None or stopped or a.get("recirc") or a.get("burner_off"):
+                continue
+            dm = mdl.q_at(p, a["d_f"]) * max((nb["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
+            if dm <= 0:
+                continue
+            ha = (a["dt"] - lst[0]["dt"]).total_seconds() / 3600.0
+            hb = (nb["dt"] - lst[0]["dt"]).total_seconds() / 3600.0
+            w_mid = 0.5 * (_interp(ha, hours, vals) + _interp(hb, hours, vals))
+            mass += dm
+            s_w += dm * w_mid
+            tt = [(h, t) for h, t in zip(hours, temps) if t is not None]
+            if tt:
+                s_t += dm * 0.5 * (_interp(ha, [h for h, _ in tt], [t for _, t in tt])
+                                   + _interp(hb, [h for h, _ in tt], [t for _, t in tt]))
+                m_t += dm
+        if mass <= 0:
+            mass, s_w = float(len(vals)), float(sum(vals))
+        pt.update(read=s_w / mass, t=(s_t / m_t) if m_t else None, n=len(rd), mass=mass)
+        pt["diff"] = pt["read"] - lab
+        if len(rd) < 6:
+            pt["note"] = f"мало проб выхода в последнем проходе ({len(rd)})"
+        out.append(pt)
+    return out
+
+
+def _interp(x: float, xs: Sequence[float], ys: Sequence[float]) -> float:
+    if not xs:
+        return float("nan")
+    if x <= xs[0]:
+        return ys[0]
+    if x >= xs[-1]:
+        return ys[-1]
+    for (x0, y0), (x1, y1) in zip(zip(xs, ys), zip(xs[1:], ys[1:])):
+        if x0 <= x <= x1:
+            return y0 if x1 == x0 else y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return ys[-1]
+
+
+def combine_meter(pair_res: Dict, points: Sequence[Dict], use_batches: bool = True) -> Dict:
+    """Поправка влагомера по парам проб и по партиям вместе: обратно-дисперсионные веса.
+
+    Наклоны k_w, k_t (если пары их показали) берутся из пар; каждая партия даёт оценку свободного члена a:
+        a_партии = (показание − лаборатория) − k_w·(показание − 20) − k_t·(T − 30).
+    Точность по парам — стандартная ошибка a; по партиям — разброс оценок между партиями / √n (пока партий меньше
+    трёх — ожидаемый разброс BATCH_SD_PRIOR). Если пары и партии расходятся больше двух стандартных ошибок разницы,
+    это признак систематики (отбор проб в пары, проба из силоса, усушка при хранении) — об этом предупреждаем."""
+    kw, kt = float(pair_res.get("kw") or 0.0), float(pair_res.get("kt") or 0.0)
+    res: Dict = {"kw": kw, "kt": kt, "a": pair_res.get("a"), "source": "пары", "se": pair_res.get("se_a"),
+                 "n_pairs": pair_res.get("n", 0), "n_batches": 0, "warn": ""}
+    pts = [x for x in points if x.get("diff") is not None] if use_batches else []
+    a_b = [x["diff"] - kw * (x["read"] - 20.0) - (kt * (x["t"] - 30.0) if (kt and x.get("t") is not None) else 0.0)
+           for x in pts]
+    res["n_batches"] = len(a_b)
+    if not a_b:
+        return res
+    mean_b = sum(a_b) / len(a_b)
+    if len(a_b) >= 3:
+        sd_b = math.sqrt(sum((v - mean_b) ** 2 for v in a_b) / (len(a_b) - 1))
+        se_b = max(sd_b, 0.15) / math.sqrt(len(a_b))
+    else:
+        sd_b = None
+        se_b = BATCH_SD_PRIOR / math.sqrt(len(a_b))
+    res.update(a_batches=mean_b, se_batches=se_b, sd_batches=sd_b)
+    a_p, se_p = pair_res.get("a"), pair_res.get("se_a")
+    if a_p is None or not se_p or pair_res.get("n", 0) < 2:
+        res.update(a=mean_b, se=se_b, source="партии")
+        return res
+    w_p, w_b = 1.0 / se_p ** 2, 1.0 / se_b ** 2
+    a = (a_p * w_p + mean_b * w_b) / (w_p + w_b)
+    res.update(a=a, se=1.0 / math.sqrt(w_p + w_b), source="пары и партии", a_pairs=a_p, se_pairs=se_p,
+               share_batches=w_b / (w_p + w_b))
+    z = abs(a_p - mean_b) / math.sqrt(se_p ** 2 + se_b ** 2)
+    if z > 2.0:
+        res["warn"] = (f"пары ({a_p:+.2f}) и партии ({mean_b:+.2f}) расходятся на {abs(a_p - mean_b):.2f} п.п. — больше "
+                       f"случайного. Проверьте отбор проб в пары (та же проба, закрытая тара), отбор пробы из силоса "
+                       f"для лаборатории, усушку при хранении.")
     return res
 
 

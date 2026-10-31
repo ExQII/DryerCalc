@@ -15,7 +15,7 @@ os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 import numpy as np  # noqa: E402
 import pyqtgraph as pg  # noqa: E402
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPen  # noqa: E402
+from PySide6.QtGui import QColor, QPen  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSizePolicy, QWidget  # noqa: E402
 
 from .theme import theme_for  # noqa: E402
@@ -155,18 +155,39 @@ class SimplePlot(pg.PlotWidget):
         pi = self.getPlotItem()
         pt = max(self.font().pointSizeF(), 7.0)
         style = {"color": th.plot_ink.name(), "font-size": f"{pt:.0f}pt"}
-        fm = QFontMetrics(QFont(self.font().family(), int(round(pt))))
-        room = {"bottom": max(self.vb.width(), self.width() - 80), "left": max(self.vb.height(), 60)}
+        room = {"bottom": max(self.vb.width(), 60), "left": max(self.vb.height(), 60)}
         for side, text in (("bottom", self._xlabel), ("left", self._ylabel)):
+            ax = pi.getAxis(side)
             if text:
                 # длинная подпись не обрезается краем, а сокращается с «…» (полная — в подсказке под курсором)
-                pi.setLabel(side, fm.elidedText(text, Qt.ElideRight, int(room[side]) - 6), **style)
+                self._fit(text, room[side] - 6, lambda t, s=side: pi.setLabel(s, t, **style),
+                          lambda a=ax: a.label.boundingRect().width())
+                ax.resizeEvent(None)        # pyqtgraph ставит подпись по старому размеру текста — пересчитать
             else:
-                pi.getAxis(side).showLabel(False)
+                ax.showLabel(False)
         if self._title:
-            pi.setTitle(self._title, color=th.plot_ink.name(), size=f"{pt:.0f}pt")
+            self._fit(self._title, max(self.vb.width() - 6, 80),          # заголовок — над областью графика
+                      lambda t: pi.setTitle(t, color=th.plot_ink.name(), size=f"{pt:.0f}pt"),
+                      lambda: pi.titleLabel.item.boundingRect().width())
         else:
             pi.setTitle(None)
+
+    @staticmethod
+    def _fit(text: str, avail: float, apply, width) -> None:
+        """Показать text целиком или самое длинное начало с «…», которое помещается в avail пикселей
+        (ширина меряется по самому элементу pyqtgraph — HTML рисуется не тем шрифтом, что у виджета)."""
+        apply(text)
+        if width() <= avail:
+            return
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            apply(text[:mid].rstrip() + "…")
+            if width() <= avail:
+                lo = mid
+            else:
+                hi = mid - 1
+        apply(text[:lo].rstrip() + "…")
 
     def resizeEvent(self, ev) -> None:  # noqa: N802
         super().resizeEvent(ev)
@@ -194,7 +215,7 @@ class SimplePlot(pg.PlotWidget):
         if y1 - y0 < 1e-9:
             y1 = y0 + 1.0
         pad_y = 0.05 * (y1 - y0)
-        pad_x = 0.0 if self._zero_x else 0.03 * (x1 - x0)
+        pad_x = 0.0 if self._zero_x else 0.05 * (x1 - x0)
         y_lo = y0 if (self._zero_y and y0 == 0.0) else y0 - pad_y
         return x0 - pad_x, x1 + pad_x, y_lo, y1 + pad_y
 

@@ -116,5 +116,6 @@ def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: floa
     w_target = float(ui_live.get("w_target", 24.0))
     c = mdl.Conditions(st.t_proc, float(ui_live.get("t_amb", p.t_amb_ref)), float(ui_live.get("rh", p.rh_ref)))
     fc = live_forecast(p, c, st, float(ui_live.get("m_pass", 500.0)), w_target, float(ui_live.get("wk", 14.0)),
-                       soft, hard, use_corr=bool(ui_live.get("corr", True)), now=now)
+                       soft, hard, use_corr=bool(ui_live.get("corr", True)), now=now,
+                       silo=bool(ui_live.get("silo", True)), silo_lim=float(ui_live.get("silo_lim", 1.0)))
     return fc.pass_end, mdl.read_from_true(p, w_target, st.t_grain)

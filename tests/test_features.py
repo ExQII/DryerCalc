@@ -580,6 +580,84 @@ def test_physics_batch_matches_scalar_pass_out():
 
 
 # ---------------------------------------------------------------------------
+# v0.8: честные допуски, средняя влажность приёмного силоса, поправка влагомера по партиям
+# ---------------------------------------------------------------------------
+
+def _sample_rows():
+    rows, _ = read_journal(SAMPLE)
+    return rows
+
+
+def test_honest_tolerance_grows_outside_explored():
+    from app import model as mdl
+    p, rep = calibrate(_sample_rows(), DryerParams())
+    assert p.unc_feats[:1] == ["const"] and "b_amb" in p.unc_feats and p.unc_cov and p.explored
+    assert 0.0 < p.struct_base < 0.5 and "ДОПУСКИ" in rep["text"]
+    # внутри изученного добавки нет, при уходе T, W, погоды — растёт
+    assert mdl.param_sigma(p, 22.0, 60.0, 10.0, 70.0) < 0.005
+    assert mdl.param_sigma(p, 22.0, 90.0, 10.0, 70.0) > 0.01 > mdl.param_sigma(p, 22.0, 75.0, 10.0, 70.0)
+    assert mdl.param_sigma(p, 30.0, 90.0, 10.0, 70.0) > mdl.param_sigma(p, 22.0, 90.0, 10.0, 70.0)
+    assert mdl.param_sigma(p, 22.0, 60.0, 0.0, 90.0) > 0.03          # влияние погоды по журналу не подобрано
+    # сценарий в 1 проход (D ≈ 12, далеко от журнала) — модели расходятся, допуск шире, чем у 3 проходов
+    c = Conditions(60.0, 10.0, 70.0)
+    plans = mdl.scenarios(p, c, 500.0, 34.0, 14.0, 4)
+    sig = [mdl.plan_sigma(p, pl, c, mdl.other_model_final(p, pl, c)) for pl in plans]
+    assert sig[0][0] > 1.5 * sig[2][0] and sig[0][1]["struct"] > 0.03
+    assert any("D" in f for f in sig[0][1]["flags"]) and "Допуск 90 %" in mdl.sigma_text(sig[0][1])
+    lo0, hi0 = mdl.time_range(lambda pp: mdl.plan_by_passes(pp, c, 500.0, 34.0, 14.0, 1), replace(p, rate_sigma=sig[0][0]))
+    lo1, hi1 = mdl.time_range(lambda pp: mdl.plan_by_passes(pp, c, 500.0, 34.0, 14.0, 1), p)
+    assert hi0 - lo0 > hi1 - lo1
+    # старые сохранённые параметры (без полей v0.8) читаются, добавки нет
+    old = DryerParams.from_dict({k: v for k, v in DryerParams().to_dict().items() if not k.startswith("unc_")})
+    assert mdl.param_sigma(old, 22.0, 90.0, 0.0, 90.0) == 0.0 and mdl.explored_flags(old, [80], [90], [40]) == []
+
+
+def test_silo_average_targeting():
+    def r(ts, wi=None, wo=None, note=""):
+        return {"ts": "25.10.26 " + ts, "w_in": wi, "w_out": wo, "t_a1": 29 if wo else None, "t_a2": 33 if wo else None,
+                "t_up": 60, "t_low": 55, "d": 35, "note": note, "batch": "К-07", "pass_no": 1, "t_amb": None, "rh": None}
+    rows = [r("08:00", note="Запуск")] + [r(f"{8 + (i + 1) // 2:02d}:{30 * ((i + 1) % 2):02d}", 30.0, 23.0)
+                                          for i in range(12)]
+    st = live_state(rows, P)
+    from app.model import true_from_read
+    assert abs(st.silo_w - true_from_read(P, 23.0, 31.0)) < 1e-9 and abs(st.silo_w_read - 23.0) < 1e-9
+    c = Conditions(st.t_proc, 10.0, 70.0)
+    plain = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0)
+    fc = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0, silo=True, silo_lim=1.0)
+    sl = fc.silo
+    assert plain.silo is None and abs(plain.w_goal - 24.0) < 1e-9
+    assert sl["need"] > 25.0 and abs(fc.w_goal - 25.0) < 1e-9 and sl["limited"] and fc.d_rec > plain.d_rec
+    total = sl["m_done"] + sl["m_tr"] + sl["m_new"]
+    assert abs(sl["avg"] - (sl["w_done"] * sl["m_done"] + sl["w_tr"] * sl["m_tr"] + fc.w_out_rec * sl["m_new"]) / total) < 1e-9
+    free = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0, silo=True, silo_lim=5.0)
+    assert abs(free.silo["avg"] - 24.0) < 0.1                      # без ограничения среднее выходит в цель
+    late = live_forecast(P, c, st, 120.0, 24.0, 14.0, 6.0, 10.0, silo=True)
+    assert late.silo["late"] and abs(late.w_goal - 24.0) < 1e-9
+
+
+def test_meter_bias_from_batches():
+    from app.analysis import batch_meter_points, combine_meter
+    rows = _sample_rows()
+    bs = batches_from_journal(rows)
+    pts0 = batch_meter_points([dict(b, w_out=15.0) for b in bs], rows, P)
+    assert len(pts0) == 3 and all(x["n"] >= 6 and x["mass"] > 100 for x in pts0)
+    # лаборатория = показание − 0,8 → по партиям ровно 0,8; вместе с парами 0,8 — без предупреждения
+    bs8 = [dict(b, w_out=x["read"] - 0.8) for b, x in zip(bs, pts0)]
+    pts = batch_meter_points(bs8, rows, P)
+    pairs = meter_bias([{"reading": 15.0 + d, "ref": 15.0} for d in (0.6, 0.9, 0.8, 1.1, 0.7)])
+    comb = combine_meter(pairs, pts)
+    assert abs(comb["a_batches"] - 0.8) < 1e-9 and comb["source"] == "пары и партии" and not comb["warn"]
+    assert abs(comb["a"] - 0.8) < 0.05 and comb["se"] < pairs["se_a"]
+    # партии говорят 2,0, пары 0,8 — это систематика, программа предупреждает
+    bs2 = [dict(b, w_out=x["read"] - 2.0) for b, x in zip(bs, pts0)]
+    assert combine_meter(pairs, batch_meter_points(bs2, rows, P))["warn"]
+    # без пар — только партии; галочка «не учитывать» — только пары
+    only_b = combine_meter(meter_bias([]), pts)
+    assert only_b["source"] == "партии" and abs(only_b["a"] - 0.8) < 1e-9
+    assert combine_meter(pairs, pts, use_batches=False)["source"] == "пары"
+
+
+# ---------------------------------------------------------------------------
 # «Правила работы» (docs/rules_ru.txt): то, что там написано о разборе журнала, должно оставаться правдой.
 # Если тест упал после изменения программы — обновите разделы 4–8, 10 и 20 правил.
 # ---------------------------------------------------------------------------

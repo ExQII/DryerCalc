@@ -730,6 +730,37 @@ def calibrate(rows: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days
     return calibrate_obs(obs, p, lam, half_life_days, skipped=skipped, lag=lag, n_rows=len(rows))
 
 
+# Априорная неопределённость (1σ) коэффициентов, которые не подобраны по журналу: b_нар и b_rh оценены по
+# физической модели (прогрев холодного зерна, равновесная влажность), а не измерены; b_w, b_dt — если строк мало.
+PRIOR_SD = {"b_w": 0.3, "b_dt": 0.4, "b_amb": 0.03, "b_rh": 0.10}
+
+
+def _param_cov(x: np.ndarray, wt: np.ndarray, a: np.ndarray, res: np.ndarray, groups: np.ndarray
+               ) -> Tuple[np.ndarray, float]:
+    """Ковариация коэффициентов взвешенной регрессии с регуляризацией (сэндвич A⁻¹·XᵀWX·A⁻¹·s²), умноженная на
+    эффект плана: строки одного прохода не независимы (общие партия, погода, состояние сушилки), поэтому информации в
+    них меньше, чем строк. Эффект плана 1 + (m̄ − 1)·ρ, ρ — внутриклассовая корреляция остатков по проходам."""
+    n, k = x.shape
+    sw = float(wt.sum())
+    s2 = float(np.sum(wt * res * res) / max(sw - k, 1.0))
+    a_inv = np.linalg.inv(a)
+    cov = s2 * a_inv @ (x.T @ (wt[:, None] * x)) @ a_inv
+    ids = np.unique(groups)
+    g = len(ids)
+    if g >= 2 and n > g:
+        sizes = np.array([np.sum(groups == i) for i in ids], dtype=float)
+        means = np.array([res[groups == i].mean() for i in ids])
+        msb = float(np.sum(sizes * (means - res.mean()) ** 2) / (g - 1))
+        msw = float(sum(np.sum((res[groups == i] - m) ** 2) for i, m in zip(ids, means)) / (n - g))
+        n0 = (n - float(np.sum(sizes ** 2)) / n) / (g - 1)
+        den = msb + (n0 - 1.0) * msw
+        rho = min(max((msb - msw) / den, 0.0), 1.0) if den > 0 else 0.0
+        deff = 1.0 + (n / g - 1.0) * rho
+    else:
+        deff = float(n)                    # один проход: строки почти ничего не добавляют друг к другу
+    return cov * deff, deff
+
+
 def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days: float = 0.0,
                   skipped: Optional[Dict[str, int]] = None, lag: bool = True, n_rows: Optional[int] = None,
                   report: bool = True) -> Tuple[DryerParams, Dict]:
@@ -781,6 +812,7 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
         for k, v in zip(use, beta[1:]):
             coef[k] = float(v)
         res = (y_adj - x @ np.asarray(beta)).tolist()
+        fit.last = (x, wt, a, ii)        # для оценки разброса коэффициентов
         return float(beta[0]), coef, res, use
 
     idx = list(range(n))
@@ -824,6 +856,27 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
     rmse_ln = math.sqrt(_mean([r * r for r in res]))
     segs = segment_summary(used, emp, used_arr)
     segs_phys = segment_summary(used, phys, used_arr)
+    # --- v0.8: данные для честных допусков ---
+    x_m, wt_m, a_m, ii_m = fit.last
+    cov_fit, deff = _param_cov(x_m, wt_m, a_m, np.asarray(res), np.asarray([obs[i]["seg"] for i in ii_m]))
+    # коэффициенты, не подобранные по журналу (нет данных или разброса), известны только приблизительно —
+    # их априорная неопределённость тоже входит в допуск
+    fixed = [k for k in feats if k not in use]
+    unc_feats = ["const"] + list(use) + fixed
+    cov = np.zeros((len(unc_feats), len(unc_feats)))
+    cov[:len(cov_fit), :len(cov_fit)] = cov_fit
+    for j, k in enumerate(fixed, start=len(cov_fit)):
+        cov[j, j] = PRIOR_SD[k] ** 2
+    f_full = np.column_stack([np.ones(len(ii_m))] + [feats[k][ii_m] for k in unc_feats[1:]])
+    lev = float(np.mean(np.einsum("ij,jk,ik->i", f_full, cov, f_full))) if len(ii_m) else 0.0
+    phys_by = {sp["seg"]: sp for sp in segs_phys}
+    rel = [abs(phys_by[sg["seg"]]["dw_pred"] - sg["dw_pred"]) / max(sg["dw_pred"], 0.5) for sg in segs if sg["seg"] in phys_by]
+    struct_base = float(np.median(rel)) if rel else p.struct_base
+    explored = {"d": [float(used_arr["d"].min()), float(used_arr["d"].max())],
+                "t": [float(used_arr["t_proc"].min()), float(used_arr["t_proc"].max())],
+                "w": [float(used_arr["w_in"].min()), float(used_arr["w_in"].max())]}
+    new_p = replace(new_p, unc_feats=unc_feats, unc_cov=cov.tolist(), unc_lev=lev,
+                    struct_base=struct_base, explored=explored)
     seg_mae = _mean([abs(s["dw_pred"] - s["dw_obs"]) for s in segs]) if segs else float("nan")
     seg_mae_phys = _mean([abs(s["dw_pred"] - s["dw_obs"]) for s in segs_phys]) if segs_phys else float("nan")
     w_pred, q_pred = predict_out(new_p, used, used_arr)
@@ -854,6 +907,12 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
         + ("  — η на границе диапазона, проверьте данные" if phys_rep["at_edge"] else ""),
         f"Ошибка прогноза w_вых по строкам: ±{phys_rep['mae']:.2f} п.п. (смещение {phys_rep['bias']:+.2f}, максимум {phys_rep['max']:.2f})",
     ]
+    lines.append("")
+    lines.append(f"ДОПУСКИ: разброс коэффициентов ±{100 * math.sqrt(lev):.1f} % скорости сушки в изученных режимах "
+                 f"(с поправкой на зависимость строк внутри прохода ×{deff:.1f}); вне их он растёт. Типичное расхождение "
+                 f"моделей на проходах журнала {100 * struct_base:.0f} %. Изучено: D {explored['d'][0]:.0f}–"
+                 f"{explored['d'][1]:.0f} с, T {explored['t'][0]:.0f}–{explored['t'][1]:.0f} °C, W вх "
+                 f"{explored['w'][0]:.0f}–{explored['w'][1]:.0f} %.")
     if segs:
         lines.append("")
         lines.append(f"Съём за проход, средняя ошибка по {len(segs)} участкам: эмпирическая ±{seg_mae:.2f} п.п., "

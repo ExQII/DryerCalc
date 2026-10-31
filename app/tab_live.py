@@ -48,6 +48,13 @@ class LiveTab(QWidget):
         self.cb_corr = QCheckBox("Поправка по последним замерам выхода")
         self.cb_corr.setChecked(True)
         self.cb_now = QCheckBox("Считать до текущего времени (а не до последней пробы)")
+        self.cb_silo = QCheckBox("Выравнивать среднюю влажность в приёмном силосе")
+        self.cb_silo.setChecked(True)
+        self.cb_silo.setToolTip(
+            "Всё, что выгружено за проход, ложится в один силос — важна его средняя влажность. Если часть уже ушла "
+            "суше или сырее цели, программа подберёт D так, чтобы оставшееся зерно выровняло среднее, но не дальше "
+            "чем на заданное число п.п. от цели прохода.")
+        self.silo_lim = dspin(0.2, 3.0, 1.0, 1, 0.1, " п.п.")
         b_mass = QPushButton("Взять массу партии из «Расчёт по модели»")
         b_mass.clicked.connect(lambda: self.m_pass.setValue(self.win.in_mass.value()))
         b_w = QPushButton("T и RH из таблицы погоды (на время последней пробы)")
@@ -61,6 +68,8 @@ class LiveTab(QWidget):
         f.addRow("Наружный воздух, RH", self.rh)
         f.addRow(b_w)
         f.addRow("Проверить своё D", self.d_try)
+        f.addRow(self.cb_silo)
+        f.addRow("…но не дальше от цели прохода, ±", self.silo_lim)
         f.addRow(self.cb_corr)
         f.addRow(self.cb_now)
         lv.addWidget(gb)
@@ -85,7 +94,7 @@ class LiveTab(QWidget):
         tv.addWidget(self.summary)
         tv.addWidget(QLabel("Что будет при другом D (вход и температура — как сейчас)"))
         self.tbl = table(["D, с", "Q, т/ч", "W вых, %", "Влагомер покажет, %", "Съём, п.п.", "Видно через, ч",
-                          "Конец прохода", "T зерна ≈, °C"])
+                          "Конец прохода", "Среднее по силосу, %", "T зерна ≈, °C"])
         tv.addWidget(self.tbl)
         right.addWidget(top)
         self.plot = SimplePlot()
@@ -96,9 +105,10 @@ class LiveTab(QWidget):
         lay.addWidget(right, 1)
         left.setMaximumWidth(470)
 
-        for w in (self.m_pass, self.w_target, self.wk_final, self.t_amb, self.rh, self.d_try):
+        for w in (self.m_pass, self.w_target, self.wk_final, self.t_amb, self.rh, self.d_try, self.silo_lim):
             w.valueChanged.connect(self.recalc)
         self.cb_corr.stateChanged.connect(self.recalc)
+        self.cb_silo.stateChanged.connect(self.recalc)
         self.cb_now.stateChanged.connect(self.refresh)
         self._load()
 
@@ -110,11 +120,15 @@ class LiveTab(QWidget):
             if k in d:
                 w.setValue(float(d[k]))
         self.cb_corr.setChecked(bool(d.get("corr", True)))
+        self.cb_silo.setChecked(bool(d.get("silo", True)))
+        if "silo_lim" in d:
+            self.silo_lim.setValue(float(d["silo_lim"]))
 
     def _save(self) -> None:
         self.win.storage.set_json("ui_live", {
             "m_pass": self.m_pass.value(), "w_target": self.w_target.value(), "wk": self.wk_final.value(),
-            "t_amb": self.t_amb.value(), "rh": self.rh.value(), "corr": self.cb_corr.isChecked()})
+            "t_amb": self.t_amb.value(), "rh": self.rh.value(), "corr": self.cb_corr.isChecked(),
+            "silo": self.cb_silo.isChecked(), "silo_lim": self.silo_lim.value()})
 
     def _weather(self) -> None:
         ws = self.win.weather_series()
@@ -158,7 +172,9 @@ class LiveTab(QWidget):
                 f"Вход сейчас: <b>{fnum(st.w_in)} %</b>; выход (влагомер): <b>{fnum(st.w_out_read)} %</b><br>"
                 f"D: <b>{fnum(st.d, 0)} с</b> (Q = {fnum(mdl.q_at(p, st.d) if st.d else None)} т/ч); "
                 f"T блоков: <b>{tp}</b>; T зерна: <b>{tg}</b><br>"
-                f"Выгружено с начала прохода: <b>{fnum(st.unloaded, 0)} т</b><br>"
+                f"Выгружено с начала прохода: <b>{fnum(st.unloaded, 0)} т</b>"
+                + (f", средняя влажность в силосе <b>{st.silo_w:.1f} %</b> (влагомер {st.silo_w_read:.1f} %)"
+                   if st.silo_w is not None else "") + "<br>"
                 f"Поправка модели по {st.corr_n} последним замерам: <b>{st.corr:+.2f} п.п.</b>"
                 + ("<br><b>Сейчас рециркуляция</b> (из силоса не подаётся) — время досушки на вкладке «Рециркуляция»."
                    if st.recirc else ""))
@@ -191,17 +207,36 @@ class LiveTab(QWidget):
         now = datetime.now() if self.cb_now.isChecked() else None
         d_try = self.d_try.value() or None
         fc = live_forecast(p, c, st, self.m_pass.value(), self.w_target.value(), self.wk_final.value(), soft, hard,
-                           use_corr=self.cb_corr.isChecked(), now=now, d_override=d_try)
+                           use_corr=self.cb_corr.isChecked(), now=now, d_override=d_try,
+                           silo=self.cb_silo.isChecked(), silo_lim=self.silo_lim.value())
+        self.fc = fc
         d_use = d_try or fc.d_rec
         lines = [f"Сейчас при D = {st.d:.0f}: на выходе ≈ <b>{fc.w_out_now:.1f} %</b> "
                  f"(влагомер покажет {fc.w_out_now_read:.1f} %)."]
+        sl = fc.silo
+        if sl:
+            lines.append(f"В приёмный силос ушло {sl['m_done']:.0f} т со средней влажностью <b>{sl['w_done']:.1f} %</b> "
+                         f"(влагомер {sl['w_done_read']:.1f} %)"
+                         + (f"; ещё ≈ {sl['m_tr']:.0f} т уже в шахте — выйдут ≈ {sl['w_tr']:.1f} %." if sl["m_tr"] >= 1
+                            else "."))
+            if sl["late"]:
+                lines.append(("До конца прохода осталось только зерно, которое уже в шахте" if sl["m_tr"] >= 1 else
+                              "Масса прохода уже выгружена") +
+                             f": среднее по силосу выйдет ≈ <b>{sl['avg']:.1f} %</b> — менять D ради этого прохода поздно.")
+            elif abs(fc.w_goal - self.w_target.value()) >= 0.05:
+                lim_txt = (f" (нужно бы {sl['need']:.1f} %, ограничено ±{sl['lim']:g} п.п.)" if sl["limited"] else "")
+                lines.append(f"Чтобы среднее по силосу вышло {self.w_target.value():g} %, зерну, которое войдёт с этого "
+                             f"момента ({sl['m_new']:.0f} т), нужно <b>{fc.w_goal:.1f} %</b>{lim_txt}.")
+        goal_txt = f"{fc.w_goal:.1f}" if abs(fc.w_goal - self.w_target.value()) >= 0.05 else f"{self.w_target.value():g}"
         if d_try:
             lines.append(f"При вашем D = <b>{d_try:.0f}</b>: на выходе ≈ <b>{fc.w_out_rec:.1f} %</b> "
-                         f"(подобранное для цели {self.w_target.value():g} %: D = {fc.d_rec:.0f}).")
+                         f"(подобранное для {goal_txt} %: D = {fc.d_rec:.0f}).")
         else:
             change = "оставить как есть" if abs(fc.d_rec - st.d) < 0.5 else f"было {st.d:.0f}"
-            lines.append(f"Для {self.w_target.value():g} % на выходе: <b>D = {fc.d_rec:.0f}</b> ({change}); "
+            lines.append(f"Для {goal_txt} % на выходе: <b>D = {fc.d_rec:.0f}</b> ({change}); "
                          f"ожидается {fc.w_out_rec:.1f} % (влагомер {mdl.read_from_true(p, fc.w_out_rec, st.t_grain):.1f} %).")
+        if sl and not sl["late"]:
+            lines.append(f"Ожидаемая средняя влажность приёмного силоса после прохода: <b>{sl['avg']:.1f} %</b>.")
         if fc.d_note:
             lines.append(f"<span style='color:{th.error}'>{fc.d_note}.</span>")
         if fc.visible_at:
@@ -216,6 +251,9 @@ class LiveTab(QWidget):
                    if fc.batch_end_range else "")
             lines.append(f"Дальше до {self.wk_final.value():g} %: ещё {len(fc.rest_plan.passes)} прох. (D {ds}), "
                          f"партия закончится ≈ <b>{fc.batch_end:%d.%m %H:%M}</b>{rng}.")
+            if fc.sigma_info and (fc.sigma_info["param"] > 0.005 or fc.sigma_info["struct"] > 0.005
+                                  or fc.sigma_info["flags"]):
+                lines.append(f"<span style='color:{th.muted}'>{mdl.sigma_text(fc.sigma_info)}.</span>")
         elif fc.batch_end:
             lines.append(f"Это последний проход: партия с охлаждением закончится ≈ <b>{fc.batch_end:%d.%m %H:%M}</b>.")
         for wtxt in fc.warnings:
@@ -236,11 +274,18 @@ class LiveTab(QWidget):
             rem = max(m_out - st.unloaded, 0.0)
             end = t_now + timedelta(hours=rem / q) if q > 0 else None
             tau = p.lag_k * p.m_dryer / q if q > 0 else 0.0
+            if sl:
+                part = w_out * sl["m_new"] if sl["m_new"] > 0 else 0.0
+                avg = (sl["w_done"] * sl["m_done"] + sl["w_tr"] * sl["m_tr"] + part) / max(
+                    sl["m_done"] + sl["m_tr"] + max(sl["m_new"], 0.0), 1e-9)
+                avg_txt = f"{avg:.1f}"
+            else:
+                avg_txt = "—"
             cells = [f"{d:.0f}", f"{q:.1f}", f"{w_out:.1f}", f"{mdl.read_from_true(p, w_out, st.t_grain):.1f}",
                      f"{st.w_in - w_out:.1f}",
-                     f"{tau:.1f}", f"{end:%d.%m %H:%M}" if end else "—", f"{ps.t_grain:.0f}"]
+                     f"{tau:.1f}", f"{end:%d.%m %H:%M}" if end else "—", avg_txt, f"{ps.t_grain:.0f}"]
             for j, txt in enumerate(cells):
-                it = item(txt, align_right=j < 7)
+                it = item(txt, align_right=j < 8)
                 if abs(d - d_use) < 0.5:
                     it.setBackground(QBrush(th.level(0)[0]))
                     it.setForeground(QBrush(th.level(0)[1]))

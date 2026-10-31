@@ -214,6 +214,25 @@ def run(out_path: str) -> int:
         (r0, r1), _ = pl.vb.viewRange()
         check(z1 - z0 < 0.6 * (x1 - x0) and abs((r1 - r0) - (x1 - x0)) < 1e-6 * max(1.0, x1 - x0),
               "интерактивный график: масштаб и «показать всё»")
+        # --- v0.8: честные допуски, средняя влажность приёмного силоса, поправка влагомера по партиям ---
+        win.recalc()
+        tips = [win.tbl_sc.item(i, 3).toolTip() for i in range(win.tbl_sc.rowCount())]
+        sig1 = win.plan_sigmas[0][0] if getattr(win, "plan_sigmas", None) else 0.0
+        check(bool(tips) and all("Допуск 90 %" in t for t in tips) and bool(win.params.unc_cov)
+              and sig1 > win.params.rate_sigma,
+              f"честные допуски: 1 проход ±{100 * mdl.Z90 * sig1:.0f} % скорости (проверка ±"
+              f"{100 * mdl.Z90 * win.params.rate_sigma:.0f} %)")
+        win.tab_live.cb_silo.setChecked(True)
+        win.tab_live.refresh()
+        _fc = getattr(win.tab_live, "fc", None)
+        check(_fc is not None and _fc.silo is not None and win.tab_live.state.silo_w is not None
+              and "силос" in win.tab_live.summary.text(),
+              f"средняя влажность приёмного силоса: {win.tab_live.state.silo_w:.1f} %" if _fc and _fc.silo else
+              "средняя влажность силоса не посчитана")
+        win.tab_data._m_stats()
+        _cm = win.tab_data._m_comb
+        check(_cm.get("n_batches", 0) >= 1 and _cm.get("a") is not None and win.tab_data.tbl_mb.rowCount() >= 1,
+              f"поправка влагомера по партиям: партий {_cm.get('n_batches', 0)}, итог a = {_cm.get('a', 0):+.2f}")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

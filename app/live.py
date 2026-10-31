@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from . import model as mdl
 
 
@@ -43,6 +45,9 @@ class LiveState:
     corr_n: int = 0
     recirc: bool = False
     burner_off: bool = False
+    silo_w: Optional[float] = None       # средневзвешенная по массе влажность ушедшего в приёмный силос (истинная), %
+    silo_w_read: Optional[float] = None  # то же по показаниям выходного влагомера, %
+    silo_n: int = 0                      # сколько проб выхода в это легло
     series: List[Tuple[datetime, Optional[float], Optional[float]]] = field(default_factory=list)  # (t, вход, выход)
 
 
@@ -92,7 +97,12 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.pass_no = r.get("pass_no") if r.get("pass_no") is not None else st.pass_no
         st.series.append((r["dt"], r.get("w_in"), r.get("w_out")))
     end = max(now, st.last) if now else st.last
-    unloaded = 0.0
+    # влажность выхода по времени (истинная — с поправкой влагомера) — для средней влажности приёмного силоса
+    rd = [(r["dt"], r["w_out"], mdl.true_from_read(p, r["w_out"], 0.5 * (r["t_a1"] + r["t_a2"])
+                                                    if r.get("t_a1") is not None and r.get("t_a2") is not None else None))
+          for r in rs if r.get("w_out") is not None and not r.get("recirc")]
+    t_rd = [(t - rs[0]["dt"]).total_seconds() / 3600.0 for t, _, _ in rd]
+    unloaded = silo_sum = silo_sum_read = 0.0
     stopped = False
     for a, b in zip(rs, rs[1:] + [None]):
         note = (a.get("note") or "").lower()
@@ -102,8 +112,16 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
             stopped = False
         t_next = b["dt"] if b is not None else end
         if a.get("d_f") is not None and not stopped and not a.get("recirc") and not a.get("burner_off"):
-            unloaded += mdl.q_at(p, a["d_f"]) * max((t_next - a["dt"]).total_seconds(), 0.0) / 3600.0
+            dm = mdl.q_at(p, a["d_f"]) * max((t_next - a["dt"]).total_seconds(), 0.0) / 3600.0
+            unloaded += dm
+            if rd and dm > 0:
+                ha = (a["dt"] - rs[0]["dt"]).total_seconds() / 3600.0
+                hb = (t_next - rs[0]["dt"]).total_seconds() / 3600.0
+                silo_sum += dm * 0.5 * float(np.interp(ha, t_rd, [x[2] for x in rd]) + np.interp(hb, t_rd, [x[2] for x in rd]))
+                silo_sum_read += dm * 0.5 * float(np.interp(ha, t_rd, [x[1] for x in rd]) + np.interp(hb, t_rd, [x[1] for x in rd]))
     st.unloaded = unloaded
+    if rd and unloaded > 0:
+        st.silo_w, st.silo_w_read, st.silo_n = silo_sum / unloaded, silo_sum_read / unloaded, len(rd)
     st.recirc = bool(rs[-1].get("recirc"))
     st.burner_off = bool(rs[-1].get("burner_off"))
     st.hours = (end - st.start).total_seconds() / 3600.0
@@ -146,21 +164,49 @@ class LiveForecast:
     rest_plan: Optional[mdl.Plan] = None
     batch_end: Optional[datetime] = None
     batch_end_range: Optional[Tuple[datetime, datetime]] = None   # 90 % по ошибке скорости сушки
+    sigma_info: Optional[Dict] = None      # из чего сложился допуск конца партии (model.plan_sigma)
+    w_goal: float = 0.0                    # на какую влажность подбирается D (цель прохода или поправленная по силосу)
+    silo: Optional[Dict] = None            # выравнивание средней влажности приёмного силоса (см. live_forecast)
     t_grain_est: float = 0.0
     warnings: List[str] = field(default_factory=list)
 
 
 def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: float, w_target: float,
                   wk_final: float, soft: float, hard: float, use_corr: bool = True, cool: bool = True,
-                  now: Optional[datetime] = None, d_override: Optional[float] = None) -> LiveForecast:
-    """w_target — желаемая истинная влажность на выходе ЭТОГО прохода; wk_final — цель партии."""
+                  now: Optional[datetime] = None, d_override: Optional[float] = None, silo: bool = False,
+                  silo_lim: float = 1.0) -> LiveForecast:
+    """w_target — желаемая истинная влажность на выходе ЭТОГО прохода (средняя по приёмному силосу); wk_final —
+    цель партии.
+
+    silo=True — выравнивание средней влажности приёмного силоса: всё, что выгружено за проход, ложится в один силос,
+    и важна его средняя влажность, а не каждая проба. Если часть уже ушла суше или сырее цели (например, в начале
+    прохода выходил хвост прошлого), остатку назначается такая влажность, чтобы среднее по массе вышло в цель:
+        W_нужно = (W_цель·M_всего − W_ушло·M_ушло − W_шахта·M_шахта) / M_новое,
+    где M_шахта ≈ lag_k·вместимость — зерно, уже находящееся в шахте: оно выйдет со старым режимом (≈ W при текущем
+    D), и подстроить можно только зерно, которое войдёт с этого момента (M_новое). W_нужно ограничивается
+    W_цель ± silo_lim, чтобы силос не стал «полосатым»: сильно разная влажность слоёв плохо хранится."""
     fc = LiveForecast()
     corr = st.corr if use_corr else 0.0
     w_in = st.w_in
     d_now = st.d
     fc.w_out_now = mdl.solve_pass(p, c, w_in, 1.0, d_now).w_out + corr
     fc.w_out_now_read = mdl.read_from_true(p, fc.w_out_now, st.t_grain)
-    raw = mdl.d_for_target(p, c, w_in, w_target - corr)
+    w_goal = w_target
+    if silo and st.silo_w is not None and st.unloaded > 1.0:
+        m_total = m_pass * (100.0 - w_in) / (100.0 - w_target)
+        m_done = st.unloaded
+        m_rem = max(m_total - m_done, 0.0)
+        m_tr = min(p.lag_k * p.m_dryer, m_rem)
+        m_new = m_rem - m_tr
+        fc.silo = {"m_total": m_total, "m_done": m_done, "w_done": st.silo_w, "w_done_read": st.silo_w_read,
+                   "m_tr": m_tr, "w_tr": fc.w_out_now, "m_new": m_new, "need": None, "limited": False,
+                   "late": m_new < max(0.05 * m_total, 5.0), "lim": silo_lim}
+        if not fc.silo["late"]:
+            need = (w_target * m_total - st.silo_w * m_done - fc.w_out_now * m_tr) / m_new
+            w_goal = min(max(need, w_target - silo_lim), w_target + silo_lim)
+            fc.silo.update(need=need, limited=abs(need - w_goal) > 0.05)
+    fc.w_goal = w_goal
+    raw = mdl.d_for_target(p, c, w_in, w_goal - corr)
     fc.d_rec_raw = raw
     if raw > 100.5:
         fc.d_rec = 100.0
@@ -172,12 +218,17 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
         fc.d_rec = float(round(raw))
     d_use = d_override if d_override else fc.d_rec
     fc.w_out_rec = mdl.solve_pass(p, c, w_in, 1.0, d_use).w_out + corr
+    if fc.silo:
+        sl = fc.silo
+        new_part = fc.w_out_rec * sl["m_new"] if sl["m_new"] > 0 else 0.0
+        sl["avg"] = (sl["w_done"] * sl["m_done"] + sl["w_tr"] * sl["m_tr"] + new_part) / max(
+            sl["m_done"] + sl["m_tr"] + max(sl["m_new"], 0.0), 1e-9)
     q_new = mdl.q_at(p, d_use)
     fc.tau_h = p.lag_k * p.m_dryer / q_new if q_new > 0 else float("inf")
     t_now = max(now, st.last) if now else st.last
     fc.visible_at = t_now + timedelta(hours=fc.tau_h) if fc.tau_h < 1e6 else None
-    # остаток прохода: масса на выходе прохода по ожидаемой влажности
-    w_pass_out = fc.w_out_rec
+    # остаток прохода: масса на выходе прохода по ожидаемой влажности (с выравниванием — средняя по силосу)
+    w_pass_out = fc.silo["avg"] if fc.silo else fc.w_out_rec
     fc.m_out_pass = m_pass * (100.0 - w_in) / (100.0 - w_pass_out) if w_pass_out < 100 else m_pass
     fc.remaining = max(fc.m_out_pass - st.unloaded, 0.0)
     fc.pass_end = t_now + timedelta(hours=fc.remaining / q_new) if q_new > 0 else None
@@ -190,8 +241,11 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
         fc.batch_end = fc.rest_plan.end
         n_rest = len(fc.rest_plan.passes)
         start_rest = fc.pass_end + timedelta(hours=p.overhead_h)
+        # честный допуск остатка партии: проверка на журнале + разброс коэффициентов + расхождение моделей
+        from dataclasses import replace as _replace
+        sig, fc.sigma_info = mdl.plan_sigma(p, fc.rest_plan, c, mdl.other_model_final(p, fc.rest_plan, c))
         lo, hi = mdl.time_range(lambda pp: mdl.plan_by_passes(pp, c, fc.m_out_pass, w_pass_out, wk_final, n_rest,
-                                                              start_rest, None, cool), p)
+                                                              start_rest, None, cool), _replace(p, rate_sigma=sig))
         fc.batch_end_range = (start_rest + timedelta(hours=lo), start_rest + timedelta(hours=hi))
     elif fc.pass_end:
         cool_h = fc.m_out_pass / mdl.q_full(p) if cool and mdl.q_full(p) > 0 else 0.0
