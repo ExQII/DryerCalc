@@ -3,13 +3,14 @@
 #   pyinstaller --noconfirm DryerCalc_dir.spec   затем   makensis installer.nsi
 import os
 
-# v0.7: расчёты на numpy, графики на pyqtgraph. Не нужны: OpenGL (pyqtgraph рисует 2D через QPainter), сетевые и
-# прочие модули Qt, matplotlib/scipy, части pyqtgraph для 3D, Jupyter, консоли, примеров.
+# v0.7: расчёты на numpy, графики на pyqtgraph. Не нужны: сетевые и прочие модули Qt, matplotlib/scipy, части
+# pyqtgraph для 3D, Jupyter, консоли, примеров. PySide6.QtOpenGL/QtOpenGLWidgets нужны: pyqtgraph импортирует их
+# всегда (рисует при этом через QPainter, без OpenGL), а программный OpenGL-рендер opengl32sw.dll — не нужен.
 EXCLUDES = [
     "matplotlib", "scipy", "pandas", "tkinter", "unittest", "ssl", "_ssl", "_hashlib",
     "pyqtgraph.examples", "pyqtgraph.opengl", "pyqtgraph.jupyter", "pyqtgraph.flowchart", "pyqtgraph.console",
     "pyqtgraph.dockarea", "OpenGL", "IPython", "jupyter_rfb", "cupy", "numba", "h5py", "PyQt5", "PyQt6", "PySide2",
-    "PySide6.QtOpenGL", "PySide6.QtOpenGLWidgets", "PySide6.QtSvg", "PySide6.QtQml", "PySide6.QtQuick",
+    "PySide6.QtSvg", "PySide6.QtQml", "PySide6.QtQuick",
     "PySide6.QtDBus", "PySide6.QtDesigner", "PySide6.QtHelp", "PySide6.QtSql", "PySide6.QtTest",
     "PySide6.QtConcurrent", "PySide6.QtXml", "PySide6.QtNetwork", "PySide6.QtPrintSupport",
 ]
