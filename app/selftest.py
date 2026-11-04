@@ -301,6 +301,27 @@ def run(out_path: str) -> int:
         _txt = _soon(win.params, win.tab_live.state, _fc) if _fc is not None else ""
         check(_fc is not None and _fc.transit is not None and bool(_txt),
               f"прогноз выхода по зерну в шахте (все режимы за его путь): {_txt or 'не посчитан'}")
+        # --- v1.1: проход делит рециркуляция, а не переключение силоса; рециркуляция у цели — досушка ---
+        from datetime import datetime
+        from .calibration import journal_passes as _jp, prepare as _prep
+        from .live import live_state
+        _t0 = datetime(2026, 11, 2, 8, 0)
+
+        def _r(h, wi=None, wo=None, note=""):
+            return {"ts": (_t0 + _td(hours=h)).strftime("%d.%m.%y %H:%M"), "w_in": wi, "w_out": wo,
+                    "t_a1": 30 if wo else None, "t_a2": 34 if wo else None, "t_up": 60, "t_low": 60, "d": 35,
+                    "note": note, "batch": "П-1", "pass_no": 1}
+        _rows = ([_r(0, note="Запуск, сушим с 2 с. в 5 с.")] + [_r(0.5 * k, 26.0, 21.8) for k in range(1, 21)]
+                 + [_r(10.2, note="Закончился 2 с., сушим с 4 с.")] + [_r(0.5 * k, 26.5, 21.6) for k in range(21, 41)]
+                 + [_r(20.2, note="Закончился 4 с., рециркуляция"), _r(20.5, 21.0, 20.2),
+                    _r(21.4, note="сушим с 5 с. в 2 с.")] + [_r(0.5 * k, 21.0, 14.7) for k in range(44, 80)]
+                 + [_r(40.2, note="Закончился 5 с., рециркуляция"), _r(40.5, 14.6, 14.2)])
+        _ps = _jp(_prep(_rows)[0], win.params, 15.0)
+        _st = live_state(_rows[:40], win.params, final_w=15.0)
+        check([(x["pass_no"], x["batch_end"]) for x in _ps] == [(1, False), (2, True)] and _st.sources == ["2", "4"]
+              and abs(_st.unloaded - mdl.q_at(win.params, 35) * 19.0) < 1e-6,
+              f"проходы по рециркуляции: {len(_ps)} (силосы {' → '.join(_st.sources)} — один проход, выгружено "
+              f"{_st.unloaded:.0f} т); рециркуляция при {_ps[-1]['w_end']:.1f} % — досушка и конец партии")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

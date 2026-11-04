@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import model as mdl
 
-STOP_WORDS = ("остановк", "закончил", "охлажд")
+STOP_WORDS = ("остановк", "охлажд")
 
 
 @dataclass
@@ -41,7 +41,7 @@ class ReminderCfg:
 
 def drying_active(rows: List[Dict], now: datetime) -> Tuple[bool, Optional[datetime], Optional[int]]:
     """(идёт ли сушка, время последней пробы с влажностью, номер участка)."""
-    from .calibration import pass_of_segment, prepare
+    from .calibration import is_feed_note, pass_of_segment, prepare
     prep, reliable = prepare(rows)
     if not prep or not reliable:
         return False, None, None
@@ -52,8 +52,9 @@ def drying_active(rows: List[Dict], now: datetime) -> Tuple[bool, Optional[datet
     last_sample = data[-1]["dt"]
     note = (last.get("note") or "").lower()
     has_data = last.get("w_in") is not None or last.get("w_out") is not None
-    # «Закончился 2 с., сушим с 1 с.» с пробой — это начало нового прохода, а не остановка
-    stopped = bool(last.get("burner_off")) or (any(w in note for w in STOP_WORDS) and not has_data)
+    # «Закончился 2 с., сушим с 1 с.» — переключение силоса, сушка идёт; «Закончились партию» без пробы — стоп
+    ended = "закончил" in note and not is_feed_note(note) and "рецирк" not in note
+    stopped = bool(last.get("burner_off")) or ((any(w in note for w in STOP_WORDS) or ended) and not has_data)
     fresh = (now - last["dt"]) <= timedelta(hours=8)
     return (not stopped) and fresh, last_sample, pass_of_segment(prep).get(last["seg"], last["seg"])
 
@@ -108,11 +109,14 @@ def check(rows: List[Dict], now: datetime, state: Dict, cfg: ReminderCfg, pass_e
 
 def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: float, hard: float, weather=None,
                  now: Optional[datetime] = None) -> Tuple[Optional[datetime], Optional[float]]:
-    """(ожидаемый конец текущего прохода, цель прохода в показаниях влагомера) — как в разделе «Текущий проходчас»."""
+    """(ожидаемый конец текущего прохода, цель прохода в показаниях влагомера) — как в разделе «Текущий проход».
+    Во время рециркуляции подача прохода уже закончилась — «проход скоро закончится» не напоминаем."""
     from .live import live_forecast, live_state
-    st = live_state(rows, p, now=now, weather=weather)
+    st = live_state(rows, p, now=now, weather=weather, final_w=float(ui_live.get("wk", 14.0)) + 1.0)
     if not st.ok:
         return None, None
+    if st.recirc:
+        return None, mdl.read_from_true(p, float(ui_live.get("w_target", 24.0)), st.t_grain)
     w_target = float(ui_live.get("w_target", 24.0))
     c = mdl.Conditions(st.t_proc, float(ui_live.get("t_amb", p.t_amb_ref)), float(ui_live.get("rh", p.rh_ref)))
     fc = live_forecast(p, c, st, float(ui_live.get("m_pass", 500.0)), w_target, float(ui_live.get("wk", 14.0)),

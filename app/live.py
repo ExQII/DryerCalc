@@ -1,8 +1,9 @@
 """Режим «по факту»: состояние текущего прохода по журналу, прогноз окончания и подсказка разгрузки D.
 
-* Текущий проход — последний участок журнала с пробами вместе с предыдущими участками того же прохода:
-  участки, разделённые только остановкой/пуском или перерывом, при тех же «Партия» и «Проход» — один проход
-  (calibration.pass_of_segment). Новый проход начинают «Закончился …», «открыли с …», смена партии/прохода.
+* Текущий проход — проход последней пробы журнала (calibration.journal_passes): от подачи из силоса до
+  рециркуляции, сколько бы силосов («Закончился 2 с., сушим с 1 с.»), остановок и перерывов в нём ни было. Новый
+  проход начинается, когда после рециркуляции (или охлаждения) снова пошла подача, или со сменой «Партия» /
+  «Проход». Рециркуляция, когда выход уже у цели партии (≤ Wк + 1 п.п.), — досушка и конец партии.
 * Выгружено с начала прохода = Σ Q(D) · Δt по строкам журнала (D переносится вперёд, как в журнале); время от
   строки «Остановка» до строки «Запуск» не считается, рециркуляция и охлаждение тоже.
 * Поправка по факту: модель сравнивается с последними (до 6, то есть ~3 ч) замерами выхода этого прохода
@@ -40,6 +41,13 @@ class LiveState:
     rh: Optional[float] = None
     batch: str = ""
     pass_no: Optional[float] = None
+    pass_auto: bool = False              # номер прохода посчитан программой (в журнале «Проход» не вписан)
+    batch_no: int = 1                    # номер партии по счёту в журнале
+    end_kind: Optional[str] = None       # подача прохода закончена: "recirc" / "cool"; None — подача идёт
+    batch_end: bool = False              # партия высушена: досушка (рециркуляция у цели) или охлаждение
+    w_end: Optional[float] = None        # истинная влажность выхода в конце подачи, %
+    recirc_since: Optional[datetime] = None   # с какого времени рециркуляция
+    sources: List[str] = field(default_factory=list)   # силосы подачи этого прохода по примечаниям
     unloaded: float = 0.0
     hours: float = 0.0
     corr: float = 0.0
@@ -58,8 +66,10 @@ class LiveState:
 
 
 def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = None, weather=None,
-               corr_window: int = 6) -> LiveState:
-    from .calibration import STOP_STEMS, _t_proc, observe_all, pass_of_segment, prepare
+               corr_window: int = 6, final_w: Optional[float] = None) -> LiveState:
+    """final_w — выше какой влажности выхода (истинной) рециркуляция — конец прохода, а не досушка партии
+    (по умолчанию calibration.FINAL_W = 15 %; раздел «Текущий проход» передаёт Wк + 1 п.п.)."""
+    from .calibration import FINAL_W, STOP_STEMS, _t_proc, journal_passes, observe_all, pass_of_segment, prepare
     st = LiveState()
     if weather is not None:
         rows = weather.fill_rows(rows)
@@ -82,7 +92,18 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.message = "У последнего прохода нет времени проб."
         return st
     st.seg = pass_of[seg]
-    st.start, st.last = rs[0]["dt"], rs[-1]["dt"]
+    info = next((x for x in journal_passes(prep, p, FINAL_W if final_w is None else final_w)
+                 if seg in x["segs"]), None)
+    if info is not None:
+        st.batch, st.pass_no, st.pass_auto = info["batch"], info["pass_no"], info["pass_auto"]
+        st.batch_no, st.end_kind, st.w_end = info["batch_no"], info["end_kind"], info["w_end"]
+        st.batch_end, st.sources = bool(info["batch_end"] and info["end_kind"]), list(info["sources"])
+    # начало прохода — первая строка, где сушилка работает (проход может начаться строкой «Остановка» после
+    # рециркуляции прошлого прохода)
+    st.start = next((r["dt"] for r in rs if r.get("d_f") is not None and not r.get("recirc")
+                     and not r.get("burner_off") and not any(w in (r.get("note") or "").lower() for w in STOP_STEMS)),
+                    rs[0]["dt"])
+    st.last = rs[-1]["dt"]
     prev_d = None
     for r in rs:
         if r.get("d_f") is not None:
@@ -106,8 +127,8 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
             st.t_amb = r["t_amb"]
         if r.get("rh") is not None:
             st.rh = r["rh"]
-        st.batch = r.get("batch") or st.batch
-        st.pass_no = r.get("pass_no") if r.get("pass_no") is not None else st.pass_no
+        if r.get("recirc") and st.recirc_since is None:
+            st.recirc_since = r["dt"]
         st.series.append((r["dt"], r.get("w_in"), r.get("w_out")))
     end = max(now, st.last) if now else st.last
     # влажность выхода по времени (истинная — с поправкой влагомера) — для средней влажности приёмного силоса
@@ -440,9 +461,22 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
     warn = ([fc.d_note[0].upper() + fc.d_note[1:]] if fc.d_note else []) + [w[0].upper() + w[1:] for w in fc.warnings]
     read = mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
     if st.recirc:
-        return {"kind": "info", "head": "Идёт рециркуляция",
-                "sub": [f"Из силоса не подаётся — сколько досушивать, смотрите в разделе «{RECIRC}»."], "warn": warn,
-                "go": RECIRC, "d_now": st.d, "d_rec": None}
+        # подача закончилась: советы про D и съём прохода уже ни к чему, остаются только пределы температуры
+        warn = [x for x in warn if x.startswith("T ")]
+        since = f" с {st.recirc_since:%H:%M}" if st.recirc_since else ""
+        w_txt = f"≈ {st.w_end:.1f} %" if st.w_end is not None else "у цели"
+        if st.batch_end:
+            return {"kind": "info", "head": "Партия высушена — идёт досушка",
+                    "sub": [f"Рециркуляция{since}: подача закончилась, выход к концу подачи {w_txt} — это цель "
+                            f"партии. В шахте досушивается остаток.",
+                            f"Сколько досушивать — раздел «{RECIRC}», затем охлаждение."],
+                    "warn": warn, "go": RECIRC, "d_now": st.d, "d_rec": None, "batch_end": True}
+        return {"kind": "info", "head": "Проход закончен — идёт рециркуляция",
+                "sub": [f"Рециркуляция{since}: подача из силосов этого прохода закончилась, выход к концу подачи "
+                        f"{w_txt}. Зерно в шахте ходит по кругу.",
+                        "Следующий проход начнётся, когда пойдёт подача: «сушим с N с.» или «Запуск, сушим с N с.». "
+                        f"Сколько досушивать остаток — раздел «{RECIRC}»."],
+                "warn": warn, "go": RECIRC, "d_now": st.d, "d_rec": None}
     sl = fc.silo
     if sl and sl["late"]:
         return {"kind": "info", "head": f"D для этого прохода уже не менять — {st.d:.0f} с",

@@ -8,8 +8,13 @@
 --------------
 * Разбирает время вида «08:30» (без даты; переход через полночь определяется по строкам) и
   «21.10.26 08:30», пары вида «26°-24°», прочерки в колонке блоков (значение переносится вперёд).
-* Делит журнал на участки (проходы) по примечаниям («Остановка», «Запуск», «Закончился …»,
-  «открыли с …»), смене партии/номера прохода и пропускам больше 1,5 ч.
+* Делит журнал на проходы: новый проход начинается, когда после рециркуляции (или охлаждения) снова пошла
+  подача из силоса («сушим с 2 с.», «Запуск», перерыв больше 1,5 ч), или когда сменили «Партия» / «Проход».
+  Переключение силосов внутри прохода («Закончился 2 с., сушим с 1 с.» — партия лежит в нескольких оперативных
+  ёмкостях), остановки и перерывы проход не делят. Рециркуляция, когда выход уже у цели партии (≤ 15 %),
+  — досушка и конец партии (journal_passes).
+* Для калибровки проход режется ещё на участки — куски непрерывной работы: остановка / пуск, загрузка /
+  зачистка, перерыв больше 1,5 ч.
 * Выход сушилки отстаёт от входа на время пребывания зерна τ = lag_k · m_dryer / Q(D) (при D = 35
   около 3,3 ч): выход в момент t относится к зерну, которое вошло в t − τ. Поэтому наблюдаемый
   расход влаги считается по паре (вход в t − τ, выход в t):
@@ -45,11 +50,27 @@ HEADERS_RU = {
     "t_amb": "T наружная, °C", "rh": "RH наружная, %",
 }
 
-BREAK_WORDS = ("остановк", "запуск", "открыли", "открыл", "набираем", "снимаем", "закончил",
-               "загрузка", "зачистка", "переключ")
+# участок (кусок непрерывной работы для калибровки) режут остановка/пуск и загрузка/зачистка шахты; переключение
+# силоса («Закончился 2 с., сушим с 1 с.») — нет: зерно через шахту идёт без перерыва
+BREAK_WORDS = ("остановк", "запуск", "загрузка", "зачистка")
 RECIRC_WORDS = ("рецирк",)
 BURNER_OFF_WORDS = ("охлажд",)          # плюс «откл…» вместе с «т.б.» / «блок» / «горел» / «топ»
 BURNER_ON_WORDS = ("запуск", "вкл. т", "вкл т", "включ")
+# подача из силоса: «сушим с 1 с.», «открыли с 3 с.», «переключили на 2 с.», «набираем из 4», «подача с 1 с.».
+# Внутри прохода — переключение силоса (проход продолжается); после рециркуляции — подача следующего прохода
+FEED_RE = re.compile(r"(сушим\s+(с|со|из|\d)|открыл\w*\s+(с\b|с\.|со\b|из\b|силос|\d)|"
+                     r"переключ\w*\s+(на\s+)?(с\b|с\.|со\b|силос|подач|\d)|"
+                     r"(набираем|снимаем|берём|берем)\s+(с\b|с\.|со\b|из\b|силос|\d)|подач\w*\s+(с|со|из)\b)", re.I)
+# конец рециркуляции словами: «закончили рециркуляцию», «рециркуляция окончена», «стоп рециркуляция»
+RECIRC_END_RE = re.compile(r"((закончил|окончил|прекратил|остановил|завершил)\w*|конец|стоп)\s+рецирк|"
+                           r"рецирк\w*\s+(закончен|окончен|завершен|стоп)", re.I)
+# рециркуляция, когда выход уже у цели партии (13–14 % после охлаждения, с запасом 1 п.п.), — досушка и конец партии
+FINAL_W = 15.0
+
+
+def is_feed_note(note: str) -> bool:
+    """Подача из силоса (переключение силоса или начало подачи) — по образцу, а не по одной основе слова."""
+    return bool(FEED_RE.search(note or ""))
 
 
 def _burner_off_note(note: str) -> bool:
@@ -348,16 +369,28 @@ def assign_times(rows: List[Dict]) -> Tuple[List[Optional[datetime]], bool]:
 
 
 def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
-    """Добавляет к строкам: dt, t (часы от начала), seg, recirc, burner_off; переносит блоки и D вперёд.
+    """Добавляет к строкам: dt, t (часы от начала), seg, pass, recirc, burner_off, cool; переносит блоки, D, «Партия»
+    и «Проход» вперёд (batch_f, pass_f — пустая клетка значит «как выше»).
 
-    recirc — после примечания «рециркуляция» до конца участка (зерно ходит по кругу, из силоса не берётся);
-    burner_off — после «охлаждение» / «откл. т.б.» до «запуск»/«вкл.» (горелки выключены, сушки нет)."""
+    pass — проход. Новый начинается: со сменой «Партия» или «Проход»; или когда проход уже закончился (была
+      рециркуляция или охлаждение) и снова пошла подача из силоса — «сушим с …», «открыли с …», «Запуск» — или
+      записи возобновились после перерыва больше 1,5 ч. Переключение силосов внутри прохода, остановки и перерывы
+      проход НЕ делят: «выгружено» и средняя влажность приёмного силоса считаются за весь проход.
+    seg — участок, кусок непрерывной работы для калибровки: его режут ещё остановка / пуск, загрузка / зачистка и
+      перерыв больше 1,5 ч (после остановки связь «вход τ назад — выход сейчас» начинается заново).
+    recirc — от «рециркуляция» до конца рециркуляции («закончили рециркуляцию», подача следующего прохода, новый
+      участок): зерно ходит по кругу, из силоса не берётся;
+    burner_off — после «охлаждение» / «откл. т.б.» до «запуск» / «вкл.» (горелки выключены, сушки нет);
+    cool — охлаждение (конец сушки: после него следующая подача — новый проход)."""
     times, reliable = assign_times(rows)
     prep: List[Dict] = []
     seg = 0
+    pass_idx = 0
     t0 = next((t for t in times if t is not None), None)
     last_up = last_low = last_d = None
-    recirc = burner_off = False
+    recirc = burner_off = cool = False
+    ended = False                       # проход закончен (рециркуляция / охлаждение): следующая подача — новый проход
+    last_batch, last_pass = "", None
     prev_key = None
     prev_dt: Optional[datetime] = None
     for i, r in enumerate(rows):
@@ -368,25 +401,33 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
         else:
             p["t"] = 0.5 * i
         note = (r.get("note") or "").lower()
-        key = (r.get("batch") or "", r.get("pass_no"))
-        brk = False
-        if i > 0:
-            if any(w in note for w in BREAK_WORDS):
-                brk = True
-            if key != prev_key:
-                brk = True
-            if reliable and dt is not None and prev_dt is not None and (dt - prev_dt).total_seconds() > 1.5 * 3600:
-                brk = True
+        batch = (r.get("batch") or "").strip() or last_batch
+        pass_no = r.get("pass_no") if r.get("pass_no") is not None else last_pass
+        key = (batch, pass_no)
+        gap = bool(reliable and dt is not None and prev_dt is not None
+                   and (dt - prev_dt).total_seconds() > 1.5 * 3600)
+        feed = is_feed_note(note) or ("запуск" in note and not any(w in note for w in RECIRC_WORDS + BURNER_OFF_WORDS))
+        new_pass = i > 0 and (key != prev_key or (ended and (feed or gap)))
+        brk = i > 0 and (new_pass or gap or any(w in note for w in BREAK_WORDS))
         if brk:
             seg += 1
-            recirc = burner_off = False
-        if any(w in note for w in RECIRC_WORDS):
-            recirc = True
+            recirc = burner_off = cool = False
+        if new_pass:
+            pass_idx += 1
+            ended = False
+        if RECIRC_END_RE.search(note):
+            recirc = False                                  # конец рециркуляции; проход при этом уже закончен
+        elif any(w in note for w in RECIRC_WORDS):
+            recirc = ended = True
         if _burner_off_note(note):
             burner_off = True
+            if any(w in note for w in BURNER_OFF_WORDS):
+                cool = ended = True
         elif _burner_on_note(note):
-            burner_off = False
-        p["recirc"], p["burner_off"] = recirc, burner_off
+            burner_off = cool = False
+        p["recirc"], p["burner_off"], p["cool"] = recirc, burner_off, cool
+        p["batch_f"], p["pass_f"] = batch, pass_no
+        last_batch, last_pass = batch, pass_no
         prev_key = key
         if dt is not None:
             prev_dt = dt
@@ -398,45 +439,90 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
             last_d = r.get("d")
         p["d_f"] = last_d
         p["seg"] = seg
+        p["pass"] = pass_idx
         p["dt"] = dt
         prep.append(p)
     return prep, reliable
 
 
 STOP_STEMS = ("остановк",)
-# слова, после которых начинается именно НОВЫЙ проход (смена силоса, окончание), а не продолжение после остановки
-PASS_END_STEMS = ("закончил", "открыл", "переключ", "загрузка", "зачистка", "набираем", "снимаем") + RECIRC_WORDS
 
 
 def pass_of_segment(prep: List[Dict]) -> Dict[int, int]:
-    """Участок журнала -> номер первого участка его прохода.
+    """Участок журнала -> номер первого участка его прохода (prepare: новый проход всегда начинает новый участок).
 
-    Участки (prepare) режутся и остановкой/пуском, и перерывом > 1,5 ч — для калибровки это правильно (после
-    остановки связь «вход − τ / выход» начинается заново). Но для учёта «выгружено», напоминаний и сводок по
-    партиям проход один: участок B продолжает проход участка A, если у первой строки B те же непустые «Партия» и
-    «Проход», что у A, и её примечание не начинает новый проход («Закончился…», «открыли с…», «переключ…»,
-    «рециркуляция» и т. п.). Без заполненных «Партия»/«Проход» участки не объединяются."""
-    first: Dict[int, Dict] = {}
-    last: Dict[int, Dict] = {}
+    Участки режутся и остановкой / пуском, и перерывом — для калибровки это правильно. Для учёта «выгружено»,
+    средней по силосу, напоминаний и сводок по партиям проход один: от подачи до рециркуляции (или до смены
+    «Партия» / «Проход»), сколько бы силосов, остановок и перерывов в нём ни было."""
+    first: Dict[int, int] = {}
+    out: Dict[int, int] = {}
+    for r in prep:
+        pid = r.get("pass", 0)
+        if pid not in first:
+            first[pid] = r["seg"]
+        out.setdefault(r["seg"], first[pid])
+    return out
+
+
+def journal_passes(prep: List[Dict], p: Optional[DryerParams] = None, final_w: float = FINAL_W) -> List[Dict]:
+    """Проходы журнала по порядку. Для каждого:
+    pass — номер в prepare; segs — его участки; start / end — первая и последняя строка со временем;
+    batch — «Партия» из журнала (если вписана в строках прохода, иначе ""); batch_no — номер партии по счёту;
+    pass_no — «Проход» из журнала, а если не вписан — номер по счёту в партии (pass_auto = True);
+    end_kind — чем закончилась подача: "recirc" (рециркуляция), "cool" (охлаждение) или None (проход идёт);
+    w_end — истинная влажность выхода в конце подачи (медиана трёх последних проб до рециркуляции / охлаждения);
+    batch_end — партия на этом проходе закончена: охлаждение; рециркуляция, когда выход уже ≤ final_w
+      (досушка); или следующий проход — другой «Партии»;
+    sources — силосы подачи по примечаниям («сушим с 2 с.» → «2»), по порядку."""
+    p = p or DryerParams()
+    groups: Dict[int, List[Dict]] = {}
     order: List[int] = []
     for r in prep:
-        s = r["seg"]
-        if s not in first:
-            first[s] = r
-            order.append(s)
-        last[s] = r
-    out: Dict[int, int] = {}
-    for i, s in enumerate(order):
-        out[s] = s
-        if i == 0:
-            continue
-        a, b = last[order[i - 1]], first[s]
-        key_b = ((b.get("batch") or "").strip(), b.get("pass_no"))
-        key_a = ((a.get("batch") or "").strip(), a.get("pass_no"))
-        note = (b.get("note") or "").lower()
-        if (key_b[0] and key_b[1] is not None and key_a == key_b and not a.get("recirc")
-                and not any(w in note for w in PASS_END_STEMS)):
-            out[s] = out[order[i - 1]]
+        pid = r.get("pass", 0)
+        if pid not in groups:
+            groups[pid] = []
+            order.append(pid)
+        groups[pid].append(r)
+    out: List[Dict] = []
+    batch_no, in_batch = 1, 0
+    prev_lab = None
+    for k, pid in enumerate(order):
+        lst = groups[pid]
+        if out and out[-1]["batch_end"]:
+            batch_no, in_batch, prev_lab = batch_no + 1, 0, None
+        in_batch += 1
+        label = next(((r.get("batch") or "").strip() for r in lst if (r.get("batch") or "").strip()), "")
+        lab_pass = next((r.get("pass_no") for r in lst if r.get("pass_no") is not None), None)
+        if lab_pass is not None and lab_pass == prev_lab:
+            lab_pass = None          # номер прохода после рециркуляции не сменили — считаем сами
+        prev_lab = lab_pass if lab_pass is not None else prev_lab
+        dts = [r["dt"] for r in lst if r.get("dt") is not None]
+        last = lst[-1]
+        end_kind = "cool" if last.get("cool") or any(r.get("cool") for r in lst) else (
+            "recirc" if any(r.get("recirc") for r in lst) else None)
+        drying = [r for r in lst if r.get("w_out") is not None and not r.get("recirc") and not r.get("burner_off")]
+        w_end = None
+        if drying:
+            tail = drying[-3:]
+            vals = sorted(true_from_read(p, r["w_out"], 0.5 * (r["t_a1"] + r["t_a2"])
+                                         if r.get("t_a1") is not None and r.get("t_a2") is not None else None)
+                          for r in tail)
+            w_end = vals[len(vals) // 2]
+        batch_end = end_kind == "cool" or (end_kind == "recirc" and w_end is not None and w_end <= final_w)
+        if k + 1 < len(order):
+            nxt = groups[order[k + 1]][0]
+            if (nxt.get("batch_f") or "") != (last.get("batch_f") or ""):
+                batch_end = True                       # дальше другая «Партия»
+        sources: List[str] = []
+        for r in lst:
+            m = re.search(r"(?:сушим|открыл\w*|переключ\w*(?:\s+на)?|набираем|снимаем|подач\w*)\s+(?:с|со|из)?\s*"
+                          r"(\d+)", (r.get("note") or "").lower())
+            if m and (not sources or sources[-1] != m.group(1)):
+                sources.append(m.group(1))
+        out.append({"pass": pid, "segs": sorted({r["seg"] for r in lst}), "start": min(dts) if dts else None,
+                    "end": max(dts) if dts else None, "batch": label, "batch_no": batch_no,
+                    "pass_no": lab_pass if lab_pass is not None else in_batch, "pass_auto": lab_pass is None,
+                    "end_kind": end_kind, "w_end": w_end, "batch_end": batch_end, "sources": sources})
     return out
 
 
@@ -492,28 +578,35 @@ _EVENT_PATTERNS = [re.compile(x, re.I) for x in (
     r"^\s*переключ\w*\s+(на\s+)?(с\b|с\.|силос|подач)",
     r"^\s*(загрузка|зачистка)(\s+(сушилки|шахты|силоса?)\b.*)?\s*[.,;:!]?\s*$",
     r"^\s*(набираем|снимаем)\s+(с\b|с\.|в\b|из\b|силос)",
-    r"^\s*(начали\s+)?рециркуляци\w*\b(?!.*(воздух|закончил|конец|стоп|откл))",
+    r"^\s*(запуск\w*[,.;]?\s*)?(сушим|подача)\s+(с|со|из|\d)",
+    r"^\s*(начали\s+)?рециркуляци\w*\b(?!.*(воздух|откл))",
+    r"^\s*(закончил\w*|окончил\w*|конец|стоп)\s+рециркуляци\w*\s*[.,;:!]?\s*$",
     r"^\s*(начали\s+)?охлаждение\b",
     r"^\s*откл\w*\.?\s*(т\.?\s*б\.?|блоки|горелк\w*|топк\w*)(\s*[.,;:!]|\s*$)",
     r"^\s*(вкл\w*\.?\s*т\.?\s*б\.?|включил\w*\s+(т\.?\s*б|блоки|горелк|топк))",
 )]
 
 _STEM_MEANING = (
-    (("рецирк",), "рециркуляция: дальше зерно ходит по кругу, из силоса не подаётся, «выгружено» не растёт"),
-    (("охлажд",), "горелки выключены (охлаждение): строки до «Запуск» не идут в калибровку, «Текущий проход» пишет "
-                  "«идёт охлаждение»"),
-    (("остановк",), "остановка сушилки: новый участок журнала, напоминания затихают"),
-    (("запуск",), "пуск: новый участок журнала, горелки работают"),
-    (("закончил", "открыл", "переключ", "загрузка", "зачистка", "набираем", "снимаем"),
-     "новый участок журнала — для программы это начало нового прохода"),
+    (("рецирк",), "рециркуляция: подача из силоса закончилась — конец прохода, зерно в шахте ходит по кругу, "
+                  "«выгружено» не растёт; если выход уже у цели партии (13–14 %) — досушка и конец партии"),
+    (("охлажд",), "горелки выключены (охлаждение): конец сушки, строки до «Запуск» не идут в калибровку, "
+                  "«Текущий проход» пишет «идёт охлаждение»"),
+    (("остановк",), "остановка сушилки: проход продолжается после «Запуск», напоминания затихают"),
+    (("запуск",), "пуск: горелки работают; после рециркуляции — подача следующего прохода"),
+    (("загрузка", "зачистка"), "загрузка / зачистка шахты: перерыв в работе (проход продолжается)"),
     (("включ", "вкл. т", "вкл т"), "горелки снова включены"),
 )
 
 
 def note_meaning(note: str) -> List[str]:
-    """Что программа поймёт из примечания (по основам слов)."""
+    """Что программа поймёт из примечания (по основам слов и образцам)."""
     n = (note or "").lower()
+    if RECIRC_END_RE.search(n):
+        return ["конец рециркуляции; следующая подача из силоса — новый проход"]
     out = [text for stems, text in _STEM_MEANING if any(w in n for w in stems)]
+    if is_feed_note(n) and not any(w in n for w in RECIRC_WORDS):
+        out.append("подача из силоса: внутри прохода — переключение силоса (проход продолжается), после "
+                   "рециркуляции — начало следующего прохода")
     if "откл" in n and any(w in n for w in ("т.б", "т. б", "тб", "блок", "горел", "топ")) and not any(
             "охлаждение" in t for t in out):
         out.append("горелки выключены: строки до «Запуск» не идут в калибровку")
@@ -640,6 +733,10 @@ def observe_all(rows: List[Dict], p: DryerParams, use_lag: Optional[bool] = None
             continue
         if r.get("burner_off"):
             skip("горелки выключены (охлаждение)")
+            continue
+        if r.get("recirc"):
+            # зерно ходит по кругу: на выходе не то зерно, что вошло τ часов назад из силоса
+            skip("рециркуляция")
             continue
         if not (0 < d <= 100):
             skip("вне диапазона")

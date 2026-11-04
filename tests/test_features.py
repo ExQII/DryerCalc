@@ -1034,17 +1034,28 @@ def test_rules_doc_journal_claims_hold():
     base = [_jr("08:00", note="Запуск"), _jr("08:30", 32.4, 30.8), _jr("09:00", 32.1, 30.3)]
     segs = lambda rows: [r["seg"] for r in prepare(rows)[0]]  # noqa: E731
     flags = lambda rows, k: [bool(r[k]) for r in prepare(rows)[0]]  # noqa: E731
+    passes = lambda rows: [r["pass"] for r in prepare(rows)[0]]  # noqa: E731
     # слова-ловушки (раздел 5.3)
     assert flags(base + [_jr("09:30", 32, 29, note="на выходе хорошо охлаждено")], "burner_off")[-1]
-    assert flags(base + [_jr("09:30", note="рециркуляция"), _jr("10:00", note="Закончили рециркуляцию")], "recirc")[-1]
+    # конец рециркуляции (раздел 6.4): словами или подачей следующего прохода
+    assert not flags(base + [_jr("09:30", note="рециркуляция"), _jr("10:00", note="Закончили рециркуляцию")], "recirc")[-1]
     assert not flags(base + [_jr("09:30", note="рециркуляция"), _jr("10:00", note="Запуск подачи с 1 с.")], "recirc")[-1]
-    assert segs(base + [_jr("09:30", 32, 29, note="открыли люк, почистили")])[-1] == 1
+    # переключение силоса внутри прохода (раздел 6.2) не режет ни проход, ни участок; «открыли люк» — безвредно
+    for note in ("Закончился 2 с., сушим с 1 с.", "открыли с 3 с.", "переключили на 4 с.", "открыли люк, почистили",
+                 "переключили вентилятор", "снимаем пробу"):
+        rows = base + [_jr("09:30", 32, 29, note=note), _jr("10:00", 32, 28)]
+        assert segs(rows)[-1] == 0 and passes(rows)[-1] == 0, note
+    # новый проход — после рециркуляции, когда пошла подача (раздел 6.2); «Проход» +1 — тоже новый проход
+    after = base + [_jr("09:30", note="Закончился 2 с., рециркуляция"), _jr("10:00", 30, 29),
+                    _jr("10:20", note="сушим с 1 с."), _jr("10:30", 29, 27)]
+    assert passes(after) == [0, 0, 0, 0, 0, 1, 1] and flags(after, "recirc") == [False] * 3 + [True, True, False, False]
+    assert passes(base + [dict(_jr("09:30", 32, 29), pass_no=2)])[-1] == 1
     for ok_note in ("на выходе холодное", "чистка люка", "вентилятор 2 вместо 1", "отгрузка", "проба", "без пробы",
                     "перемер", "испр.: было 2,1", "D 35→38 по «Сейчас»", "возврат воздуха", "нория стоит"):
         rows = base + [_jr("09:30", 32, 29, note=ok_note)]
         assert segs(rows)[-1] == 0 and not flags(rows, "burner_off")[-1] and not flags(rows, "recirc")[-1], ok_note
-    # перерыв > 1,5 ч режет проход, строка «без пробы» — нет (раздел 4.3)
-    assert segs(base + [_jr("11:00", 32, 26)])[-1] == 1
+    # перерыв > 1,5 ч режет участок (для калибровки), но не проход; строка «без пробы» — ничего (раздел 4.3)
+    assert segs(base + [_jr("11:00", 32, 26)])[-1] == 1 and passes(base + [_jr("11:00", 32, 26)])[-1] == 0
     assert segs(base + [_jr("10:00", note="без пробы"), _jr("11:00", 32, 26)])[-1] == 0
     # строка «из прошлого» в конце журнала режет проход (поэтому программа вставляет её на место — раздел 8)
     late = base + [_jr("09:30", 32, 29), _jr("10:00", 32, 28), _jr("08:45", 32, 30), _jr("10:30", 32, 27)]
@@ -1069,13 +1080,13 @@ def test_rules_doc_journal_claims_hold():
     st2 = live_state(other, P)
     assert st2.start == datetime(2026, 10, 25, 9, 50) and abs(st2.unloaded - q_at(P, 35) * 40 / 60) < 1e-6
     # слова-ловушки: программа переспрашивает (раздел 5.3), явные события — нет
-    for trap in ("зерно на выходе хорошо охлаждено", "закончили рециркуляцию", "рециркуляция воздуха",
-                 "открыли люк, почистили", "переключили вентилятор", "загрузка машины", "снимаем пробу",
+    for trap in ("зерно на выходе хорошо охлаждено", "рециркуляция воздуха", "загрузка машины",
                  "отключили блок управления нории"):
         assert note_trap(trap), trap
     for ev in ("Запуск, сушим с 2 с. в 1 с.", "Закончился 2 с., сушим с 1 с.", "Остановка: силос 1 полный",
-               "рециркуляция", "охлаждение", "Откл. т.б.", "Запуск подачи с 1 с.", "открыли с 1 с.",
-               "Остановка, закончили партию К-07", "без пробы", "D 35→38 по «Сейчас»", "на выходе холодное"):
+               "рециркуляция", "охлаждение", "Откл. т.б.", "Запуск подачи с 1 с.", "открыли с 1 с.", "сушим со 2 с.",
+               "Остановка, закончили партию К-07", "без пробы", "D 35→38 по «Сейчас»", "на выходе холодное",
+               "закончили рециркуляцию", "открыли люк, почистили", "переключили вентилятор", "снимаем пробу"):
         assert note_trap(ev) is None, ev
     # сам файл правил на месте и содержит ключевые разделы
     text = open(os.path.join(ROOT, "docs", "rules_ru.txt"), encoding="utf-8-sig").read()
@@ -1237,6 +1248,104 @@ def test_rare_actions_in_menus_and_operator_hides_them():
     win.apply_mode(pilot.ENGINEER)
     assert win.j_buttons["Импорт CSV/XLSX…"].isVisible()
     win.close()
+
+
+
+# ---------------------------------------------------------------------------
+# v1.1: проходы делит рециркуляция, а не переключение силоса; рециркуляция у цели — досушка и конец партии
+# ---------------------------------------------------------------------------
+
+def _silo_journal(change_pass_no=False):
+    """Партия в трёх оперативных ёмкостях: проход 1 — из силосов 2 и 4, рециркуляция при 21 %; проход 2 — из
+    силоса 5 (номер прохода в журнале не сменили), рециркуляция у цели — досушка; затем охлаждение."""
+    t0 = datetime(2026, 11, 2, 8, 0)
+    rows = []
+
+    def row(h, wi=None, wo=None, note="", pn=1):
+        t = t0 + timedelta(hours=h)
+        rows.append({"ts": t.strftime("%d.%m.%y %H:%M"), "w_in": wi, "w_out": wo, "t_a1": 30 if wo else None,
+                     "t_a2": 34 if wo else None, "t_up": 60, "t_low": 60, "d": 35, "note": note, "batch": "П-1",
+                     "pass_no": pn, "t_amb": None, "rh": None})
+    row(0, note="Запуск, сушим с 2 с. в 5 с.")
+    for k in range(1, 21):
+        row(0.5 * k, 26.0, 21.8)
+    row(10.2, note="Закончился 2 с., сушим с 4 с.")
+    for k in range(21, 41):
+        row(0.5 * k, 26.5, 21.6)
+    row(20.2, note="Закончился 4 с., рециркуляция")
+    row(20.5, 21.0, 20.2)
+    row(21.0, 20.5, 19.8)
+    pn2 = 2 if change_pass_no else 1
+    row(21.4, note="сушим с 5 с. в 2 с.", pn=pn2)
+    for k in range(44, 80):
+        row(0.5 * k, 21.0, 14.7, pn=pn2)
+    return rows, row, t0
+
+
+def test_passes_split_by_recirculation_not_by_silo_switch():
+    from app import pages
+    from app.calibration import journal_passes, observe_all, prepare
+    from app.live import live_advice
+    from app.reminders import drying_active
+    rows, row, t0 = _silo_journal()
+    # проход 1 до рециркуляции: переключение силоса 2 → 4 не обнуляет «выгружено» и среднюю по силосу
+    cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
+    st1 = live_state(cut, P, final_w=15.0)
+    assert st1.start == t0 and abs(st1.unloaded - q_at(P, 35) * 18.5) < 1e-6 and st1.sources == ["2", "4"]
+    assert 20.7 < st1.silo_w < 21.1 and st1.silo_n == 37
+    # подача после рециркуляции — новый проход, номер посчитан сам (в журнале «Проход» не сменили)
+    st2 = live_state(rows, P, final_w=15.0)
+    assert st2.pass_no == 2 and st2.pass_auto and st2.start == t0 + timedelta(hours=21.4) and not st2.recirc
+    assert abs(st2.unloaded - q_at(P, 35) * (39.5 - 21.4)) < 1e-6 and st2.sources == ["5"]
+    # рециркуляция у цели партии — досушка и конец партии
+    row(40.2, note="Закончился 5 с., рециркуляция")
+    row(40.5, 14.6, 14.2)
+    prep, _ = prepare(rows)
+    ps = journal_passes(prep, P, 15.0)
+    assert [(x["pass_no"], x["end_kind"], x["batch_end"]) for x in ps] == [(1, "recirc", False), (2, "recirc", True)]
+    assert 20.5 < ps[0]["w_end"] < 21.2 and ps[1]["w_end"] < 15.0 and ps[0]["sources"] == ["2", "4"]
+    st3 = live_state(rows, P, final_w=15.0)
+    assert st3.recirc and st3.batch_end and st3.recirc_since == t0 + timedelta(hours=40.2)
+    fc3 = live_forecast(P, Conditions(st3.t_proc, 10.0, 70.0), st3, 1000.0, 14.5, 14.0, 6.0, 10.0)
+    a = live_advice(P, st3, fc3)
+    assert a["head"] == "Партия высушена — идёт досушка" and a["go"] == pages.RECIRC
+    # при другой цели партии (Wк 12 % → порог 13 %) та же рециркуляция — конец прохода, не партии
+    st4 = live_state(rows, P, final_w=13.0)
+    assert st4.recirc and not st4.batch_end
+    assert live_advice(P, st4, fc3)["head"] == "Проход закончен — идёт рециркуляция"
+    # охлаждение после досушки, следующая партия без названия — новая партия, проход 1
+    row(41.0, note="Откл. т.б., охлаждение")
+    row(42.0, note="Запуск, сушим с 3 с. в 1 с.", pn=None)
+    for k in range(85, 90):
+        row(0.5 * k, 30.0, 26.0, pn=None)
+    for r in rows[-6:]:
+        r["batch"] = ""
+    prep, _ = prepare(rows)
+    ps = journal_passes(prep, P, 15.0)
+    assert [(x["batch_no"], x["pass_no"], x["end_kind"]) for x in ps] == [(1, 1, "recirc"), (1, 2, "cool"), (2, 1, None)]
+    # переключение силоса без пробы — сушка идёт, напоминания не затихают; рециркуляция в калибровку не идёт
+    sw = cut + [{"ts": (t0 + timedelta(hours=18.6)).strftime("%d.%m.%y %H:%M"), "note": "Закончился 4 с., сушим с 1 с.",
+                 "batch": "П-1", "pass_no": 1}]
+    assert drying_active(sw, t0 + timedelta(hours=18.8))[0]
+    obs = observe_all(rows, P)[0]
+    assert not any(t0 + timedelta(hours=20.2) <= o["dt"] < t0 + timedelta(hours=21.4) for o in obs)
+    # с номером прохода, вписанным как надо, — то же самое, только номер из журнала
+    rows2, _, _ = _silo_journal(change_pass_no=True)
+    st5 = live_state(rows2, P, final_w=15.0)
+    assert st5.pass_no == 2 and not st5.pass_auto and st5.start == t0 + timedelta(hours=21.4)
+
+
+def test_sample_journal_passes_unchanged():
+    """Журнал октября: те же четыре прохода и та же калибровка, что до перехода на «проход делит рециркуляция»
+    (в нём новый проход всегда отмечен сменой «Партия» / «Проход»)."""
+    from app.calibration import journal_passes, prepare
+    rows, _ = read_journal(SAMPLE)
+    prep, _ = prepare(rows)
+    ps = journal_passes(prep, P)
+    assert [(x["batch"], x["pass_no"], x["end_kind"], x["batch_end"]) for x in ps] == [
+        ("A", 3, "cool", True), ("B", 2, None, False), ("B", 3, "cool", True), ("C", 1, None, False)]
+    p, rep = calibrate(rows, P)
+    assert rep["n_used"] == 120
 
 
 if __name__ == "__main__":

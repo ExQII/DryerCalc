@@ -68,7 +68,8 @@ class LiveTab(QWidget):
         self.facts.setVerticalSpacing(3)
         self.facts.setColumnStretch(1, 1)
         self.fact_lbl = {}
-        for i, (key, cap) in enumerate((("batch", "Партия"), ("start", "Начало прохода"), ("last", "Последняя запись"),
+        for i, (key, cap) in enumerate((("batch", "Партия"), ("src", "Подача из силосов"),
+                                        ("start", "Начало прохода"), ("last", "Последняя запись"),
                                         ("w_in", "Вход сейчас"), ("w_out", "Выход, влагомер"), ("d", "Разгрузка D"),
                                         ("t", "T блоков / зерна"), ("unl", "Выгружено"), ("silo", "В силосе"),
                                         ("corr", "Поправка модели"))):
@@ -260,8 +261,9 @@ class LiveTab(QWidget):
         rv.addLayout(tabs_box, 1)
         lay.addWidget(right, 1)
 
-        for w in (self.m_pass, self.w_target, self.wk_final, self.t_amb, self.rh, self.d_try, self.silo_lim):
+        for w in (self.m_pass, self.w_target, self.t_amb, self.rh, self.d_try, self.silo_lim):
             w.valueChanged.connect(self.recalc)
+        self.wk_final.valueChanged.connect(self.refresh)       # от цели партии зависит, досушка ли рециркуляция
         self.cb_corr.stateChanged.connect(self.recalc)
         self.cb_silo.stateChanged.connect(self.recalc)
         self.cb_now.stateChanged.connect(self.refresh)
@@ -308,7 +310,9 @@ class LiveTab(QWidget):
     def refresh(self) -> None:
         p = self.win.params
         now = datetime.now() if self.cb_now.isChecked() else None
-        self.state = live_state(self.win.journal_rows(), p, now=now, weather=self.win.weather_series())
+        # рециркуляция, когда выход уже у цели партии (Wк + 1 п.п.), — досушка и конец партии
+        self.state = live_state(self.win.journal_rows(), p, now=now, weather=self.win.weather_series(),
+                                final_w=self.wk_final.value() + 1.0)
         st = self.state
         if st.t_amb is not None:
             self.t_amb.blockSignals(True)
@@ -337,8 +341,11 @@ class LiveTab(QWidget):
         tg = f"{st.t_grain:.0f}" if st.t_grain is not None else "—"
         tp = f"{st.t_proc:.0f}" if st.t_proc is not None else "—"
         q = mdl.q_at(p, st.d) if st.d else None
+        auto = " (по рециркуляциям)" if st.pass_auto else ""
         vals = {
-            "batch": (f"{st.batch or '—'}, проход {st.pass_no:g}" if st.pass_no is not None else f"{st.batch or '—'}"),
+            "batch": (f"{st.batch or 'без названия'}, проход {st.pass_no:g}{auto}" if st.pass_no is not None
+                      else f"{st.batch or '—'}"),
+            "src": " → ".join(f"{x} с." for x in st.sources) if st.sources else "",
             "start": f"{st.start:%d.%m %H:%M}" if ok else "—",
             "last": (f"{st.last:%d.%m %H:%M}, через {fmt_hours(st.hours)}" if ok and st.last else "—"),
             "w_in": f"{fnum(st.w_in)} %", "w_out": f"{fnum(st.w_out_read)} %",
@@ -349,14 +356,17 @@ class LiveTab(QWidget):
         }
         for key, (k, v) in self.fact_lbl.items():
             v.setText(vals[key] if ok else "—")
-            show = ok or key in ("batch",)
+            show = (ok or key in ("batch",)) and (key != "src" or bool(vals["src"]))
             k.setVisible(show)
             v.setVisible(show)
         msg = ""
         if not ok:
             msg = st.message or "—"
+        elif st.recirc and st.batch_end:
+            msg = "Рециркуляция у цели партии — досушка остатка в шахте и конец партии (раздел «Досушка»)."
         elif st.recirc:
-            msg = "Сейчас рециркуляция (из силоса не подаётся) — время досушки в разделе «Досушка»."
+            msg = ("Подача прохода закончилась — рециркуляция. Следующий проход начнётся с подачи из силоса "
+                   "(«сушим с N с.»).")
         self.lbl_state.setText(msg)
         self.lbl_state.setVisible(bool(msg))
 
@@ -489,7 +499,7 @@ class LiveTab(QWidget):
         goal_read = mdl.read_from_true(p, fc.w_goal, st.t_grain)
         if st.w_out_read is not None:
             dev = st.w_out_read - goal_read
-            soon = self._soon(p, st, fc, (1.0,))
+            soon = "" if st.recirc else self._soon(p, st, fc, (1.0,))   # при рециркуляции прогноз подачи ни к чему
             when = f", проба {st.last_sample:%H:%M}" if st.last_sample else ""
             self.t_out.set(f"{st.w_out_read:.1f} %", f"{dev:+.1f} п.п. к цели{when}" + (f"\n{soon}" if soon else ""),
                            "Последняя проба выходного влагомера (как показал прибор) и её отличие от цели прохода на "
@@ -504,7 +514,7 @@ class LiveTab(QWidget):
             xs = [(t - t0).total_seconds() / 3600.0 for t, _ in pts]
             ys = [w for _, w in pts]
             fx, fy = [], []
-            tr = fc.transit
+            tr = None if st.recirc else fc.transit
             if tr is not None and len(tr["t"]):
                 for tt, w in zip(tr["t"], tr["w"]):
                     h = (tt - t0).total_seconds() / 3600.0
@@ -522,7 +532,8 @@ class LiveTab(QWidget):
         sl = fc.silo
         if st.silo_w is not None:
             self.t_silo.set(f"{st.silo_w:.1f} %",
-                            f"{st.unloaded:.0f} т" + (f", к концу прохода ≈ {sl['avg']:.1f} %" if sl else ""),
+                            f"{st.unloaded:.0f} т" + (f", к концу прохода ≈ {sl['avg']:.1f} %"
+                                                     if sl and not st.recirc else ""),
                             "Средняя по массе влажность всего, что ушло в приёмный силос с начала прохода (истинная, "
                             "с поправкой влагомера), и ожидаемая к концу прохода.")
         else:
@@ -544,6 +555,16 @@ class LiveTab(QWidget):
                              ("С охлаждением. " + (f"Допуск {rng}." if rng else "")).strip())
         else:
             self.t_batch.set("—")
+        if st.recirc:
+            # подача прохода закончилась: выгрузки в силос нет, зерно в шахте ходит по кругу
+            since = f"рециркуляция с {st.recirc_since:%H:%M}" if st.recirc_since else "рециркуляция"
+            self.t_pass.set("закончен", since, "Подача из силосов этого прохода закончилась (в журнале "
+                                               "«рециркуляция»): «выгружено» больше не растёт.")
+            self.pass_bar.set_value(1.0)
+            if st.batch_end:
+                self.t_batch.set("высушена", "досушка, затем охлаждение",
+                                 "Рециркуляция, когда выход уже у цели партии, — досушка остатка в шахте и конец партии. "
+                                 "Сколько досушивать — раздел «Досушка».")
 
     def _table(self, p, st, fc, c, d_use, now, th, target_read: float) -> None:
         sl = fc.silo
@@ -593,13 +614,17 @@ class LiveTab(QWidget):
         self.plot.add_hline(mdl.read_from_true(p, fc.w_goal, st.t_grain), "target")
         tr = fc.transit
         steady = mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
-        if tr is not None and len(tr["t"]):
+        legend = [("dot", "ref", "вход"), ("dot", "dot", "выход по влагомеру"), ("dash", "target", "цель на влагомере")]
+        if st.recirc:
+            pass                            # подача закончилась — прогноз выхода «при этом D» не рисуем
+        elif tr is not None and len(tr["t"]):
             # ожидаемый выход по часам: зерно, которое уже в шахте (с его историей), затем новое зерно при этом D
             xs = [(x - st.start).total_seconds() / 3600.0 for x in tr["t"]]
             ys = [mdl.read_from_true(p, float(w), st.t_grain) for w in tr["w"]]
             self.plot.add_line(xs + [xs[-1], xs[-1] + max(1.0, 0.3 * (xs[-1] - xs[0]))], ys + [steady, steady], "line", 3)
+            legend.append(("line", "line", "ожидаемый выход при этом D"))
         elif fc.visible_at:
             h0 = (fc.visible_at - st.start).total_seconds() / 3600.0
             self.plot.add_line([h0, h0 + max(fc.tau_h, 1.0)], [steady] * 2, "line", 3)
-        self.legend.set_items([("dot", "ref", "вход"), ("dot", "dot", "выход по влагомеру"),
-                               ("dash", "target", "цель на влагомере"), ("line", "line", "ожидаемый выход при этом D")])
+            legend.append(("line", "line", "ожидаемый выход при этом D"))
+        self.legend.set_items(legend)
