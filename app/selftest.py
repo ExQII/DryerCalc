@@ -153,8 +153,8 @@ def run(out_path: str) -> int:
         msgs = rem_check(rows_now, last_t + __import__("datetime").timedelta(minutes=45), {}, ReminderCfg())
         check([k for k, _, _ in msgs] == ["sample"], f"напоминание «пора внести пробу»: {len(msgs)}")
         win.tab_help.on_show()
-        check("ШПАРГАЛКА" in win.tab_help.manual.toPlainText(), "инструкция для пользователя встроена в «Справку»")
-        check("СЛОВА-ЛОВУШКИ" in win.tab_help.rules.toPlainText(), "правила работы встроены в «Справку»")
+        check("шпаргалка" in win.tab_help.manual.toPlainText().lower(), "инструкция для пользователя встроена в «Справку»")
+        check("слова-ловушки" in win.tab_help.rules.toPlainText().lower(), "правила работы встроены в «Справку»")
         # --- v0.6: режим сушильщика, PIN, замечания, статистика пилота ---
         from . import pilot as _pilot
         from . import pages as _pages
@@ -317,29 +317,31 @@ def run(out_path: str) -> int:
             check((not pm.isNull()) and pm.width() >= 800, f"раздел {i + 1} «{tabs.tabText(i)}» отрисован {pm.width()}×{pm.height()}")
             pm.save(os.path.join(shots_dir, f"selftest_tab{i + 1}.png"))
 
-        # --- светлая и тёмная темы: контраст всех цветных надписей и переключение на ходу ---
-        from .theme import dark_palette, theme_for
-        light_pal = app.palette()
-        for label, pal in (("системная", light_pal), ("тёмная", dark_palette())):
-            app.setPalette(pal)
-            app.processEvents()
-            win._theme_changed()
+        # --- оформление: светлое и тёмное — контраст всех цветных надписей и переключение на ходу ---
+        from .theme import theme_for
+        from . import design as _design
+        _mode0 = _design.mode()
+        for label, mode in (("светлое", "light"), ("тёмное", "dark")):
+            win.set_ui_theme(mode, save=False)
             app.processEvents()
             th = theme_for(win)
-            style = app.style().name()
-            check(not (th.dark and style.lower() in ("windowsvista", "windows")),
-                  f"тема {label}: стиль окна {style}")
-            bad =[f"{n} {c:.1f}<{need:g}" for n, c, need in th.contrast_report() if c < need]
-            check(not bad, f"тема {label} ({'тёмная' if th.dark else 'светлая'}): контраст надписей "
+            style = _design.style_name()
+            check(th.dark == (mode == "dark") and style.lower() == "fusion",
+                  f"оформление {label}: стиль окна {style}, фон {_design.tokens().paper}")
+            bad = [f"{n} {c:.1f}<{need:g}" for n, c, need in th.contrast_report() if c < need]
+            check(not bad, f"оформление {label}: контраст надписей "
                            + ("в норме" if not bad else "мал: " + ", ".join(bad)))
-            check(th.summary_bg in win.sm_summary.styleSheet(), f"тема {label}: сводка перекрашена ({th.summary_bg})")
+            check(th.summary_bg in win.sm_summary.styleSheet() and win.tabs.side.width() > 150,
+                  f"оформление {label}: сводка перекрашена ({th.summary_bg}), меню {win.tabs.side.width()} px")
             if th.dark:
+                tabs.setCurrentIndex(tabs.indexOfText(_pages.LIVE))
+                app.processEvents()
+                win.grab().save(os.path.join(shots_dir, "selftest_dark_live.png"))
                 tabs.setCurrentIndex(0)
                 app.processEvents()
                 win.grab().save(os.path.join(shots_dir, "selftest_dark_tab1.png"))
-        app.setPalette(light_pal)
+        win.set_ui_theme(_mode0, save=False)
         app.processEvents()
-        win._theme_changed()
         win.close()
     except Exception:  # noqa: BLE001
         ok = False

@@ -1,8 +1,9 @@
-"""Боковое меню разделов (как «Параметры» Windows 10) и область страницы с заголовком.
+"""Боковое меню разделов (как «Параметры» Windows 11) и область страницы с заголовком.
 
-Слева — название программы, разделы по смыслу работы («Смена», «Планирование», «Модель и данные», «Справка»),
-внизу — переключатель режима и «Замечание…». Справа — заголовок страницы, одна строка о её назначении и сама
-страница. В отличие от строки вкладок всё помещается на экран 1366 px, а сушильщик видит только свой раздел.
+Слева — стеклянная панель (widgets.Glass) над тёплым фоном окна: знак и название программы, разделы по смыслу
+работы («Смена», «Планирование», «Модель и данные», «Справка») с иконками, внизу — переключатель режима, «Замечание…»
+и оформление. Выбранный раздел — золотистая «пилюля» с короткой золотой чертой слева. Справа — заголовок страницы,
+одна строка о её назначении и сама страница. Всё помещается на экран 1366 px, а сушильщик видит только свой раздел.
 
 Интерфейс повторяет QTabWidget в той части, которой пользуется окно (addTab, count, tabText, widget,
 currentIndex, setCurrentIndex, currentWidget, indexOf, isTabVisible, setTabVisible, currentChanged), поэтому
@@ -12,17 +13,121 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QBrush, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import QModelIndex, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QSizePolicy,
-                               QStackedWidget, QVBoxLayout, QWidget)
+                               QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QVBoxLayout, QWidget)
 
-from .theme import Theme, mix, theme_for
+from . import design, icons
+from .theme import Theme
+from .widgets import Glass
 
-PAGE_ROLE = Qt.UserRole + 1          # номер страницы у пункта меню (у заголовка раздела — -1)
+PAGE_ROLE = Qt.UserRole + 1          # номер страницы у пункта меню (у заголовка раздела и отступа — -1)
+ICON_ROLE = Qt.UserRole + 2          # имя иконки (icons.py)
 
 
-class NavPanel(QWidget):
+class _NavDelegate(QStyledItemDelegate):
+    """Рисует пункты меню целиком: заголовки разделов, отступ, страницы (иконка + название), выбранную «пилюлю»."""
+
+    def _fonts(self, base: QFont):
+        hdr = QFont(base)
+        hdr.setPointSizeF(max(base.pointSizeF() - 0.5, 7.0))
+        hdr.setWeight(QFont.DemiBold)
+        return hdr
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:  # noqa: N802
+        fm = QFontMetrics(option.font)
+        page = index.data(PAGE_ROLE)
+        text = index.data(Qt.DisplayRole) or ""
+        if page is None or page < 0:
+            if not text:
+                return QSize(10, max(6, fm.height() // 2))
+            return QSize(10, int(QFontMetrics(self._fonts(option.font)).height() + fm.height() * 0.9))
+        return QSize(10, int(fm.height() * 2.2))
+
+    def paint(self, p: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        t = design.tokens_for(option.widget) if option.widget is not None else design.tokens()
+        page = index.data(PAGE_ROLE)
+        text = index.data(Qt.DisplayRole) or ""
+        r = QRectF(option.rect)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        fm = QFontMetrics(option.font)
+        pad = fm.height() * 0.6
+        if page is None or page < 0:
+            if text:
+                f = self._fonts(option.font)
+                p.setFont(f)
+                p.setPen(QColor(t.muted))
+                p.drawText(r.adjusted(pad, 0, -pad, -fm.height() * 0.25), Qt.AlignLeft | Qt.AlignBottom, text)
+            p.restore()
+            return
+        sel = bool(option.state & QStyle.State_Selected)
+        hover = bool(option.state & QStyle.State_MouseOver)
+        pill = r.adjusted(1.5, 1.5, -1.5, -1.5)
+        if sel:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(t.accent_tint))
+            p.drawRoundedRect(pill, 8, 8)
+            bar_h = pill.height() * 0.42
+            p.setBrush(QColor(t.accent_edge if not t.dark else t.accent))
+            p.drawRoundedRect(QRectF(pill.left() + 1.5, pill.center().y() - bar_h / 2, 3.0, bar_h), 1.5, 1.5)
+        elif hover:
+            hv = QColor(t.ink)
+            hv.setAlphaF(0.07 if not t.dark else 0.09)
+            p.setPen(Qt.NoPen)
+            p.setBrush(hv)
+            p.drawRoundedRect(pill, 8, 8)
+        if (option.state & QStyle.State_HasFocus) and option.widget is not None and option.widget.hasFocus():
+            p.setPen(QColor(t.steel))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(pill.adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+        isz = int(round(fm.height() * 1.15))
+        name = index.data(ICON_ROLE)
+        x = pill.left() + pad + 2
+        if name:
+            col = (t.accent_deep if not t.dark else t.accent) if sel else t.ink2
+            pm = icons.pixmap(name, col, isz, p.device().devicePixelRatioF() if p.device() else 1.0)
+            p.drawPixmap(int(x), int(pill.center().y() - isz / 2), pm)
+            x += isz + pad * 0.9
+        p.setFont(option.font)
+        p.setPen(QColor(t.ink))
+        p.drawText(QRectF(x, pill.top(), pill.right() - x - 4, pill.height()), Qt.AlignVCenter | Qt.AlignLeft,
+                   fm.elidedText(text, Qt.ElideRight, int(pill.right() - x - 4)))
+        p.restore()
+
+
+def _logo(size: int, dpr: float):
+    """Знак программы — тот же, что у ярлыка и в панели задач (assets/dryer.png), уменьшенный под меню."""
+    from PySide6.QtGui import QPixmap
+    from .resources import resource_path
+    src = resource_path("assets/dryer.png")
+    if not src.exists():
+        return None
+    pm = QPixmap(str(src))
+    if pm.isNull():
+        return None
+    pm = pm.scaled(int(size * dpr), int(size * dpr), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    pm.setDevicePixelRatio(dpr)
+    return pm
+
+
+class _Root(QWidget):
+    """Фон под стеклом: тёплый градиент со свечением (widgets.paint_backdrop). В окне программы фон рисует само
+    окно (на всю высоту, со строкой состояния) — тогда backdrop = False."""
+
+    backdrop = True
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        if not self.backdrop:
+            return
+        from .widgets import paint_backdrop
+        p = QPainter(self)
+        paint_backdrop(p, QRectF(self.rect()), design.tokens_for(self))
+        p.end()
+
+
+class NavPanel(_Root):
     currentChanged = Signal(int)
 
     def __init__(self, app_title: str = "DryerCalc", app_subtitle: str = ""):
@@ -34,25 +139,34 @@ class NavPanel(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        self.side = QFrame()
+        self.side = Glass(radius=16, blur=12, dy=3)
         self.side.setObjectName("navSide")
         sv = QVBoxLayout(self.side)
-        sv.setContentsMargins(10, 12, 10, 10)
-        sv.setSpacing(6)
+        sv.setContentsMargins(10, 14, 10, 10)
+        sv.setSpacing(4)
+        brand = QHBoxLayout()
+        brand.setSpacing(8)
+        self.lbl_logo = QLabel()
+        self.lbl_logo.setObjectName("navLogo")
         self.lbl_app = QLabel(app_title)
         self.lbl_app.setObjectName("navApp")
+        brand.addWidget(self.lbl_logo, 0, Qt.AlignVCenter)
+        brand.addWidget(self.lbl_app, 1, Qt.AlignVCenter)
+        sv.addLayout(brand)
         self.lbl_app_sub = QLabel(app_subtitle)
         self.lbl_app_sub.setObjectName("navAppSub")
         self.lbl_app_sub.setWordWrap(True)
-        sv.addWidget(self.lbl_app)
         if app_subtitle:
             sv.addWidget(self.lbl_app_sub)
-        sv.addSpacing(6)
+        sv.addSpacing(8)
         self.list = QListWidget()
         self.list.setObjectName("navList")
         self.list.setFrameShape(QFrame.NoFrame)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.setFocusPolicy(Qt.StrongFocus)
+        self.list.setMouseTracking(True)
+        self.list.viewport().setAutoFillBackground(False)
+        self.list.setItemDelegate(_NavDelegate(self.list))
         self.list.currentItemChanged.connect(self._item_changed)
         sv.addWidget(self.list, 1)
         self.bottom = QVBoxLayout()
@@ -61,8 +175,9 @@ class NavPanel(QWidget):
         lay.addWidget(self.side, 0)
 
         right = QWidget()
+        right.setObjectName("navPage")
         rv = QVBoxLayout(right)
-        rv.setContentsMargins(14, 10, 10, 4)
+        rv.setContentsMargins(10, 16, 16, 4)
         rv.setSpacing(2)
         self.lbl_title = QLabel()
         self.lbl_title.setObjectName("navTitle")
@@ -71,7 +186,7 @@ class NavPanel(QWidget):
         self.lbl_sub.setWordWrap(True)
         rv.addWidget(self.lbl_title)
         rv.addWidget(self.lbl_sub)
-        rv.addSpacing(4)
+        rv.addSpacing(8)
         self.stack = QStackedWidget()
         rv.addWidget(self.stack, 1)
         lay.addWidget(right, 1)
@@ -85,10 +200,10 @@ class NavPanel(QWidget):
 
     # --- как у QTabWidget -------------------------------------------------------------------------------------
     def addTab(self, widget: QWidget, text: str, section: Optional[str] = None, subtitle: str = "",  # noqa: N802
-               tip: str = "") -> int:
+               tip: str = "", icon: Optional[str] = None) -> int:
         if section and section not in self._headers:
-            hdr = QListWidgetItem(section.upper())
-            hdr.setFlags(Qt.ItemIsEnabled)
+            hdr = QListWidgetItem(section)
+            hdr.setFlags(Qt.NoItemFlags)
             hdr.setData(PAGE_ROLE, -1)
             self.list.addItem(hdr)
             self._headers[section] = hdr
@@ -96,11 +211,12 @@ class NavPanel(QWidget):
             sp = QListWidgetItem("")                  # отступ перед страницей без раздела («Справка»)
             sp.setFlags(Qt.NoItemFlags)
             sp.setData(PAGE_ROLE, -1)
-            sp.setSizeHint(QSize(10, 10))
             self.list.addItem(sp)
         idx = len(self._pages)
         it = QListWidgetItem(text)
         it.setData(PAGE_ROLE, idx)
+        if icon:
+            it.setData(ICON_ROLE, icon)
         if tip or subtitle:
             it.setToolTip(tip or subtitle)
         self.list.addItem(it)
@@ -109,6 +225,7 @@ class NavPanel(QWidget):
                             "visible": True})
         if self._cur < 0:
             self.setCurrentIndex(0)
+        self._fit_width()
         return idx
 
     def count(self) -> int:
@@ -176,6 +293,9 @@ class NavPanel(QWidget):
     def addBottomWidget(self, w: QWidget) -> None:  # noqa: N802
         self.bottom.addWidget(w)
 
+    def addBottomLayout(self, lay) -> None:  # noqa: N802
+        self.bottom.addLayout(lay)
+
     # --- внутреннее -------------------------------------------------------------------------------------------
     def _item_changed(self, cur: Optional[QListWidgetItem], prev: Optional[QListWidgetItem]) -> None:
         if cur is None:
@@ -195,31 +315,25 @@ class NavPanel(QWidget):
         pos = vis.index(self._cur) if self._cur in vis else 0
         self.setCurrentIndex(vis[(pos + step) % len(vis)])
 
-    def apply_theme(self, th: Optional[Theme] = None) -> None:
-        """Цвета и размеры шрифтов от текущей темы и базового шрифта (в режиме сушильщика он крупнее)."""
-        th = th or theme_for(self)
-        pt = QApplication.font().pointSizeF()
-        side_bg = mix(th.window, th.text, 0.06 if th.dark else 0.035).name()
-        hover = mix(th.window, th.text, 0.12 if th.dark else 0.08).name()
-        sel_bg, sel_fg = th.highlight
-        accent = "#4ea1ff" if th.dark else "#0067c0"
-        line = mix(th.window, th.text, 0.18).name()
-        self.side.setStyleSheet(
-            f"#navSide {{ background:{side_bg}; border-right:1px solid {line}; }}"
-            f"#navApp {{ font-size:{pt + 5:.1f}pt; font-weight:600; }}"
-            f"#navAppSub {{ color:{th.muted}; }}"
-            f"#navList {{ background:transparent; outline:0; }}"
-            f"#navList::item {{ padding:7px 10px; border-left:3px solid transparent; border-radius:3px; }}"
-            f"#navList::item:hover {{ background:{hover}; }}"
-            f"#navList::item:selected {{ background:{sel_bg}; color:{sel_fg}; border-left:3px solid {accent}; }}")
-        self.lbl_title.setStyleSheet(f"font-size:{pt + 6:.1f}pt; font-weight:600;")
-        self.lbl_sub.setStyleSheet(f"color:{th.muted};")
-        f = QFont(QApplication.font())
-        f.setPointSizeF(max(pt - 1.0, 7.0))
-        f.setBold(True)
-        for hdr in self._headers.values():
-            hdr.setFont(f)
-            hdr.setForeground(QBrush(mix(th.text, th.window, 0.45)))
-        fm = self.list.fontMetrics()
-        width = max(fm.horizontalAdvance(pg["text"]) for pg in self._pages) if self._pages else 150
-        self.side.setFixedWidth(int(width + 70))
+    def _fit_width(self) -> None:
+        """Ширина меню — по самому длинному названию раздела (+ иконка и поля) и по нижним кнопкам."""
+        fm = QFontMetrics(self.list.font())
+        text_w = max((fm.horizontalAdvance(pg["text"]) for pg in self._pages), default=150)
+        inner = text_w + fm.height() * 1.15 + fm.height() * 2.2 + 12
+        bottom = self.bottom.minimumSize().width() if self.bottom.count() else 0
+        l, _t, r, _b = self.side.shadow_margins()
+        m = self.side.layout().contentsMargins()
+        self.side.setFixedWidth(int(max(inner, bottom, 150) + m.left() + m.right() + l + r))
+
+    def apply_theme(self, th: Optional[Theme] = None) -> None:  # noqa: ARG002 — цвета берутся из design
+        """Знак программы под тему, ширина меню — под размер шрифта (в режиме сушильщика он крупнее)."""
+        t = design.tokens_for(self)
+        fm = QFontMetrics(QApplication.font())
+        sz = int(round(fm.height() * 1.55))
+        dpr = max(self.devicePixelRatioF() if self.isVisible() else 2.0, 1.0)
+        self.lbl_logo.setPixmap(_logo(sz, dpr) or icons.pixmap("kernel", t.accent, sz, dpr))
+        self.lbl_logo.setFixedSize(sz, sz)
+        self.list.doItemsLayout()
+        self._fit_width()
+        self.list.viewport().update()
+        self.update()

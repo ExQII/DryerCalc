@@ -33,6 +33,10 @@ PAGES = (
 
 OPERATOR_PAGES = (JOURNAL, LIVE, RECIRC, HELP)
 
+# иконки разделов в меню (icons.py)
+ICONS = {JOURNAL: "journal", LIVE: "live", RECIRC: "recirc", PLAN: "plan", QUICK: "quick", BATCHES: "batches",
+         DATA: "data", CHECK: "check", SETTINGS: "settings", HELP: "help"}
+
 OLD_NAMES = {
     "Сейчас (по факту)": LIVE, "Рециркуляция": RECIRC, "Журнал": JOURNAL, "Расчёт по модели": PLAN,
     "По производительности": QUICK, "Проверка и опыты": CHECK, "Сушилка и модель": SETTINGS,

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDateTimeEdit, QFormLayo
 from . import model as mdl
 from .plots import SimplePlot
 from .theme import theme_for
-from .ui_common import Collapsible, scroll_wrap, dspin, fmt_hours, item, table
+from .ui_common import Collapsible, dspin, fmt_hours, item, mute, scroll_wrap, set_role, table, with_legend
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -38,9 +38,11 @@ class RecircTab(QWidget):
         self.start.setCalendarPopup(True)
         self.cool = QCheckBox("Потом охлаждение на D = 100 (горелки выкл.)")
         self.cool.setChecked(True)
-        b_j = QPushButton("Взять из журнала (последние пробы)")
+        b_j = set_role(QPushButton("Взять из журнала (последние пробы)"), "link")
+        b_j.setCursor(Qt.PointingHandCursor)
         b_j.clicked.connect(self._from_journal)
-        b_c = QPushButton("T блоков и наружный воздух — из «План сушки партии»")
+        b_c = set_role(QPushButton("Взять T блоков и воздух из «План сушки партии»"), "link")
+        b_c.setCursor(Qt.PointingHandCursor)
         b_c.clicked.connect(self._from_calc)
         f.addRow("Масса в сушилке", self.mass)
         f.addRow("Влажность сейчас (средняя, после охл.)", self.w0)
@@ -82,7 +84,8 @@ class RecircTab(QWidget):
         self.plot = SimplePlot()
         self.plot.set_labels("часы рециркуляции", "влажность (после охлаждения), %")
         self.plot.include_zero(x=True)
-        right.addWidget(self.plot)
+        right.addWidget(with_legend(self.plot, (("line", "line", "модель для расчётов"), ("dash", "ref", "вторая модель"),
+                                                ("dash", "target", "цель"))))
         right.setSizes([380, 380])
         lay.addWidget(scroll_wrap(left, 500), 0)
         lay.addWidget(right, 1)
@@ -123,8 +126,9 @@ class RecircTab(QWidget):
 
     def recalc(self) -> None:
         th = theme_for(self)
-        self.hint.setStyleSheet(f"color:{th.muted};")
-        self.summary.setStyleSheet(f"background:{th.summary_bg}; color:{th.summary_fg}; padding:10px; font-size:{QApplication.font().pointSizeF() + 2:.1f}pt;")
+        mute(self.hint)
+        self.summary.setStyleSheet(f"background:{th.summary_bg}; color:{th.summary_fg}; border-radius:10px; "
+                                   f"padding:10px 12px; font-size:{QApplication.font().pointSizeF() + 2:.1f}pt;")
         p = self.win.params
         c = mdl.Conditions(self.tproc.value(), self.tamb.value(), self.rh.value())
         m, w0, wk = self.mass.value(), self.w0.value(), self.wk.value()
@@ -198,4 +202,4 @@ class RecircTab(QWidget):
             self.plot.add_line([a for a, _ in pts], [b for _, b in pts], role, 2.5 if k == active else 1.5,
                                dashed=(k != active))
         self.plot.add_hline(wk, "target")
-        self.plot.set_title("сплошная — модель для расчётов, пунктир — вторая модель; красная — цель")
+        self.plot.set_title("")

@@ -16,7 +16,8 @@ from .batches import (BATCH_FIELDS, BATCH_HEADERS, BATCH_TEXT, QUALITY_NAMES, RE
                       schedule, season_meter_shift)
 from .plots import SimplePlot
 from .theme import mix as mix_color, theme_for
-from .ui_common import dspin, fmt_hours, fnum, item, size_by_current, table, to_num
+from .ui_common import (dspin, fmt_hours, fnum, item, menu_button, mute, set_role, size_by_current, table,
+                        to_num)
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -125,14 +126,24 @@ class BatchesTab(QWidget):
         lay.addWidget(hint)
         self.b_hint = hint
         bar = QHBoxLayout()
-        for text, slot in (("Добавить партию", self._add_batch), ("Удалить выделенные", self._del_batch),
-                           ("Создать из журнала", self._from_journal), ("Отчёт PDF…", self._report_pdf),
-                           ("Отчёт XLSX…", self._report_xlsx), ("Сводка сезона XLSX…", self._season_xlsx),
-                           ("Удельный расход топлива → в расчёт", self._fuel_to_calc)):
+        bar.setSpacing(6)
+        for text, slot, role in (("Добавить партию", self._add_batch, None),
+                                 ("Создать из журнала", self._from_journal, None),
+                                 ("Удалить выделенные", self._del_batch, "danger")):
             b = QPushButton(text)
+            if role:
+                set_role(b, role)
             b.clicked.connect(slot)
             bar.addWidget(b)
         bar.addStretch(1)
+        b_rep, _acts = menu_button("Отчёты", (("Отчёт PDF…", self._report_pdf), ("Отчёт XLSX…", self._report_xlsx),
+                                              ("Сводка сезона XLSX…", self._season_xlsx)),
+                                   "Отчёт по выбранной партии (PDF или Excel) и сводка сезона по всем партиям.")
+        bar.addWidget(b_rep)
+        b = QPushButton("Перенести расход топлива в план")
+        b.setToolTip("Удельный расход топлива на 1 т испарённой воды по всем партиям — в «План сушки партии».")
+        b.clicked.connect(self._fuel_to_calc)
+        bar.addWidget(b)
         lay.addLayout(bar)
         split = QSplitter(Qt.Vertical)
         self.tbl_b = QTableWidget(0, len(BATCH_FIELDS))
@@ -244,7 +255,7 @@ class BatchesTab(QWidget):
     def _show_batch(self) -> None:
         from .reports import batch_report_data
         th = theme_for(self)
-        self.b_hint.setStyleSheet(f"color:{th.muted};")
+        mute(self.b_hint)
         b = self._current()
         self.tbl_bp.setRowCount(0)
         unit = self.win.fuel_unit()
@@ -419,8 +430,7 @@ class BatchesTab(QWidget):
         return w
 
     def recalc_quality(self) -> None:
-        th = theme_for(self)
-        self.q_hint.setStyleSheet(f"color:{th.muted};")
+        mute(self.q_hint)
         tab = quality_table(self._batches(), self.win.journal_rows(), self.win.params)
         self.q_tbl.setRowCount(len(tab))
         for i, r in enumerate(tab):
@@ -441,7 +451,7 @@ class BatchesTab(QWidget):
                 mx = sum(a for a, _ in pts) / n
                 my = sum(b for _, b in pts) / n
                 xs = [min(a for a, _ in pts), max(a for a, _ in pts)]
-                self.q_plot.add_line(xs, [my + slope * (x - mx) for x in xs], "target", 1.5, dashed=True)
+                self.q_plot.add_line(xs, [my + slope * (x - mx) for x in xs], "alt", 1.5, dashed=True)
                 self.q_plot.set_title(f"r = {r:+.2f}, партий {n}")
         findings = quality_findings(tab)
         filled = sum(1 for r in tab if any(r[k] is not None for k in QUALITY_NAMES))
@@ -636,8 +646,7 @@ class BatchesTab(QWidget):
         self.recalc_queue()
 
     def recalc_queue(self) -> None:
-        th = theme_for(self)
-        self.lbl_q_note.setStyleSheet(f"color:{th.muted};")
+        mute(self.lbl_q_note)
         self.q_q.setEnabled(self.q_method.currentData() == "q")
         self.q_lim.setEnabled(self.q_method.currentData() == "q")
         if self._loading:

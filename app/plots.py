@@ -3,7 +3,8 @@
 
 Интерфейс прежний (SimplePlot: add_line, add_points, add_hline, set_labels, set_title, include_zero, clear),
 поэтому разделы программы не зависят от того, чем рисуется график. Цвета берутся из темы (светлая/тёмная) по
-смыслу линии: «line», «target», «ref», «dot».
+смыслу линии: «line» и «dot» (данные), «alt» (вторая серия), «target» (цель, предложенное), «ref» (фон-контекст).
+Подписи серий — над графиком (ui_common.with_legend), а не словами о цветах в заголовке.
 """
 from __future__ import annotations
 
@@ -67,12 +68,14 @@ class SimplePlot(pg.PlotWidget):
         self._ylabel = ""
         self._zero_x = False
         self._zero_y = False
+        self.legend_widget = None          # ui_common.with_legend: подписи серий над графиком
+        self._empty_text = "Пока нечего показать"
         pi = self.getPlotItem()
         pi.setMenuEnabled(False)          # своё меню на русском вместо английского меню pyqtgraph
         pi.hideButtons()
         self.vb = pi.getViewBox()
         self.vb.setMenuEnabled(False)
-        pi.showGrid(x=True, y=True, alpha=0.3)
+        pi.showGrid(x=True, y=True, alpha=0.13)       # сетка — тихая, данные — громкие
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(260, 170)
         self._marker = pg.ScatterPlotItem(size=12, symbol="o")
@@ -99,6 +102,16 @@ class SimplePlot(pg.PlotWidget):
     def set_title(self, text: str) -> None:
         self._title = text
         self._apply_labels()
+
+    def set_empty_text(self, text: str) -> None:
+        """Надпись на пустом графике (что сделать, чтобы он появился)."""
+        self._empty_text = text
+        self._schedule()
+
+    def set_legend(self, items) -> None:
+        """Подписи серий: [(вид "dot" | "line" | "dash", роль цвета, подпись)] — если график обёрнут with_legend."""
+        if self.legend_widget is not None:
+            self.legend_widget.set_items(items)
 
     def include_zero(self, x: bool = False, y: bool = False) -> None:
         self._zero_x, self._zero_y = x, y
@@ -241,6 +254,11 @@ class SimplePlot(pg.PlotWidget):
             elif s.kind == "points" and len(s.xs):
                 pi.addItem(pg.ScatterPlotItem(s.xs, s.ys, size=s.width, symbol="o",
                                               pen=pg.mkPen(th.plot_bg, width=0.8), brush=pg.mkBrush(th.role(s.color))))
+        if not self._series and not self._hlines and self._empty_text:
+            empty = pg.TextItem(self._empty_text, color=QColor(th.t.muted), anchor=(0.5, 0.5))
+            empty.setFont(self.font())
+            empty.setPos(0.5, 0.5)
+            pi.addItem(empty, ignoreBounds=True)
         self._marker.setPen(pg.mkPen(th.plot_ink, width=1.5))
         self._marker.setBrush(pg.mkBrush(None))
         self._marker.setData([], [])

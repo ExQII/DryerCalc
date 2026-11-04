@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QHBoxL
 from .analysis import batch_meter_points, combine_meter, meter_bias
 from .plots import SimplePlot
 from .theme import theme_for
-from .ui_common import size_by_current, to_num
+from .ui_common import mute, set_role, size_by_current, to_num, with_legend
 from .weather import WeatherSeries, merge_points, parse_dt, read_weather
 
 if TYPE_CHECKING:
@@ -53,10 +53,13 @@ class DataTab(QWidget):
         self.w_hint.setWordWrap(True)
         lay.addWidget(self.w_hint)
         bar = QHBoxLayout()
+        bar.setSpacing(6)
         for text, slot in (("Импорт файла…", self._w_import), ("Добавить замер", self._w_add),
                            ("Удалить выделенные", self._w_del), ("Очистить всё", self._w_clear),
                            ("Записать в пустые T/RH журнала", self._w_fill_journal)):
             b = QPushButton(text)
+            if text in ("Удалить выделенные", "Очистить всё"):
+                set_role(b, "danger")
             b.clicked.connect(slot)
             bar.addWidget(b)
         bar.addStretch(1)
@@ -75,6 +78,8 @@ class DataTab(QWidget):
         self.plot_t.set_labels("сутки от первого замера", "T наружная, °C")
         self.plot_rh = SimplePlot()
         self.plot_rh.set_labels("сутки от первого замера", "RH наружная, %")
+        for pl in (self.plot_t, self.plot_rh):
+            pl.set_empty_text("Замеров нет: импортируйте файл или добавьте замер")
         plots.addWidget(self.plot_t)
         plots.addWidget(self.plot_rh)
         split.addWidget(plots)
@@ -184,8 +189,7 @@ class DataTab(QWidget):
             self.win.replace_journal_rows(filled)
 
     def _w_plot(self) -> None:
-        th = theme_for(self)
-        self.w_hint.setStyleSheet(f"color:{th.muted};")
+        mute(self.w_hint)
         pts = self._points()
         self.plot_t.clear()
         self.plot_rh.clear()
@@ -205,8 +209,8 @@ class DataTab(QWidget):
             self.plot_t.add_line(xt, yt, "line", 1.5)
         self.plot_t.add_points(xt, yt, "dot", 4)
         if len(xr) > 1:
-            self.plot_rh.add_line(xr, yr, "target", 1.5)
-        self.plot_rh.add_points(xr, yr, "target", 4)
+            self.plot_rh.add_line(xr, yr, "alt", 1.5)
+        self.plot_rh.add_points(xr, yr, "alt", 4)
         self.plot_t.set_title(f"с {t0:%d.%m.%Y %H:%M}")
 
     # ==================================================================
@@ -224,9 +228,12 @@ class DataTab(QWidget):
         self.m_hint.setWordWrap(True)
         lay.addWidget(self.m_hint)
         bar = QHBoxLayout()
+        bar.setSpacing(6)
         for text, slot in (("Добавить пару", self._m_add), ("Удалить выделенные", self._m_del),
                            ("Применить поправку в модель", self._m_apply)):
             b = QPushButton(text)
+            if text == "Удалить выделенные":
+                set_role(b, "danger")
             b.clicked.connect(slot)
             bar.addWidget(b)
         bar.addStretch(1)
@@ -262,7 +269,9 @@ class DataTab(QWidget):
         split.addWidget(left)
         self.plot_m = SimplePlot()
         self.plot_m.set_labels("показание выходного влагомера, %", "показание − после охлаждения, п.п.")
-        split.addWidget(self.plot_m)
+        split.addWidget(with_legend(self.plot_m, (("dot", "dot", "пары проб"), ("dot", "alt", "партии"),
+                                                  ("line", "line", "рекомендуемая поправка"),
+                                                  ("dash", "target", "сейчас в модели"))))
         split.setSizes([700, 560])
         lay.addWidget(split, 1)
         return w
@@ -319,7 +328,7 @@ class DataTab(QWidget):
 
     def _m_stats(self) -> None:
         th = theme_for(self)
-        self.m_hint.setStyleSheet(f"color:{th.muted};")
+        mute(self.m_hint)
         r = meter_bias(self._pairs())
         p = self.win.params
         points = batch_meter_points(self.win.storage.get_list("batches"), self.win.journal_rows(), p)
@@ -353,7 +362,7 @@ class DataTab(QWidget):
             if pts:
                 self.plot_m.add_points([a for a, _ in pts], [b for _, b in pts], "dot", 7)
             if bpts:
-                self.plot_m.add_points([a for a, _ in bpts], [b for _, b in bpts], "target", 12)
+                self.plot_m.add_points([a for a, _ in bpts], [b for _, b in bpts], "alt", 12)
             allx = [a for a, _ in pts + bpts]
             xs = [min(allx), max(allx)]
             if xs[1] - xs[0] < 1e-6:
@@ -361,8 +370,7 @@ class DataTab(QWidget):
             if comb.get("a") is not None:
                 self.plot_m.add_line(xs, [comb["a"] + comb["kw"] * (x - 20.0) for x in xs], "line", 2)
             self.plot_m.add_line(xs, [p.out_bias + p.out_kw * (x - 20.0) for x in xs], "target", 1.5, dashed=True)
-            self.plot_m.set_title("точки — пары; крупные красные — партии; синяя — рекомендуемая поправка; "
-                                  "красный пунктир — сейчас в модели")
+            self.plot_m.set_title("")
         self._m_result = r
         self._m_comb = comb
 

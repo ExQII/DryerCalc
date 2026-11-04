@@ -4,9 +4,10 @@ from __future__ import annotations
 import re
 from typing import List, Optional
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QDoubleSpinBox, QFrame, QHeaderView, QLabel, QScrollArea, QTableWidget,
-                               QTableWidgetItem, QWidget)
+from PySide6.QtCore import QEvent, QSize, Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (QDoubleSpinBox, QFrame, QHeaderView, QLabel, QScrollArea, QStyledItemDelegate,
+                               QTableWidget, QTableWidgetItem, QWidget)
 
 SEP = re.compile(r"[;/\s]+")
 
@@ -79,18 +80,95 @@ def to_num(txt) -> Optional[float]:
         return None
 
 
+class _RowLine(QStyledItemDelegate):
+    """Обычная отрисовка клетки (с её цветом фона — уровни сценариев, выделение) и тонкая черта под строкой."""
+
+    def paint(self, p, option, index) -> None:
+        super().paint(p, option, index)
+        from . import design
+        p.save()
+        p.setPen(QColor(design.tokens_for(option.widget).line_soft))
+        r = option.rect
+        p.drawLine(r.left(), r.bottom(), r.right(), r.bottom())
+        p.restore()
+
+
+def clean_table(t: QTableWidget) -> QTableWidget:
+    """Вид таблицы результатов: без номеров строк и вертикальных линий — строки разделяет тонкая черта.
+    Таблицы для ввода (журнал, партии, погода) остаются с номерами строк и сеткой, как в Excel."""
+    t.verticalHeader().setVisible(False)
+    t.setShowGrid(False)
+    t.setItemDelegate(_RowLine(t))
+    t.setProperty("clean", True)
+    return t
+
+
 def table(headers: List[str], stretch_last: bool = True) -> QTableWidget:
+    """Таблица результатов (clean_table)."""
     t = QTableWidget(0, len(headers))
     t.setHorizontalHeaderLabels(headers)
     t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
     t.horizontalHeader().setStretchLastSection(stretch_last)
-    return t
+    return clean_table(t)
+
+
+def set_role(w: QWidget, role: str) -> QWidget:
+    """Роль виджета для общего QSS (design.stylesheet): muted, error, summary, num, link, primary, ghost, danger…
+    Меняет вид сразу, без своего setStyleSheet — поэтому смена темы на ходу перекрашивает и эти надписи."""
+    if w.property("role") != role:
+        w.setProperty("role", role)
+        if w.styleSheet():
+            w.setStyleSheet("")
+        st = w.style()
+        st.unpolish(w)
+        st.polish(w)
+        w.update()
+    return w
+
+
+def menu_button(text: str, items, tip: str = ""):
+    """Кнопка с меню для редких действий (отчёты, импорт): items — [(подпись, функция)].
+    Возвращает (кнопка, {подпись: QAction})."""
+    from PySide6.QtWidgets import QMenu, QPushButton
+    b = QPushButton(text)
+    b.setProperty("menu", True)
+    m = QMenu(b)
+    acts = {}
+    for cap, slot in items:
+        act = m.addAction(cap)
+        act.triggered.connect(lambda _c=False, f=slot: f())
+        acts[cap] = act
+    b.setMenu(m)
+    if tip:
+        b.setToolTip(tip)
+    return b, acts
+
+
+def with_legend(plot, items=()) -> QWidget:
+    """График с подписями серий над ним (widgets.Legend): цвет — значок, текст — обычным цветом. Вместо слов
+    «красная — цель» в заголовке графика."""
+    from PySide6.QtWidgets import QVBoxLayout
+    from .widgets import Legend
+    w = QWidget()
+    v = QVBoxLayout(w)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(4)
+    lg = Legend(items)
+    v.addWidget(lg)
+    v.addWidget(plot, 1)
+    plot.legend_widget = lg
+    return w
+
+
+def mute(w: QWidget) -> QWidget:
+    """Приглушённая подсказка (цвет из темы)."""
+    return set_role(w, "muted")
 
 
 def note_label(text: str = "") -> QLabel:
     lb = QLabel(text)
     lb.setWordWrap(True)
-    lb.setProperty("muted", True)
+    lb.setProperty("role", "muted")
     return lb
 
 
@@ -108,7 +186,7 @@ def scroll_wrap(w: QWidget, max_w: Optional[int] = None) -> QScrollArea:
 
 
 class Collapsible(QWidget):
-    """«▸ Заголовок» — по щелчку раскрывает содержимое (пояснение или виджет). Длинные пояснения на страницах
+    """«› Заголовок» — по щелчку раскрывает содержимое (пояснение или виджет). Длинные пояснения на страницах
     свёрнуты, чтобы не заслонять главное; состояние раскрытия меняет только сам человек."""
 
     def __init__(self, title: str, content=None, expanded: bool = False, parent: Optional[QWidget] = None):
@@ -122,8 +200,8 @@ class Collapsible(QWidget):
         self.button.setCheckable(True)
         self.button.setChecked(expanded)
         self.button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         self.button.setAutoRaise(True)
+        self.button.setCursor(Qt.PointingHandCursor)
         self.button.toggled.connect(self._toggled)
         lay.addWidget(self.button, 0, Qt.AlignLeft)
         if content is None or isinstance(content, str):
@@ -135,9 +213,22 @@ class Collapsible(QWidget):
         self.content = content
         lay.addWidget(content)
         content.setVisible(expanded)
+        self._chevron()
+
+    def _chevron(self) -> None:
+        from . import design, icons
+        t = design.tokens_for(self)
+        sz = max(int(self.fontMetrics().height() * 0.9), 10)
+        self.button.setIcon(icons.icon("chev_down" if self.button.isChecked() else "chev_right", t.ink2, sz))
+        self.button.setIconSize(QSize(sz, sz))
+
+    def changeEvent(self, ev) -> None:  # noqa: N802 — тема или шрифт сменились: перекрасить стрелку
+        super().changeEvent(ev)
+        if ev.type() in (QEvent.PaletteChange, QEvent.FontChange) and hasattr(self, "button"):
+            self._chevron()
 
     def _toggled(self, on: bool) -> None:
-        self.button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        self._chevron()
         self.content.setVisible(on)
 
     def set_expanded(self, on: bool) -> None:
@@ -148,37 +239,48 @@ class Collapsible(QWidget):
 
 
 class Tile(QFrame):
-    """Плитка «подпись / крупное число / пояснение» для главных цифр страницы."""
+    """Плитка «подпись / крупное число / пояснение» для главных цифр страницы. Справа от числа можно поставить
+    маленький график (set_aside), под числом — полосу прогресса (set_below). Вид — из общего QSS (QFrame#tile)."""
 
     def __init__(self, title: str, parent: Optional[QWidget] = None):
-        from PySide6.QtWidgets import QVBoxLayout
+        from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout
         super().__init__(parent)
         self.setObjectName("tile")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 6, 10, 8)
-        lay.setSpacing(0)
+        lay.setContentsMargins(12, 8, 12, 10)
+        lay.setSpacing(1)
         self.lbl_title = QLabel(title)
+        self.lbl_title.setProperty("role", "tileTitle")
         self.lbl_value = QLabel("—")
+        self.lbl_value.setProperty("role", "tileValue")
         self.lbl_sub = QLabel("")
+        self.lbl_sub.setProperty("role", "tileSub")
         self.lbl_sub.setWordWrap(True)
         self.lbl_title.setWordWrap(True)
         self.setMinimumWidth(10)
-        for w in (self.lbl_title, self.lbl_value, self.lbl_sub):
-            lay.addWidget(w)
+        lay.addWidget(self.lbl_title)
+        self.value_row = QHBoxLayout()
+        self.value_row.setSpacing(6)
+        self.value_row.addWidget(self.lbl_value, 0, Qt.AlignBottom)
+        self.value_row.addStretch(1)
+        lay.addLayout(self.value_row)
+        self.below = QVBoxLayout()
+        self.below.setContentsMargins(0, 2, 0, 2)
+        lay.addLayout(self.below)
+        lay.addWidget(self.lbl_sub)
         lay.addStretch(1)
+
+    def set_aside(self, w: QWidget) -> None:
+        self.value_row.addWidget(w, 0, Qt.AlignBottom)
+
+    def set_below(self, w: QWidget) -> None:
+        self.below.addWidget(w)
 
     def set(self, value: str, sub: str = "", tip: str = "") -> None:
         self.lbl_value.setText(value)
         self.lbl_sub.setText(sub)
+        self.lbl_sub.setVisible(bool(sub))
         self.setToolTip(tip)
-
-    def style_for(self, th, pt: float) -> None:
-        from .theme import mix
-        border = mix(th.window, th.text, 0.18).name()
-        self.setStyleSheet(f"#tile {{ background:{th.base.name()}; border:1px solid {border}; border-radius:6px; }}")
-        self.lbl_title.setStyleSheet(f"color:{th.muted};")
-        self.lbl_value.setStyleSheet(f"font-size:{pt + 4:.1f}pt; font-weight:600; color:{th.base_text.name()};")
-        self.lbl_sub.setStyleSheet(f"color:{th.muted};")
 
 
 def size_by_current(tabs) -> None:

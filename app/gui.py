@@ -8,14 +8,14 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QDateTime, QEvent, QTimer, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QIcon
+from PySide6.QtCore import QDateTime, QEvent, QSize, QTimer, Qt
+from PySide6.QtGui import QActionGroup, QBrush, QColor, QFont, QIcon
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox, QInputDialog,
-    QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStyledItemDelegate,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox,
+    QInputDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStyledItemDelegate,
     QSystemTrayIcon, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 from . import __version__
@@ -40,10 +40,12 @@ from .tab_live import LiveTab
 from .tab_recirc import RecircTab
 from .reminders import ReminderCfg, check as reminders_check, live_numbers
 from . import pilot
-from .theme import ensure_style_for_palette, theme_for
+from . import design, icons
+from .theme import theme_for
 from .weather import WeatherSeries
 
-from .ui_common import SEP, Collapsible, dspin, fmt_hours, item, parse_decimals, parse_ints, scroll_wrap  # noqa: E402,F401
+from .ui_common import (SEP, Collapsible, clean_table, dspin, fmt_hours, item, mute, parse_decimals,  # noqa: E402,F401
+                        parse_ints, scroll_wrap, set_role, with_legend)
 
 
 class _JournalDelegate(QStyledItemDelegate):
@@ -68,6 +70,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._ready = False
         self.storage = storage or Storage()
+        # оформление — до того, как строятся страницы: шрифт, палитра и общий QSS (design.py)
+        self.ui_theme = (self.storage.get_json("ui_theme", {}) or {}).get("mode", "system")
+        design.apply(QApplication.instance(), self.ui_theme, QApplication.font().pointSizeF())
         self.params: mdl.DryerParams = self.storage.load_params()
         self.plans: List[mdl.Plan] = []
         self._loading = False
@@ -103,11 +108,12 @@ class MainWindow(QMainWindow):
         self.tab_check = built[pg.CHECK] = CheckTab(self)
         built[pg.SETTINGS] = self._build_settings_tab()
         self.tab_help = built[pg.HELP] = HelpTab()
-        tabs = NavPanel("DryerCalc", "сушка кукурузы · шахтная сушилка Araj")
+        tabs = NavPanel("DryerCalc", "шахтная сушилка Araj")
+        tabs.backdrop = False              # фон рисует окно целиком — без шва у строки состояния
         self.tabs = tabs
         self.setCentralWidget(tabs)
         for name, section, sub in pg.PAGES:
-            tabs.addTab(built[name], name, section, sub)
+            tabs.addTab(built[name], name, section, sub, icon=pg.ICONS.get(name))
         tabs.currentChanged.connect(self._tab_changed)
 
         self._load_ui_state()
@@ -139,17 +145,38 @@ class MainWindow(QMainWindow):
         self._rem_timer.timeout.connect(self._check_reminders)
         self._rem_timer.start()
         # режим «Сушильщик / Инженер» и сбор замечаний (пилотный запуск) — внизу бокового меню
-        self._base_pt = QApplication.font().pointSizeF()
+        self._base_pt = design.base_pt() or QApplication.font().pointSizeF()
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItem("Режим: сушильщик", pilot.OPERATOR)
         self.cmb_mode.addItem("Режим: инженер", pilot.ENGINEER)
         self.cmb_mode.setToolTip("Сушильщик — только раздел «Смена» и «Справка», крупный шрифт. Инженер — всё.")
         self.cmb_mode.activated.connect(self._mode_selected)
-        self.btn_feedback = QPushButton("Замечание…")
+        self.btn_feedback = set_role(QPushButton("Замечание…"), "ghost")
         self.btn_feedback.setToolTip("Что-то неудобно или непонятно? Напишите — инженер увидит замечание.")
         self.btn_feedback.clicked.connect(self._feedback_dialog)
+        # оформление: как в Windows / светлое / тёмное — меню у кнопки с солнцем, месяцем или полукругом
+        self.btn_theme = QToolButton()
+        self.btn_theme.setObjectName("themeButton")
+        self.btn_theme.setPopupMode(QToolButton.InstantPopup)
+        self.btn_theme.setAutoRaise(True)
+        self.theme_menu = QMenu(self.btn_theme)
+        grp = QActionGroup(self.theme_menu)
+        self.theme_actions = {}
+        for m in design.MODES:
+            act = self.theme_menu.addAction(design.MODE_NAMES[m])
+            act.setCheckable(True)
+            act.setData(m)
+            grp.addAction(act)
+            act.triggered.connect(lambda _c=False, mm=m: self.set_ui_theme(mm))
+            self.theme_actions[m] = act
+        self.btn_theme.setMenu(self.theme_menu)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(4)
+        bottom.addWidget(self.btn_feedback, 1)
+        bottom.addWidget(self.btn_theme, 0)
         tabs.addBottomWidget(self.cmb_mode)
-        tabs.addBottomWidget(self.btn_feedback)
+        tabs.addBottomLayout(bottom)
+        self._theme_button()
         self.lbl_mode = QLabel()          # режим виден в меню; подпись оставлена для совместимости
         cfg_mode = self.storage.get_json("ui_mode")
         self.first_run = not isinstance(cfg_mode, dict) or "mode" not in cfg_mode
@@ -334,18 +361,21 @@ class MainWindow(QMainWindow):
              "Время, ч", "Окончание прохода"])
         self.sm_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.sm_tbl.horizontalHeader().setStretchLastSection(True)
+        clean_table(self.sm_tbl)
         tv.addWidget(self.sm_tbl)
         self.sm_cmp = QTableWidget(0, 5)
         self.sm_cmp.setHorizontalHeaderLabels(["Проходов", "Съём за проход, п.п.", "Чистое время, ч", "Итого", "Окончание"])
         self.sm_cmp.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.sm_cmp.horizontalHeader().setStretchLastSection(True)
+        clean_table(self.sm_cmp)
         tv.addWidget(QLabel("Сравнение по числу проходов (при выбранной производительности)"))
         tv.addWidget(self.sm_cmp)
         right.addWidget(top)
         self.sm_plot = SimplePlot()
         self.sm_plot.set_labels("время от старта, ч", "средняя влажность партии, %")
         self.sm_plot.include_zero(x=True)
-        right.addWidget(self.sm_plot)
+        right.addWidget(with_legend(self.sm_plot, (("line", "line", "средняя влажность партии"),
+                                                   ("dash", "target", "цель"))))
         right.setSizes([540, 280])
 
         lay.addWidget(scroll_wrap(left), 0)
@@ -416,10 +446,10 @@ class MainWindow(QMainWindow):
             warn = f" <span style='color:{th.error}'>съём за проход выше 10 п.п.</span>"
         cool_txt = f" + охлаждение {plan.cool_h:.1f} ч" if cool else ""
         self.sm_summary.setText(
-            f"<b>Итого: {fmt_hours(plan.total_time_h)}</b> &nbsp;·&nbsp; окончание <b>{end:%d.%m.%Y %H:%M}</b><br>"
+            f"<b>Итого {fmt_hours(plan.total_time_h)}, окончание {end:%d.%m.%Y %H:%M}</b><br>"
             f"Проходов: {n}, съём за проход {plan.passes[0].dw:.1f} п.п.{warn}<br>"
-            f"Чистое время {fmt_hours(work)} + накладные {n} × {overhead:g} ч{cool_txt} &nbsp;·&nbsp; "
-            f"вода {plan.water_total:.1f} т &nbsp;·&nbsp; масса после сушки {plan.m_final:.1f} т")
+            f"Чистое время {fmt_hours(work)} + накладные {n} × {overhead:g} ч{cool_txt}.<br>"
+            f"Испарится {plan.water_total:.1f} т воды, масса после сушки {plan.m_final:.1f} т.")
 
         t = 0.0
         self.sm_tbl.setRowCount(len(plan.passes))
@@ -450,7 +480,7 @@ class MainWindow(QMainWindow):
         pts = plan.timeline()
         self.sm_plot.add_line([x for x, _ in pts], [y for _, y in pts], "line", 2)
         self.sm_plot.add_hline(wk, "target")
-        self.sm_plot.set_title(f"Влажность партии по времени, красная линия — цель {wk:g} %")
+        self.sm_plot.set_title(f"Влажность партии по времени, цель {wk:g} %")
         self._save_simple_state()
 
     def _save_simple_state(self) -> None:
@@ -514,7 +544,8 @@ class MainWindow(QMainWindow):
         f.addRow("T по проходам", self.in_tlist)
         f.addRow("Наружный воздух, T", self.in_tamb)
         f.addRow("Наружный воздух, RH", self.in_rh)
-        self.btn_calc_w = QPushButton("T и RH: среднее за 3 сут из таблицы погоды")
+        self.btn_calc_w = set_role(QPushButton("T и RH: среднее за 3 сут из таблицы погоды"), "link")
+        self.btn_calc_w.setCursor(Qt.PointingHandCursor)
         self.btn_calc_w.clicked.connect(self._calc_weather)
         f.addRow(self.btn_calc_w)
         lv.addWidget(gb)
@@ -550,7 +581,7 @@ class MainWindow(QMainWindow):
         f.addRow("Теплота сгорания (для КПД)", self.in_lhv)
         lv.addWidget(gb)
 
-        self.btn_calc = QPushButton("Рассчитать")
+        self.btn_calc = set_role(QPushButton("Рассчитать"), "primary")
         self.btn_calc.clicked.connect(self.recalc)
         lv.addWidget(self.btn_calc)
         self.status = QLabel()
@@ -572,6 +603,7 @@ class MainWindow(QMainWindow):
         self.tbl_sc.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.tbl_sc.horizontalHeader().setStretchLastSection(True)
         self.tbl_sc.itemSelectionChanged.connect(self._on_scenario_selected)
+        clean_table(self.tbl_sc)
         right.addWidget(self.tbl_sc)
 
         self.tbl_det = QTableWidget(0, 13)
@@ -580,12 +612,14 @@ class MainWindow(QMainWindow):
              "T зерна ≈, °C", "Время, ч", "В сушилке, мин", "Масса вых, т", "Примечание"])
         self.tbl_det.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.tbl_det.horizontalHeader().setStretchLastSection(True)
+        clean_table(self.tbl_det)
         right.addWidget(self.tbl_det)
 
         self.plot = SimplePlot()
         self.plot.set_labels("время от старта, ч", "средняя влажность партии, %")
         self.plot.include_zero(x=True)
-        right.addWidget(self.plot)
+        right.addWidget(with_legend(self.plot, (("line", "line", "средняя влажность партии"),
+                                                ("dash", "target", "цель"))))
         right.setSizes([240, 200, 290])
         split.addWidget(right)
         split.setSizes([380, 1000])
@@ -750,8 +784,8 @@ class MainWindow(QMainWindow):
         if rng and pl.start:
             a, b = pl.start + timedelta(hours=rng[0]), pl.start + timedelta(hours=rng[1])
             span = f" (90 %: {a:%d.%m %H:%M} … {b:%d.%m %H:%M})"
-        self.plot.set_title(f"{pl.name}: итого {fmt_hours(pl.total_time_h)}, окончание {pl.end:%d.%m %H:%M}{span}; "
-                            f"красная — цель {pl.w_target:g} %" if pl.end else f"{pl.name}: итого {fmt_hours(pl.total_time_h)}")
+        self.plot.set_title(f"{pl.name}: итого {fmt_hours(pl.total_time_h)}, окончание {pl.end:%d.%m %H:%M}{span}, "
+                            f"цель {pl.w_target:g} %" if pl.end else f"{pl.name}: итого {fmt_hours(pl.total_time_h)}")
 
     # ------------------------------------------------------------------
     # Раздел «Журнал проб»
@@ -773,19 +807,33 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.j_help)
 
         bar = QHBoxLayout()
-        self.j_buttons: Dict[str, QPushButton] = {}
+        bar.setSpacing(6)
+        self.j_buttons: Dict = {}            # кнопки и пункты меню панели журнала (режим сушильщика прячет часть)
+        # редкие действия с файлами — в меню одной кнопки, частые — кнопками
+        b_files = QPushButton("Импорт и бланки")
+        b_files.setProperty("menu", True)
+        m_files = QMenu(b_files)
         for text, slot in (("Импорт CSV/XLSX…", self._import_journal),
                            ("Сохранить шаблон…", self._save_template),
                            ("Сохранить пример…", self._save_sample),
-                           ("Бланк журнала PDF…", self._blank_pdf),
-                           ("Добавить пустую строку", self._add_row),
-                           ("Удалить выделенные", self._delete_rows),
-                           ("Калибровать модель", self._calibrate)):
+                           ("Бланк журнала PDF…", self._blank_pdf)):
+            act = m_files.addAction(text)
+            act.triggered.connect(lambda _c=False, f=slot: f())
+            self.j_buttons[text] = act
+        b_files.setMenu(m_files)
+        b_files.setToolTip("Импорт журнала из CSV/XLSX, шаблон и пример для заполнения, бланк журнала для печати.")
+        bar.addWidget(b_files)
+        for text, slot, role in (("Добавить пустую строку", self._add_row, None),
+                                 ("Удалить выделенные", self._delete_rows, "danger"),
+                                 ("Калибровать модель", self._calibrate, None)):
             b = QPushButton(text)
+            if role:
+                set_role(b, role)
             b.clicked.connect(slot)
+            if text == "Калибровать модель":
+                bar.addStretch(1)
             bar.addWidget(b)
             self.j_buttons[text] = b
-        bar.addStretch(1)
         lay.addLayout(bar)
 
         qe = QGroupBox("Быстрый ввод пробы — Enter добавляет строку")
@@ -820,11 +868,11 @@ class MainWindow(QMainWindow):
         field(line1, "Время пробы", self.qe_time)
         self.qe: Dict[str, QLineEdit] = {}
         for line, key, cap, ph, width in (
-                (line1, "w_in", "Влага вход, %", "Вход, %", 70), (line1, "w_out", "Влага выход, %", "Выход, %", 70),
-                (line1, "t_a1", "T зерна низ", "T низ", 56), (line1, "t_a2", "T зерна верх", "T верх", 56),
-                (line2, "t_up", "T блока 1", "Блок 1", 60), (line2, "t_low", "T блока 2", "Блок 2", 60),
-                (line2, "d", "Разгрузка D", "D, с", 52), (line2, "batch", "Партия", "Партия", 64),
-                (line2, "pass_no", "Проход", "Проход", 58),
+                (line1, "w_in", "Влага вход, %", "%", 76), (line1, "w_out", "Влага выход, %", "%", 76),
+                (line1, "t_a1", "T зерна низ", "°C", 64), (line1, "t_a2", "T зерна верх", "°C", 64),
+                (line2, "t_up", "T блока 1", "°C", 64), (line2, "t_low", "T блока 2", "°C", 64),
+                (line2, "d", "Разгрузка D", "с", 58), (line2, "batch", "Партия", "", 64),
+                (line2, "pass_no", "Проход", "", 58),
                 (line2, "note", "Примечание", "«Остановка», «Запуск», «Закончился …», «рециркуляция»", 0)):
             le = QLineEdit()
             le.setPlaceholderText(ph)
@@ -837,7 +885,7 @@ class MainWindow(QMainWindow):
             le.returnPressed.connect(self._qe_add)
             self.qe[key] = le
             field(line, cap, le, 0 if width else 1)
-        b = QPushButton("Добавить")
+        b = set_role(QPushButton("Добавить"), "primary")
         b.setToolTip("Добавить пробу в журнал (Enter в любом поле — то же самое)")
         b.clicked.connect(self._qe_add)
         field(line1, " ", b)
@@ -1314,9 +1362,8 @@ class MainWindow(QMainWindow):
             self.tabs.setTabVisible(i, vis)     # размер окна — по открытой странице (NavPanel)
         if to_journal:
             self.tabs.setCurrentIndex(self.tabs.indexOfText(pg.JOURNAL))
-        f = QApplication.font()
-        f.setPointSizeF(self._base_pt + (2.0 if op else 0.0))
-        QApplication.setFont(f)
+        # шрифт режима и общий QSS (размеры заголовков и цифр — от базового шрифта)
+        design.apply(QApplication.instance(), design.mode(), self._base_pt + (2.0 if op else 0.0))
         if getattr(self, "_ready", False):
             self._apply_theme()       # сводки с размером шрифта от текущего
         for name in ("Импорт CSV/XLSX…", "Сохранить шаблон…", "Сохранить пример…", "Калибровать модель"):
@@ -1637,8 +1684,10 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(w)
 
         left = QVBoxLayout()
-        gb = QGroupBox("Производительность выгрузки Q(D), т/ч (лист пересчёта, кукуруза, натура 0,65)")
+        gb = QGroupBox("Производительность выгрузки Q(D)")
+        gb.setMaximumWidth(380)
         gv = QVBoxLayout(gb)
+        gv.addWidget(mute(QLabel("т/ч по листу пересчёта: кукуруза, натура 0,65")))
         self.s_qtbl = QTableWidget(0, 2)
         self.s_qtbl.setHorizontalHeaderLabels(["Разгрузка D, с", "Q, т/ч"])
         self.s_qtbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -1664,6 +1713,9 @@ class MainWindow(QMainWindow):
         self.s_model = QComboBox()
         self.s_model.addItem("Эмпирическая (по журналу; точнее на ваших данных)", "empirical")
         self.s_model.addItem("Физическая (кинетика сушки кукурузы + КПД слоя)", "physics")
+        for cb in (self.s_src, self.s_model):         # длинные пункты не раздувают ширину страницы
+            cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumContentsLength(18)
         self.s_rref = dspin(0.05, 100, 1.83, 3, 0.1, " т воды/ч")
         self.s_wref = dspin(10, 50, 22, 1, 1, " %")
         self.s_tref = dspin(20, 150, 60, 1, 0.5, " °C")
@@ -1689,10 +1741,10 @@ class MainWindow(QMainWindow):
         f = QFormLayout(gb)
         f.addRow("Вместимость сушилки", self.s_mdryer)
         f.addRow("Накладные на каждый проход", self.s_overhead)
-        f.addRow("Поправка влагомера на выходе (показание − после охлаждения), a", self.s_bias)
+        f.addRow("Поправка влагомера на выходе, a\n(показание − после охлаждения)", self.s_bias)
         f.addRow("  + k_w · (показание − 20)", self.s_kw)
         f.addRow("  + k_t · (T зерна по датчикам − 30)", self.s_kt)
-        f.addRow("Ошибка скорости сушки σ (для допусков ± в прогнозах)", self.s_sigma)
+        f.addRow("Ошибка скорости сушки σ\n(для допусков ± в прогнозах)", self.s_sigma)
         f.addRow("Лаг выхода: доля времени пребывания", self.s_lag)
         f.addRow("Температура в модели", self.s_src)
         f.addRow("Модель для расчётов", self.s_model)
@@ -2052,7 +2104,7 @@ class MainWindow(QMainWindow):
                 f"Расчёт по ФИЗИЧЕСКОЙ модели (тонкий слой Thompson + КПД слоя η = {p.eta:.2f}): {p.phys_info}. "
                 f"На журнале октября она точнее эмпирической не оказалась — сравнивайте в разделе «Точность модели».")
             bg, fg = theme_for(self).banner("red" if manual else "amber")
-            self.banner.setStyleSheet(f"background:{bg}; color:{fg}; padding:6px;")
+            self.banner.setStyleSheet(f"background:{bg}; color:{fg}; padding:8px 12px; border-radius:10px;")
             self.s_info.setText(f"Физическая модель: {p.phys_info}. Эмпирическая: {p.calib_info}.")
             return
         if p.calibrated and p.calib_info.startswith("стартовая"):
@@ -2060,39 +2112,39 @@ class MainWindow(QMainWindow):
                 f"Стартовая калибровка ({p.calib_info[len('стартовая: '):]}). Для своего режима загрузите журнал "
                 f"в разделе «Журнал проб» и нажмите «Калибровать модель».")
             bg, fg = theme_for(self).banner("amber")
-            self.banner.setStyleSheet(f"background:{bg}; color:{fg}; padding:6px;")
+            self.banner.setStyleSheet(f"background:{bg}; color:{fg}; padding:8px 12px; border-radius:10px;")
             self.s_info.setText("Статус: " + p.calib_info.rstrip(".") + ".")
         elif p.calibrated:
             self.banner.setText(f"Модель откалибрована по журналу: {p.calib_info}")
             bg, fg = theme_for(self).banner("green")
-            self.banner.setStyleSheet(f"background:{bg}; color:{fg}; padding:6px;")
+            self.banner.setStyleSheet(f"background:{bg}; color:{fg}; padding:8px 12px; border-radius:10px;")
             self.s_info.setText(f"Статус: откалибровано ({p.calib_info}).")
         else:
             self.banner.setText(
                 "⚠ Параметры модели изменены вручную и не проверены по журналу: прогноз съёма приблизительный. "
                 "Нажмите «Калибровать модель» в разделе «Журнал проб» или сбросьте к стартовым значениям.")
             bg, fg = theme_for(self).banner("red")
-            self.banner.setStyleSheet(f"background:{bg}; color:{fg}; padding:6px; font-weight:bold;")
+            self.banner.setStyleSheet(f"background:{bg}; color:{fg}; padding:8px 12px; border-radius:10px; "
+                                      f"font-weight:600;")
             self.s_info.setText("Статус: не откалибровано (изменено вручную).")
 
     # ------------------------------------------------------------------
     # Тема (светлая / тёмная)
     # ------------------------------------------------------------------
     def _apply_theme(self) -> None:
-        """Цвета надписей, сводки и баннера под текущую системную тему; таблицы и графики перерисовываются."""
+        """Цвета надписей, сводки и баннера под текущую тему; таблицы и графики перерисовываются."""
         th = theme_for(self)
         self._theme_dark = th.dark
         self.tabs.apply_theme(th)
-        muted = f"color:{th.muted};"
-        err = f"color:{th.error};"
-        self.qe_hint.setStyleSheet(muted)
-        self.sm_q_hint.setStyleSheet(muted)
-        self.sm_note.setStyleSheet(muted)
-        self.sm_status.setStyleSheet(err)
-        self.status.setStyleSheet(err)
+        for w in (self.qe_hint, self.sm_q_hint, self.sm_note):
+            mute(w)
+        for w in (self.sm_status, self.status):
+            set_role(w, "error")
         self.sm_summary.setStyleSheet(
-            f"background:{th.summary_bg}; color:{th.summary_fg}; padding:10px; font-size:{QApplication.font().pointSizeF() + 2:.1f}pt;")
+            f"background:{th.summary_bg}; color:{th.summary_fg}; border-radius:10px; padding:10px 12px; "
+            f"font-size:{QApplication.font().pointSizeF() + 2:.1f}pt;")
         self._update_banner()
+        self._theme_button()
         if getattr(self, "_ready", False):
             self.recalc()
             self.recalc_simple()
@@ -2101,10 +2153,42 @@ class MainWindow(QMainWindow):
             self.tab_check.mark_dirty()
             self._tab_changed(self.tabs.currentIndex())
 
+    def _theme_button(self) -> None:
+        """Значок кнопки оформления: солнце — светлое, месяц — тёмное, полукруг — как в Windows."""
+        if not hasattr(self, "btn_theme"):
+            return
+        m = design.mode()
+        t = design.tokens_for(self)
+        sz = int(round(self.fontMetrics().height() * 1.15))
+        self.btn_theme.setIcon(icons.icon({"light": "sun", "dark": "moon"}.get(m, "auto"), t.ink2, sz))
+        self.btn_theme.setIconSize(QSize(sz, sz))
+        self.btn_theme.setToolTip(f"Оформление: {design.MODE_NAMES[m].lower()}")
+        for k, act in self.theme_actions.items():
+            act.setChecked(k == m)
+
+    def set_ui_theme(self, mode: str, save: bool = True) -> None:
+        """Оформление: «system» — как в Windows (меняется вместе с темой Windows), «light», «dark»."""
+        op = self.mode == pilot.OPERATOR
+        design.apply(QApplication.instance(), mode, self._base_pt + (2.0 if op else 0.0))
+        self.ui_theme = design.mode()
+        if save:
+            self.storage.set_json("ui_theme", {"mode": self.ui_theme})
+        self._apply_theme()
+
     def _theme_changed(self) -> None:
-        ensure_style_for_palette()
-        if theme_for(self).dark != getattr(self, "_theme_dark", None):
+        """Тема Windows сменилась на ходу (или палитра окна): при «как в Windows» — перестроить оформление."""
+        if design.mode() == "system" and design.system_dark() != design.tokens().dark:
+            self.set_ui_theme("system", save=False)
+        elif theme_for(self).dark != getattr(self, "_theme_dark", None):
             self._apply_theme()
+
+    def paintEvent(self, _e) -> None:  # noqa: N802 — тёплый фон окна со свечением за стеклянным меню
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QPainter
+        from .widgets import paint_backdrop
+        p = QPainter(self)
+        paint_backdrop(p, QRectF(self.rect()), design.tokens_for(self))
+        p.end()
 
     def changeEvent(self, event) -> None:  # noqa: N802
         super().changeEvent(event)
@@ -2179,7 +2263,6 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             pass
     app = QApplication.instance() or QApplication(sys.argv)
-    ensure_style_for_palette(app)
     _install_excepthook()
     win = MainWindow()
     win.show()

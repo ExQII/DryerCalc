@@ -1084,6 +1084,161 @@ def test_rules_doc_journal_claims_hold():
     assert max(len(line) for line in text.splitlines()) <= 101
 
 
+
+# ---------------------------------------------------------------------------
+# v1.0: оформление — тёплый минимализм и стекло, тема «как в Windows / светлое / тёмное»
+# ---------------------------------------------------------------------------
+
+def _qapp():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def test_design_tokens_readable_in_both_themes():
+    from app import design
+    from app.theme import contrast
+    for t in (design.LIGHT, design.DARK):
+        pairs = [(t.ink, t.paper, 7.0), (t.ink, t.surface, 7.0), (t.ink2, t.surface, 4.5), (t.muted, t.paper, 4.5),
+                 (t.muted, t.surface, 4.5), (t.accent_ink, t.accent, 4.5), (t.ink, t.accent_tint, 4.5),
+                 (t.rust, t.paper, 4.5), (t.steel, t.surface, 3.0), (t.good_ink, t.good_tint, 4.5),
+                 (t.rust_ink, t.rust_tint, 4.5), (t.amber_ink, t.accent_tint, 4.5)]
+        bad = [(fg, bg, round(contrast(fg, bg), 2)) for fg, bg, need in pairs if contrast(fg, bg) < need]
+        assert not bad, (t.dark, bad)
+        assert set(design.token_names()) >= {"paper", "accent", "glass", "series1", "series2"}
+
+
+def test_design_apply_switches_palette_and_qss():
+    from PySide6.QtGui import QPalette
+    app = _qapp()
+    from app import design
+    base = app.font().pointSizeF()
+    t = design.apply(app, "dark", base)
+    assert t.dark and design.mode() == "dark" and design.style_name() == "fusion"
+    assert app.palette().color(QPalette.Window).name().lower() == design.DARK.paper.lower()
+    assert design.DARK.accent.lower() in app.styleSheet().lower()
+    t = design.apply(app, "light", base)
+    assert not t.dark and app.palette().color(QPalette.Window).name().lower() == design.LIGHT.paper.lower()
+    assert design.tokens_for(None) is design.LIGHT and design.base_pt() == base
+    design.apply(app, "nonsense", base)                       # неизвестный режим — как в Windows
+    assert design.mode() == "system"
+    design.apply(app, "light", base)
+
+
+def test_ui_theme_saved_and_restored():
+    _qapp()
+    from app import design
+    from app.gui import MainWindow
+    db = _tmp("theme.db")
+    win = MainWindow(Storage(db))
+    win.set_ui_theme("dark")
+    assert win.storage.get_json("ui_theme") == {"mode": "dark"} and design.tokens().dark
+    assert win.theme_actions["dark"].isChecked() and not win.theme_actions["light"].isChecked()
+    win.close()
+    win2 = MainWindow(Storage(db))                            # следующий запуск — то же оформление
+    assert design.mode() == "dark" and win2.ui_theme == "dark"
+    win2.set_ui_theme("light")
+    assert win2.storage.get_json("ui_theme") == {"mode": "light"} and not design.tokens().dark
+    win2.close()
+
+
+def test_live_card_dial_follows_advice():
+    _qapp()
+    from app.gui import MainWindow
+    win = MainWindow(Storage(_tmp("dial.db")))
+    lt = win.tab_live
+    base = {"sub": ["строка"], "warn": [], "go": None}
+    lt._show_advice(dict(base, kind="change", head="Поставьте D = 47 с", d_now=35.0, d_rec=47.0))
+    assert lt.dial.state() == ("change", 35.0, 47.0, "было 35") and lt.card.tint() == "gold"
+    assert lt.lbl_head.text() == "Поставьте D = 47 с" and lt.lbl_warn.isHidden()
+    lt._show_advice(dict(base, kind="keep", head="D не менять — 35 с", d_now=35.0, d_rec=36.0))
+    assert lt.dial.state()[:3] == ("keep", 35.0, 35.0) and lt.card.tint() == "green"
+    lt._show_advice(dict(base, kind="wait", head="Подождите", d_now=40.0, d_rec=44.0,
+                         until=datetime(2026, 10, 25, 9, 30), warn=["Проверьте пробу"]))
+    assert lt.dial.state() == ("wait", 40.0, 40.0, "до 09:30") and lt.card.tint() == "steel"
+    assert not lt.lbl_warn.isHidden() and "⚠ Проверьте пробу" in lt.lbl_warn.text()
+    lt._show_advice(dict(base, kind="nodata", head="Совета пока нет", go="Журнал проб", d_now=None, d_rec=None))
+    assert lt.dial.state()[0] == "nodata" and lt.card.tint() is None and lt.btn_go.text() == "Открыть «Журнал проб»"
+    # данные прохода и задание — на своей вкладке, рядом с графиком
+    assert [lt.views.tabText(i) for i in range(lt.views.count())] == [
+        "График проб", "Данные прохода и задание", "Если поставить другое D", "Расчёт подробно"]
+    win.close()
+
+
+def test_plural_passes_and_tiles():
+    from app.tab_live import _passes
+    assert [_passes(n) for n in (1, 2, 4, 5, 11, 12, 21, 22, 25)] == [
+        "1 проход", "2 прохода", "4 прохода", "5 проходов", "11 проходов", "12 проходов", "21 проход", "22 прохода",
+        "25 проходов"]
+    _qapp()
+    from app.ui_common import Tile
+    from app.widgets import ProgressLine, Sparkline
+    t = Tile("Конец прохода")
+    bar = ProgressLine()
+    t.set_below(bar)
+    t.set("26.10 03:55", "")
+    assert t.lbl_sub.isHidden() and t.lbl_value.property("role") == "tileValue"
+    bar.set_value(1.7)
+    assert bar.value() == 1.0
+    sp = Sparkline()
+    sp.set_data([0, 1], [23.0, 22.5], 22.0, [1.5], [22.2])
+    assert not sp.isHidden()
+    sp.set_data([0], [23.0])
+    assert sp.isHidden()
+
+
+def test_glass_shadow_is_soft_and_symmetric():
+    _qapp()
+    from app.widgets import _shadow_image
+    img, corner = _shadow_image(16, 12, (0, 0, 0, 120))
+    n = img.width()
+    assert n == 2 * corner + 1
+    mid = img.pixelColor(n // 2, n // 2).alpha()
+    edge = img.pixelColor(0, n // 2).alpha()
+    assert mid > 100 and edge < 5                             # под телом — тень, у края картинки — почти ноль
+    assert abs(img.pixelColor(3, n // 2).alpha() - img.pixelColor(n - 4, n // 2).alpha()) <= 1
+
+
+def test_icons_draw_for_every_page():
+    _qapp()
+    from app import icons
+    from app import pages as pg
+    for name in set(pg.ICONS.values()) | {"kernel", "sun", "moon", "auto", "chev_right", "chev_down"}:
+        pm = icons.pixmap(name, "#4D4840", 20, 2.0)
+        img = pm.toImage()
+        assert not pm.isNull() and any(img.pixelColor(x, y).alpha() > 0 for x in range(0, 40, 2) for y in range(0, 40, 2)), name
+    assert set(pg.ICONS) == {x[0] for x in pg.PAGES}
+
+
+def test_docs_rendered_as_pages():
+    from app.docview import _sentence, to_html
+    text = open(os.path.join(ROOT, "docs", "manual_ru.txt"), encoding="utf-8-sig").read()
+    h = to_html(text)
+    assert "=====" not in h and "<h1" in h and "Инструкция для пользователя" in h
+    assert "<a name='s7'></a>" in h and "href='#s7'" in h and "7. Раздел «Текущий проход»" in h
+    assert _sentence("СУШИЛЬЩИК: КАК ПОЛЬЗОВАТЬСЯ РАЗДЕЛОМ «ТЕКУЩИЙ ПРОХОД» И PDF") == \
+        "Сушильщик: как пользоваться разделом «Текущий проход» и PDF"
+    rules = to_html(open(os.path.join(ROOT, "docs", "rules_ru.txt"), encoding="utf-8-sig").read())
+    assert "href='#s22'" in rules and "<pre>" in rules
+
+
+def test_rare_actions_in_menus_and_operator_hides_them():
+    _qapp()
+    from PySide6.QtGui import QAction
+    from PySide6.QtWidgets import QPushButton
+    from app import pilot
+    from app.gui import MainWindow
+    win = MainWindow(Storage(_tmp("menus.db")))
+    assert isinstance(win.j_buttons["Импорт CSV/XLSX…"], QAction) and isinstance(win.j_buttons["Калибровать модель"],
+                                                                                 QPushButton)
+    assert win.qe_add_btn.property("role") == "primary" and win.j_buttons["Удалить выделенные"].property("role") == "danger"
+    win.apply_mode(pilot.OPERATOR)
+    assert not win.j_buttons["Импорт CSV/XLSX…"].isVisible() and win.j_buttons["Бланк журнала PDF…"].isVisible()
+    win.apply_mode(pilot.ENGINEER)
+    assert win.j_buttons["Импорт CSV/XLSX…"].isVisible()
+    win.close()
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):

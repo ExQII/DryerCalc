@@ -203,6 +203,7 @@ def _make_dialog_class():
             lay.addWidget(self.cb_fix)
             bb = QDialogButtonBox()
             self.btn_ok = bb.addButton("Записать изменение режима", QDialogButtonBox.AcceptRole)
+            self.btn_ok.setProperty("role", "primary")        # главное действие окна — золотом (design.py)
             if edit_mode:
                 typo = QPushButton("Это опечатка — оставить исправление")
                 typo.clicked.connect(lambda: self.done(self.TYPO))
@@ -259,7 +260,9 @@ def _make_dialog_class():
             vals = self.new_values()
             if vals is None:
                 self.plan = None
-                self.preview.setText("<span style='color:#c0392b'>D и T блоков — числа, например 40 или 62,5.</span>")
+                from .design import tokens_for
+                self.preview.setText(f"<span style='color:{tokens_for(self).rust}'>D и T блоков — числа, например 40 "
+                                     f"или 62,5.</span>")
                 self.btn_ok.setEnabled(False)
                 self.cb_fix.setVisible(False)
                 return

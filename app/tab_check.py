@@ -14,7 +14,7 @@ from .analysis import backtest, drift_text, rate_sigma_from_backtest
 from .doe import explored_passes, suggest, typical_regime
 from .plots import SimplePlot
 from .theme import theme_for
-from .ui_common import dspin, fnum, item, scroll_wrap, size_by_current, table
+from .ui_common import dspin, fnum, item, mute, scroll_wrap, size_by_current, table, with_legend
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -81,7 +81,9 @@ class CheckTab(QWidget):
         split.addWidget(self.tbl)
         self.plot = SimplePlot()
         self.plot.set_labels("проход по порядку", "ошибка съёма, п.п. (модель − факт)")
-        split.addWidget(self.plot)
+        split.addWidget(with_legend(self.plot, (("dot", "line", "прогноз эмпирической"),
+                                                ("dot", "alt", "прогноз физической"),
+                                                ("dot", "ref", "эмпирическая по текущим данным"))))
         split.setSizes([300, 300])
         lay.addWidget(split, 1)
         return w
@@ -108,8 +110,7 @@ class CheckTab(QWidget):
     def refresh(self) -> None:
         """Проверка модели считается в фоне (на журнале сезона — около секунды, на старом компьютере дольше);
         окно при этом не замирает, ход расчёта виден в сводке."""
-        th = theme_for(self)
-        self.hint.setStyleSheet(f"color:{th.muted};")
+        mute(self.hint)
         if self._job is not None:
             self._dirty = True          # уже считается — пересчитать по свежим данным, когда закончит
             return
@@ -188,13 +189,13 @@ class CheckTab(QWidget):
                 f"В расчётах сейчас: <b>{active}</b>. {drift_text(bt, self.win.params.model_kind)}{sig_txt}")
         self.plot.clear()
         xs = list(range(1, len(data) + 1))
-        for key, role in (("fc_emp", "line"), ("fc_phys", "target"), ("cur_emp", "ref")):
+        for key, role in (("fc_emp", "line"), ("fc_phys", "alt"), ("cur_emp", "ref")):
             pts = [(x, r[key] - r["dw_obs"]) for x, r in zip(xs, data) if r.get(key) is not None]
             if pts:
                 self.plot.add_points([a for a, _ in pts], [b for _, b in pts], role, 8 if key != "cur_emp" else 5)
         if data:
             self.plot.add_hline(0.0, "ref", dashed=True)
-        self.plot.set_title("синие — прогноз эмпирической, красные — прогноз физической, серые — эмпирическая текущая")
+        self.plot.set_title("ошибка прогноза по каждому проходу: чем ближе к нулю, тем лучше")
 
     # ==================================================================
     # План опытов
@@ -253,7 +254,9 @@ class CheckTab(QWidget):
         right.addWidget(top)
         self.doe_plot = SimplePlot()
         self.doe_plot.set_labels("разгрузка D, с", "T блоков, °C")
-        right.addWidget(self.doe_plot)
+        right.addWidget(with_legend(self.doe_plot, (("dot", "dot", "уже изучено"),
+                                                    ("dot", "target", "предлагаемые опыты"),
+                                                    ("dot", "ref", "другие допустимые режимы"))))
         right.setSizes([330, 330])
         lay.addWidget(scroll_wrap(left, 480), 0)
         lay.addWidget(right, 1)
@@ -270,7 +273,7 @@ class CheckTab(QWidget):
 
     def refresh_doe(self) -> None:
         th = theme_for(self)
-        self.doe_hint.setStyleSheet(f"color:{th.muted};")
+        mute(self.doe_hint)
         self._doe_dirty = False
         p = self.win.params
         if p.t_agent_max and self.d_tmax.value() > p.t_agent_max:
@@ -309,4 +312,4 @@ class CheckTab(QWidget):
             self.doe_plot.add_points([x["d"] for x in passes], [x["t"] for x in passes], "dot", 10)
         if plan:
             self.doe_plot.add_points([x.d for x in plan], [x.t for x in plan], "target", 10)
-        self.doe_plot.set_title("синие — уже изучено, красные — предлагаемые опыты, серые — другие допустимые режимы")
+        self.doe_plot.set_title("")

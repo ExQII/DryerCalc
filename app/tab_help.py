@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import shutil
 
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTabWidget,
-                               QTextBrowser, QVBoxLayout, QWidget)
+from PySide6.QtCore import QEvent
+from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTabWidget, QTextBrowser,
+                               QVBoxLayout, QWidget)
 
+from . import design, docview
 from .resources import resource_path
 
 MANUAL = "docs/manual_ru.txt"
@@ -38,15 +39,17 @@ class HelpTab(QWidget):
         bar.addWidget(b)
         lay.addLayout(bar)
         self.tabs = QTabWidget()
-        mono = QFont("Consolas")
-        mono.setStyleHint(QFont.Monospace)
-        mono.setPointSize(10)
-        self.manual = QPlainTextEdit()
-        self.rules = QPlainTextEdit()
+        self.tabs.setDocumentMode(True)
+        # инструкция и правила — свёрстанной страницей (docview): заголовки, содержание-ссылки, текст как в файле
+        self.manual = QTextBrowser()
+        self.rules = QTextBrowser()
         for w in (self.manual, self.rules):
-            w.setReadOnly(True)
-            w.setFont(mono)
+            w.setObjectName("doc")
+            w.setOpenLinks(True)
+            w.setOpenExternalLinks(False)
+        self._texts = {}
         self.view = QTextBrowser()
+        self.view.setObjectName("doc")
         self.view.setOpenExternalLinks(False)
         self.widgets = (self.manual, self.rules, self.view)
         for w, (_, title, _, _) in zip(self.widgets, DOCS):
@@ -59,13 +62,31 @@ class HelpTab(QWidget):
             return
         for w, (rel, _, _, _) in zip((self.manual, self.rules), DOCS):
             src = resource_path(rel)
-            w.setPlainText(src.read_text(encoding="utf-8-sig") if src.exists() else f"Файл {rel} не найден.")
+            if src.exists():
+                self._texts[rel] = src.read_text(encoding="utf-8-sig")
+            else:
+                w.setPlainText(f"Файл {rel} не найден.")
+        self._render()
         src = resource_path(README)
         if src.exists():
             self.view.setMarkdown(src.read_text(encoding="utf-8"))
         else:
             self.view.setPlainText("Файл технического описания не найден.")
         self._loaded = True
+
+    def _render(self) -> None:
+        """Свёрстать документы под текущую тему (цвета зашиты в HTML — при смене темы перерисовать)."""
+        t = design.tokens_for(self)
+        for w, (rel, _, _, _) in zip((self.manual, self.rules), DOCS):
+            if rel in self._texts:
+                pos = w.verticalScrollBar().value()
+                w.setHtml(docview.to_html(self._texts[rel], t))
+                w.verticalScrollBar().setValue(pos)
+
+    def changeEvent(self, ev) -> None:  # noqa: N802
+        super().changeEvent(ev)
+        if ev.type() == QEvent.PaletteChange and self._loaded:
+            self._render()
 
     def _find_next(self) -> None:
         text = self.find.text().strip()

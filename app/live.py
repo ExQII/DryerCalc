@@ -423,7 +423,8 @@ D_STEP_BIG = 10.0     # больше 10 с — сначала проверить
 def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d_try: Optional[float] = None,
                 now: Optional[datetime] = None) -> Dict:
     """{"kind": "change" | "keep" | "wait" | "info" | "nodata", "head": крупная строка, "sub": [строки],
-    "warn": [предупреждения], "go": раздел, куда отправить (или None)}.
+    "warn": [предупреждения], "go": раздел, куда отправить (или None), "d_now": D сейчас, "d_rec": советуемое D,
+    "until": до какого времени ждать (для wait), "d_try": проверяемое D, "late": проход уже не поправить}.
 
     Правила работы (раздел 7.3), зашитые в совет:
       * совет отличается от текущего D меньше чем на 3 с — «D не менять»: это ≈ 0,5 п.п. на выходе, на уровне
@@ -435,24 +436,24 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
     if not st.ok or fc is None:
         go = RECIRC if st.burner_off else JOURNAL
         return {"kind": "nodata", "head": "Совета пока нет", "sub": [st.message or "Нет данных текущего прохода."],
-                "warn": [], "go": go}
+                "warn": [], "go": go, "d_now": st.d if st.ok else None, "d_rec": None}
     warn = ([fc.d_note[0].upper() + fc.d_note[1:]] if fc.d_note else []) + [w[0].upper() + w[1:] for w in fc.warnings]
     read = mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
     if st.recirc:
         return {"kind": "info", "head": "Идёт рециркуляция",
                 "sub": [f"Из силоса не подаётся — сколько досушивать, смотрите в разделе «{RECIRC}»."], "warn": warn,
-                "go": RECIRC}
+                "go": RECIRC, "d_now": st.d, "d_rec": None}
     sl = fc.silo
     if sl and sl["late"]:
         return {"kind": "info", "head": f"D для этого прохода уже не менять — {st.d:.0f} с",
                 "sub": [("До конца прохода выйдет только зерно, которое уже в шахте" if sl["m_tr"] >= 1 else
                          "Масса прохода уже выгружена")
                         + f": среднее по силосу ≈ {sl['avg']:.1f} %.", "Готовьте следующий проход."],
-                "warn": warn, "go": None}
+                "warn": warn, "go": None, "d_now": st.d, "d_rec": None, "late": True}
     if d_try:
         return {"kind": "info", "head": f"При D = {d_try:.0f} с на выходе ≈ {fc.w_out_rec:.1f} %",
                 "sub": [f"Влагомер покажет ≈ {read:.1f} %. Подобранное для цели {fc.w_goal:.1f} %: D = {fc.d_rec:.0f} с."],
-                "warn": warn, "go": None}
+                "warn": warn, "go": None, "d_now": st.d, "d_rec": fc.d_rec, "d_try": d_try}
     diff = fc.d_rec - st.d
     t_now = max(now, st.last) if now and st.last else (now or st.last)
     q_cur = mdl.q_at(p, st.d)
@@ -466,7 +467,7 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
                         f"цель {fc.w_goal:.1f} %."] + soon_line +
                        [f"Совет {fc.d_rec:.0f} с отличается меньше чем на {D_STEP_MIN:.0f} с — это ≈ 0,5 п.п. на "
                         f"выходе, на уровне точности влагомера."],
-                "warn": warn, "go": None}
+                "warn": warn, "go": None, "d_now": st.d, "d_rec": fc.d_rec}
     if st.d_changed_at is not None and t_now is not None:
         ready = st.d_changed_at + timedelta(hours=tau_cur / 2.0)
         if t_now < ready:
@@ -475,7 +476,7 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
                     "sub": [f"D меняли в {st.d_changed_at:%H:%M} ({st.d_prev:.0f} → {st.d:.0f} с); на выходе это станет "
                             f"видно к {seen:%H:%M}, а пока выходит зерно, которое сушилось при старом D."] + soon_line +
                            [f"Совет сейчас: D = {fc.d_rec:.0f} с — проверьте его после {ready:%H:%M}."],
-                    "warn": warn, "go": None}
+                    "warn": warn, "go": None, "d_now": st.d, "d_rec": fc.d_rec, "until": ready}
     sub = [f"Сейчас {st.d:.0f} с. На выходе станет ≈ {fc.w_out_rec:.1f} % (влагомер ≈ {read:.1f} %), "
            f"цель {fc.w_goal:.1f} %."]
     if fc.visible_at:
@@ -484,6 +485,7 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
     if soon:
         sub.append(f"При D = {fc.d_rec:.0f} влагомер на выходе: {soon}.")
     if abs(diff) > D_STEP_BIG:
-        sub.append("Большое изменение: сначала проверьте последнюю пробу входа, D и T блоков в журнале и задание "
-                   "слева; всё верно — меняйте, сомневаетесь — позвоните инженеру.")
-    return {"kind": "change", "head": f"Поставьте D = {fc.d_rec:.0f} с", "sub": sub, "warn": warn, "go": None}
+        warn = ["Большое изменение: сначала проверьте последнюю пробу входа, D и T блоков в журнале и задание "
+                "прохода; всё верно — меняйте, сомневаетесь — позвоните инженеру."] + warn
+    return {"kind": "change", "head": f"Поставьте D = {fc.d_rec:.0f} с", "sub": sub, "warn": warn, "go": None,
+            "d_now": st.d, "d_rec": fc.d_rec}
