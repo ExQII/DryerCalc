@@ -33,7 +33,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .model import DryerParams, pass_rate_arr, q_at, solve_out_arr, true_from_read
+from .model import DryerParams, d_at, pass_rate_arr, q_at, solve_out_arr, true_from_read
 
 FIELDS = ["ts", "w_in", "w_out", "t_a1", "t_a2", "t_up", "t_low", "d", "note", "batch", "pass_no", "t_amb", "rh"]
 TEXT_FIELDS = {"ts", "batch", "note"}
@@ -547,6 +547,65 @@ def _inlet_series(prep: List[Dict]) -> Dict[int, List[Tuple[float, float]]]:
     return ser
 
 
+def _regime_timeline(prep: List[Dict], p: DryerParams) -> Dict[int, List[Tuple]]:
+    """Режим по участкам журнала: [(t, Q, T, горелки выключены, D)] — от строки до следующей строки (D и T блоков в
+    строке действуют с момента записи и дальше, пустая клетка — прежнее значение)."""
+    out: Dict[int, List[Tuple]] = {}
+    for r in prep:
+        if r.get("dt") is None:
+            continue
+        d = r.get("d_f")
+        ok = d is not None and 0 < d <= 100
+        out.setdefault(r["seg"], []).append((r["t"], q_at(p, d) if ok else None, _t_proc(r, p.temp_source),
+                                             bool(r.get("burner_off")), d if ok else None))
+    return out
+
+
+def residence(timeline: List[Tuple], t_out: float, m_eff: float):
+    """Когда вошло зерно, которое выходит в момент t_out, и в каком режиме оно сушилось.
+
+    Шахта — плотный поток: порция проходит сушилку, пока через выгрузку не пройдёт масса m_eff (lag_k·вместимость),
+    поэтому момент входа t_in — такой, что ∫ Q(s) ds от t_in до t_out = m_eff, где Q(s) — производительность при D,
+    действовавшем в момент s. При постоянном D это t_out − m_eff/Q, как раньше; если D меняли, время в шахте другое,
+    а режим — смесь: средняя по времени T блоков за [t_in, t_out] и «действующая» Q = m_eff / (t_out − t_in).
+    Возвращает (t_in, τ, T_средняя или None, D — если за это время D не менялся, иначе None) или строку — причину,
+    почему посчитать нельзя."""
+    idx = -1
+    for k, row in enumerate(timeline):
+        if row[0] < t_out - 1e-12:
+            idx = k
+        else:
+            break
+    acc = 0.0
+    t_int = 0.0
+    t_known = 0.0
+    ds = set()
+    end = t_out
+    for j in range(idx, -1, -1):
+        t_j, q_j, temp_j, off_j = timeline[j][:4]
+        d_j = timeline[j][4] if len(timeline[j]) > 4 else None
+        dur = max(end - t_j, 0.0)
+        if dur > 0:
+            if q_j is None:
+                return "нет данных"
+            if off_j:
+                return "горелки выключались, пока зерно было в шахте"
+            ds.add(d_j)
+            part = dur
+            done = q_j > 0 and acc + q_j * dur >= m_eff - 1e-12
+            if done:
+                part = (m_eff - acc) / q_j
+            if temp_j is not None:
+                t_int += temp_j * part
+                t_known += part
+            if done:
+                t_in = end - part
+                return t_in, t_out - t_in, (t_int / t_known if t_known > 0 else None), (ds.pop() if len(ds) == 1 else None)
+            acc += q_j * dur
+        end = t_j
+    return "ещё идёт прежнее зерно"
+
+
 def _interp_inlet(points: List[Tuple[float, float]], t: float) -> Optional[float]:
     if not points:
         return None
@@ -565,6 +624,8 @@ def observe_all(rows: List[Dict], p: DryerParams, use_lag: Optional[bool] = None
     prep, reliable = prepare(rows)
     lag = reliable if use_lag is None else (use_lag and reliable)
     series = _inlet_series(prep)
+    m_eff = p.lag_k * p.m_dryer
+    timeline = _regime_timeline(prep, p) if lag and m_eff > 0 else {}
     obs: List[Dict] = []
     skipped: Dict[str, int] = {}
 
@@ -584,15 +645,32 @@ def observe_all(rows: List[Dict], p: DryerParams, use_lag: Optional[bool] = None
             skip("вне диапазона")
             continue
         q = q_at(p, d)
-        tau = p.lag_k * p.m_dryer / q if lag and q > 0 else 0.0
-        if lag:
-            w_in = _interp_inlet(series.get(r["seg"], []), r["t"] - tau)
+        t_proc = _t_proc(r, p.temp_source)
+        mixed = False
+        if lag and m_eff > 0:
+            # режим, в котором сушилось зерно, выходящее сейчас: все D и T блоков за время его прохода через шахту
+            res = residence(timeline.get(r["seg"], []), r["t"], m_eff)
+            if isinstance(res, str):
+                skip(res)
+                continue
+            t_in, tau, t_mean, d_single = res
+            mixed = d_single is None
+            if mixed:                       # D менялся, пока зерно шло через шахту: «действующая» Q по времени в шахте
+                q = m_eff / tau
+                d = d_at(p, q)
+            elif d_single is not None:      # D не менялся — тот, при котором зерно шло (а не записанный в строке пробы)
+                d = d_single
+                q = q_at(p, d)
+            if t_mean is not None:
+                t_proc = t_mean
+            w_in = _interp_inlet(series.get(r["seg"], []), t_in)
+        elif lag:
+            w_in = _interp_inlet(series.get(r["seg"], []), r["t"])
         else:
             w_in = r.get("w_in")
         if w_in is None:
             skip("ещё идёт прежнее зерно" if lag else "нет входа")
             continue
-        t_proc = _t_proc(r, p.temp_source)
         if t_proc is None:
             skip("нет температуры")
             continue
@@ -609,7 +687,7 @@ def observe_all(rows: List[Dict], p: DryerParams, use_lag: Optional[bool] = None
             "t_amb": p.t_amb_ref if t_amb is None else t_amb,
             "rh": p.rh_ref if rh is None else rh,
             "has_amb": t_amb is not None, "has_rh": rh is not None,
-            "seg": r["seg"], "dt": r["dt"], "t": r["t"],
+            "seg": r["seg"], "dt": r["dt"], "t": r["t"], "d_now": r.get("d_f"), "mixed": mixed,
         })
     return obs, skipped, lag
 
@@ -961,7 +1039,9 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
     lines = [
         f"Строк в журнале: {n_rows}; использовано: {len(used)}; выбросов: {n_out}; "
         f"отброшено: {sum(skipped.values())}{skipped_txt}",
-        ("Лаг выхода от входа учтён: τ = %.1f ч при D=35." % (p.lag_k * p.m_dryer / max(q_at(p, 35), 1e-9)))
+        ("Лаг выхода от входа учтён: τ = %.1f ч при D=35; каждая проба выхода сравнивается с режимом за весь путь "
+         "этого зерна через шахту (D менялся по пути у %d из %d строк)."
+         % (p.lag_k * p.m_dryer / max(q_at(p, 35), 1e-9), sum(1 for o in used if o.get("mixed")), len(used)))
         if lag else "Времени в журнале нет или оно не распознано: лаг не учитывается (вход и выход берутся из одной строки).",
         (f"Наружная T/RH есть у {n_amb} из {len(used)} строк (журнал + таблица погоды)." if n_amb else
          "Наружной T/RH нет ни в журнале, ни в таблице погоды: взяты опорные 10 °C / 70 %."),

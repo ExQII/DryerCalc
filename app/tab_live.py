@@ -12,10 +12,10 @@ from typing import TYPE_CHECKING, Optional
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush
 from PySide6.QtWidgets import (QApplication, QCheckBox, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
-                               QPushButton, QSplitter, QVBoxLayout, QWidget)
+                               QPushButton, QScrollArea, QSplitter, QVBoxLayout, QWidget)
 
 from . import model as mdl
-from .live import LiveState, live_advice, live_forecast, live_state
+from .live import LiveState, live_advice, live_forecast, live_state, outlet_soon
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import Collapsible, Tile, scroll_wrap, dspin, fmt_hours, fnum, item, table
@@ -152,7 +152,12 @@ class LiveTab(QWidget):
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.RichText)
-        self.details = Collapsible("Подробнее: силос, допуск, расчёт", self.summary)
+        sc = QScrollArea()                 # полный текст расчёта длинный — в прокрутке, чтобы не обрезался
+        sc.setWidget(self.summary)
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setMinimumHeight(170)
+        self.details = Collapsible("Подробнее: силос, ближайшие часы, допуск, расчёт", sc)
         tv.addWidget(self.details)
         tv.addWidget(QLabel("Что будет при другом D (вход и температура — как сейчас)"))
         self.tbl = table(["D, с", "Q, т/ч", "W вых, %", "Влагомер покажет, %", "Съём, п.п.", "Видно через, ч",
@@ -349,6 +354,10 @@ class LiveTab(QWidget):
             lines.append(f"<span style='color:{th.error}'>{fc.d_note}.</span>")
         if fc.visible_at:
             lines.append(f"Изменение D будет видно на выходе через <b>{fc.tau_h:.1f} ч</b> — к {fc.visible_at:%d.%m %H:%M}.")
+        soon = self._soon(p, st, fc)
+        if soon:
+            lines.append(f"На выходе в ближайшие часы (влагомер): {soon}. Это зерно уже в шахте — прогноз учитывает "
+                         f"все D и T блоков, при которых оно шло, и новое D до выхода.")
         if fc.pass_end:
             rem = "проход фактически закончен (выгружено больше расчётной массы)" if fc.remaining <= 0.05 else \
                 f"осталось выгрузить {fc.remaining:.0f} т"
@@ -372,14 +381,20 @@ class LiveTab(QWidget):
 
         self._table(p, st, fc, c, d_use, now, th, target_read)
 
+    def _soon(self, p, st, fc, hours=(1.0, 2.0)) -> str:
+        return outlet_soon(p, st, fc, hours)
+
     def _fill_tiles(self, p, st, fc, target_read: float) -> None:
         goal_read = mdl.read_from_true(p, fc.w_goal, st.t_grain)
         if st.w_out_read is not None:
             dev = st.w_out_read - goal_read
+            soon = self._soon(p, st, fc, (1.0,))
             self.t_out.set(f"{st.w_out_read:.1f} %",
-                           (f"проба {st.last_sample:%H:%M} · " if st.last_sample else "") + f"от цели {dev:+.1f} п.п.",
+                           (f"проба {st.last_sample:%H:%M} · " if st.last_sample else "") + f"от цели {dev:+.1f} п.п."
+                           + (f" · {soon}" if soon else ""),
                            "Последняя проба выходного влагомера (как показал прибор) и её отличие от цели прохода на "
-                           "влагомере.")
+                           "влагомере; «через 1 ч» — прогноз по зерну, которое уже в шахте (со всеми режимами, при "
+                           "которых оно шло).")
         else:
             self.t_out.set("—", "проб выхода ещё нет")
         sub = f"после охлаждения {self.w_target.value():g} %"
@@ -457,9 +472,15 @@ class LiveTab(QWidget):
         self.plot.add_points(xs_in, ys_in, "ref", 6)
         self.plot.add_points(xs_out, ys_out, "dot", 7)
         self.plot.add_hline(mdl.read_from_true(p, fc.w_goal, st.t_grain), "target")
-        if fc.visible_at:
+        tr = fc.transit
+        steady = mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
+        if tr is not None and len(tr["t"]):
+            # ожидаемый выход по часам: зерно, которое уже в шахте (с его историей), затем новое зерно при этом D
+            xs = [(x - st.start).total_seconds() / 3600.0 for x in tr["t"]]
+            ys = [mdl.read_from_true(p, float(w), st.t_grain) for w in tr["w"]]
+            self.plot.add_line(xs + [xs[-1], xs[-1] + max(1.0, 0.3 * (xs[-1] - xs[0]))], ys + [steady, steady], "line", 3)
+        elif fc.visible_at:
             h0 = (fc.visible_at - st.start).total_seconds() / 3600.0
-            self.plot.add_line([h0, h0 + max(fc.tau_h, 1.0)], [mdl.read_from_true(p, fc.w_out_rec, st.t_grain)] * 2,
-                               "line", 3)
+            self.plot.add_line([h0, h0 + max(fc.tau_h, 1.0)], [steady] * 2, "line", 3)
         self.plot.set_title("серые — вход, синие — выход по влагомеру; красная — цель на влагомере сейчас; "
-                            "отрезок — ожидаемый выход после смены D")
+                            "линия — ожидаемый выход по часам при этом D")

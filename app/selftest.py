@@ -296,6 +296,11 @@ def run(out_path: str) -> int:
         check(bool(_adv.get("head")) and win.tab_live.lbl_head.text() == _adv["head"]
               and win.tab_live.t_pass.lbl_value.text() not in ("", "—") and _nav.lbl_title.text() == _pages.LIVE,
               f"«{_pages.LIVE}»: «{_adv.get('head', '?')}», конец прохода {win.tab_live.t_pass.lbl_value.text()}")
+        from .live import outlet_soon as _soon
+        _fc = win.tab_live.fc
+        _txt = _soon(win.params, win.tab_live.state, _fc) if _fc is not None else ""
+        check(_fc is not None and _fc.transit is not None and bool(_txt),
+              f"прогноз выхода по зерну в шахте (все режимы за его путь): {_txt or 'не посчитан'}")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

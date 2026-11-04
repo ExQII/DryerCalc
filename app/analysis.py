@@ -262,14 +262,23 @@ def combine_meter(pair_res: Dict, points: Sequence[Dict], use_batches: bool = Tr
     return res
 
 
+RATE_SIGMA_PRIOR = (0.05, 3)    # стартовая ошибка скорости сушки 5 % «весит» как 3 прохода
+
+
 def rate_sigma_from_backtest(bt: Dict, model_kind: str) -> Optional[Tuple[float, int]]:
-    """Относительная ошибка прогноза съёма (СКО) по проходам, где был честный прогноз; ≥ 3 прохода."""
+    """Относительная ошибка прогноза съёма (СКО) по проходам, где был честный прогноз; ≥ 3 прохода.
+
+    По 3–5 проходам СКО само по себе ненадёжно (три удачных прохода дают ±1 %, а следующий может ошибиться на 5 %),
+    поэтому оно сглаживается к стартовым 5 % с весом трёх проходов: σ² = (n·s² + 3·0,05²) / (n + 3). С ростом журнала
+    вес данных растёт, и допуск сходится к ошибке на ваших проходах."""
     key = "fc_phys" if model_kind == "physics" else "fc_emp"
     rel = [(r[key] - r["dw_obs"]) / r["dw_obs"] for r in bt.get("rows", []) if r.get(key) is not None and r["dw_obs"] > 0.5]
     if len(rel) < 3:
         return None
-    sig = math.sqrt(sum(e * e for e in rel) / len(rel))
-    return min(max(sig, 0.02), 0.30), len(rel)
+    n = len(rel)
+    s0, n0 = RATE_SIGMA_PRIOR
+    sig = math.sqrt((sum(e * e for e in rel) + n0 * s0 * s0) / (n + n0))
+    return min(max(sig, 0.02), 0.30), n
 
 
 # ----------------------------------------------------------------------------

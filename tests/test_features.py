@@ -924,6 +924,101 @@ def test_nav_panel_sections_and_operator_visibility():
 
 
 # ---------------------------------------------------------------------------
+# v0.9.1: все режимы за время прохода зерна через шахту, а не только последний
+# ---------------------------------------------------------------------------
+
+def _plug_flow_journal(truth, until_h=14.0, change_d=(6.0, 50), change_t=(8.0, 70), step_t=0.5, minutes=2):
+    """«Истинная» сушилка = модель truth, но зерно идёт плотным потоком порциями, у каждой — своя история режимов.
+    D 35 → 50 в 06:00, T блоков 60 → 70 в 08:00. Возвращает (журнал проб каждые 30 мин, функция «истина на выходе»)."""
+    import numpy as np
+    from app.model import d_at, q_at, read_from_true, solve_out_arr
+    t0 = datetime(2026, 10, 25, 0, 0)
+
+    def regime(t):
+        h = (t - t0).total_seconds() / 3600
+        return (35 if h < change_d[0] else change_d[1]), (60 if h < change_t[0] else change_t[1])
+    m_shaft = truth.lag_k * truth.m_dryer
+    tau0 = m_shaft / q_at(truth, 35)
+    parcels = [{"ahead": (k + 0.5) * step_t, "w_in": 30.0, "h": tau0 * (1 - (k + 0.5) * step_t / m_shaft)}
+               for k in range(int(m_shaft / step_t))]
+    for pc in parcels:
+        pc["Ti"] = 60 * pc["h"]
+    inflow = lambda t: 30.0 + 2.0 * math.sin((t - t0).total_seconds() / 3600 / 3)  # noqa: E731
+    exited, t, dt_h = [], t0, minutes / 60
+    while t < t0 + timedelta(hours=until_h + 3):
+        d, temp = regime(t)
+        dm = q_at(truth, d) * dt_h
+        for pc in parcels:
+            pc["ahead"] -= dm
+            pc["h"] += dt_h
+            pc["Ti"] += temp * dt_h
+        for pc in [x for x in parcels if x["ahead"] <= 0]:
+            w, _ = solve_out_arr(truth, np.array([pc["w_in"]]), np.array([d_at(truth, m_shaft / pc["h"])]),
+                                 np.array([pc["Ti"] / pc["h"]]), np.array([10.0]), np.array([70.0]))
+            exited.append((t, float(w[0])))
+        parcels = [x for x in parcels if x["ahead"] > 0]
+        parcels.append({"ahead": (parcels[-1]["ahead"] if parcels else 0) + dm, "w_in": inflow(t), "h": 0.0, "Ti": 0.0})
+        t += timedelta(minutes=minutes)
+
+    def truth_at(tk):
+        return min(exited, key=lambda e: abs((e[0] - tk).total_seconds()))[1]
+    jr = [{"ts": t0.strftime("%d.%m.%y %H:%M"), "w_in": None, "w_out": None, "t_a1": None, "t_a2": None, "t_up": 60,
+           "t_low": 60, "d": 35, "note": "Запуск", "batch": "S", "pass_no": 1, "t_amb": None, "rh": None}]
+    for k in range(1, int(until_h * 2) + 1):
+        tk = t0 + timedelta(minutes=30 * k)
+        d, temp = regime(tk)
+        jr.append({"ts": tk.strftime("%d.%m.%y %H:%M"), "w_in": round(inflow(tk), 1),
+                   "w_out": round(read_from_true(truth, truth_at(tk)), 1), "t_a1": None, "t_a2": None, "t_up": temp,
+                   "t_low": temp, "d": d, "note": "", "batch": "S", "pass_no": 1, "t_amb": None, "rh": None})
+    return jr, truth_at, regime
+
+
+def test_residence_follows_all_regimes_in_the_shaft():
+    """Проба выхода сопоставляется с режимом, при котором это зерно сушилось (все D и T блоков за его путь через
+    шахту), а не с D в строке пробы. На «идеальной» сушилке (истина = модель) ошибка после смены D и T — на уровне
+    округления проб, а прежнее сопоставление давало до 2,5 п.п."""
+    from app.calibration import observe_all, predict_out, residence
+    truth, _ = calibrate(_sample_rows(), P)
+    jr, _truth_at, _ = _plug_flow_journal(truth)
+    obs, _sk, _ = observe_all(jr, truth)
+    w_pred, _ = predict_out(truth, obs)
+    errs = [abs(float(a) - o["w_out"]) for a, o in zip(w_pred, obs)]
+    assert len(obs) >= 18 and max(errs) < 0.15
+    assert any(o["mixed"] for o in obs) and all(o["d_now"] == 50 for o in obs if o["mixed"])
+    # чистая функция: постоянный D — как раньше (t − M/Q); смена D — время в шахте другое; охлаждение — нельзя
+    tl = [(0.0, 20.0, 60.0, False, 35), (2.0, 30.0, 70.0, False, 50)]
+    t_in, tau, t_mean, d1 = residence(tl, 1.5, 20.0)
+    assert abs(t_in - 0.5) < 1e-9 and d1 == 35 and abs(t_mean - 60.0) < 1e-9
+    t_in, tau, t_mean, d2 = residence(tl, 3.0, 40.0)      # 30 т при D 50 за 1 ч + 10 т при D 35 за 0,5 ч
+    assert abs(t_in - 1.5) < 1e-9 and abs(tau - 1.5) < 1e-9 and d2 is None and abs(t_mean - (70 + 60 * 0.5) / 1.5) < 1e-9
+    assert residence(tl, 1.0, 60.0) == "ещё идёт прежнее зерно"
+    assert residence([(0.0, 20.0, 60.0, True, 35), (2.0, 20.0, 60.0, False, 35)], 3.0, 30.0).startswith("горелки")
+
+
+def test_transit_profile_predicts_outlet_of_grain_in_shaft():
+    """«Текущий проход»: что выйдет в ближайшие часы — по истории каждой порции в шахте. В 09:00 (через 3 ч после
+    смены D и 1 ч после смены T) прогноз совпадает с «истиной» до 0,2 п.п.; прежнее допущение «всё в шахте выйдет как
+    при текущем режиме» ошибалось на 1,2 п.п."""
+    import numpy as np
+    from app.live import transit_profile
+    from app.model import solve_pass
+    truth, _ = calibrate(_sample_rows(), P)
+    jr, truth_at, regime = _plug_flow_journal(truth, until_h=9.0)
+    st = live_state(jr, truth)
+    d, temp = regime(st.last)
+    c = Conditions(temp, 10.0, 70.0)
+    prof = transit_profile(truth, st, c, d, st.corr, st.last)
+    hs = [(x - st.last).total_seconds() / 3600 for x in prof["t"]]
+    old = solve_pass(truth, c, st.w_in, 1.0, d).w_out + st.corr
+    new_err, old_err = [], []
+    for h in (0.5, 1.0, 1.5, 2.0):
+        real = truth_at(st.last + timedelta(hours=h))
+        new_err.append(abs(float(np.interp(h, hs, prof["w"])) - real))
+        old_err.append(abs(old - real))
+    assert prof["known"].all() and max(new_err) < 0.2 and max(old_err) > 1.0
+
+
+# ---------------------------------------------------------------------------
 # «Правила работы» (docs/rules_ru.txt): то, что там написано о разборе журнала, должно оставаться правдой.
 # Если тест упал после изменения программы — обновите разделы 4–8, 10 и 20 правил.
 # ---------------------------------------------------------------------------

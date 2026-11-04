@@ -52,6 +52,8 @@ class LiveState:
     d_changed_at: Optional[datetime] = None   # когда в этом проходе последний раз меняли D (строка с новым D)
     d_prev: Optional[float] = None            # каким D было до этого
     last_sample: Optional[datetime] = None    # время последней пробы выхода
+    regime: List[Tuple] = field(default_factory=list)   # весь журнал: (время, Q, T, идёт ли выгрузка, D) от строки дальше
+    inlet: List[Tuple[datetime, float]] = field(default_factory=list)   # весь журнал: (время, влажность на входе)
     series: List[Tuple[datetime, Optional[float], Optional[float]]] = field(default_factory=list)  # (t, вход, выход)
 
 
@@ -133,6 +135,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
     st.unloaded = unloaded
     if rd and unloaded > 0:
         st.silo_w, st.silo_w_read, st.silo_n = silo_sum / unloaded, silo_sum_read / unloaded, len(rd)
+    st.regime, st.inlet = _journal_regime(prep, p)
     st.recirc = bool(rs[-1].get("recirc"))
     st.burner_off = bool(rs[-1].get("burner_off"))
     st.hours = (end - st.start).total_seconds() / 3600.0
@@ -159,6 +162,115 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
     return st
 
 
+def _journal_regime(prep: List[Dict], p: mdl.DryerParams) -> Tuple[List[Tuple], List[Tuple[datetime, float]]]:
+    """Весь журнал по времени: режим [(время, Q, T блоков, идёт ли выгрузка, D)] — от строки до следующей — и вход
+    [(время, W)]. Во время остановки, охлаждения и рециркуляции зерно в шахте не движется к выходу из силоса
+    (выгрузка = 0) и не сушится в учёт времени прохода."""
+    from .calibration import STOP_STEMS, _t_proc
+    tl: List[Tuple] = []
+    inlet: List[Tuple[datetime, float]] = []
+    stopped = False
+    for r in prep:
+        if r.get("dt") is None:
+            continue
+        note = (r.get("note") or "").lower()
+        if any(w in note for w in STOP_STEMS):
+            stopped = True
+        elif "запуск" in note:
+            stopped = False
+        d = r.get("d_f")
+        ok = d is not None and 0 < d <= 100
+        running = ok and not stopped and not r.get("burner_off") and not r.get("recirc")
+        tl.append((r["dt"], mdl.q_at(p, d) if ok else None, _t_proc(r, p.temp_source), running, d if ok else None))
+        if r.get("w_in") is not None and not r.get("recirc"):
+            inlet.append((r["dt"], r["w_in"]))
+    return tl, inlet
+
+
+def _walk_back(tl: List[Tuple], t_now: datetime, mass: float, times: Optional[List[datetime]] = None):
+    """Порция, за которой с момента её входа выгружено mass т: (вход, часов сушки, ∫T dt по известной T, часов с
+    известной T, D — если он не менялся, иначе None) или None — журнала не хватает (зашла раньше первой записи)."""
+    import bisect
+    times = times if times is not None else [row[0] for row in tl]
+    idx = bisect.bisect_right(times, t_now) - 1
+    acc = h_run = t_int = t_known = 0.0
+    ds = set()
+    end = t_now
+    for j in range(idx, -1, -1):
+        t_j, q_j, temp_j, run_j, d_j = tl[j]
+        dur = max((end - t_j).total_seconds() / 3600.0, 0.0)
+        end = t_j
+        if dur <= 0 or not run_j:
+            continue                      # остановка / охлаждение / рециркуляция: зерно стоит, время не считаем
+        if q_j is None or q_j <= 0:
+            return None
+        ds.add(d_j)
+        part = dur
+        done = acc + q_j * dur >= mass - 1e-12
+        if done:
+            part = (mass - acc) / q_j
+        h_run += part
+        if temp_j is not None:
+            t_int += temp_j * part
+            t_known += part
+        if done:
+            return t_j + timedelta(hours=dur - part), h_run, t_int, t_known, (ds.pop() if len(ds) == 1 else None)
+        acc += q_j * dur
+    return None
+
+
+def transit_profile(p: mdl.DryerParams, st: LiveState, c: mdl.Conditions, d_future: float, corr: float,
+                    t_now: datetime, n: int = 24) -> Optional[Dict]:
+    """Что выйдет из шахты в ближайшие часы — с учётом ВСЕХ режимов, которые зерно уже прошло.
+
+    Шахта — плотный поток массы M = lag_k·вместимость, порезанный на n порций. У каждой порции своя история: когда
+    вошла (по журналу: с её входа через выгрузку прошло M − «масса впереди»), с какой влажностью (вход в тот момент),
+    сколько часов и при какой T блоков уже сушилась — по всем D и T блоков, записанным за это время. Дальше она
+    идёт при D = d_future и T = c.t_proc и выходит через «масса впереди» / Q(d_future) часов. Её влажность на выходе —
+    по модели с «действующим» режимом всего пути: Q = M / (время в шахте), T — средняя по времени (то же, что при
+    калибровке, calibration.residence). Поэтому смена D действует и на зерно, уже находящееся в шахте: при большем D
+    оно идёт быстрее и досушивается меньше.
+    Возвращает {"t": время выхода порций, "w": истинная влажность на выходе, "w_in", "m": масса впереди, т,
+    "known": порции, историю которых удалось восстановить по журналу} или None."""
+    m_shaft = p.lag_k * p.m_dryer
+    q_f = mdl.q_at(p, d_future)
+    if m_shaft <= 0 or q_f <= 0 or not st.regime or not st.inlet:
+        return None
+    m_ahead = (np.arange(n) + 0.5) * m_shaft / n
+    h_fut = m_ahead / q_f
+    in_t = np.array([(t - t_now).total_seconds() / 3600.0 for t, _ in st.inlet])
+    in_w = np.array([w for _, w in st.inlet])
+    w_in = np.empty(n)
+    d_eff = np.empty(n)
+    t_eff = np.empty(n)
+    known = np.zeros(n, dtype=bool)
+    times = [row[0] for row in st.regime]
+    for j in range(n):
+        wb = _walk_back(st.regime, t_now, m_shaft - m_ahead[j], times)
+        if wb is None:                     # журнала не хватает — как будто вошла сейчас и идёт при новом режиме
+            w_in[j], d_eff[j], t_eff[j] = st.w_in, d_future, c.t_proc
+            continue
+        t_in, h_past, t_int, t_known, d_same = wb
+        tau = h_past + h_fut[j]
+        w_in[j] = float(np.interp((t_in - t_now).total_seconds() / 3600.0, in_t, in_w))
+        d_eff[j] = d_future if d_same is not None and abs(d_same - d_future) < 1e-9 else mdl.d_at(p, m_shaft / tau)
+        t_eff[j] = (t_int + c.t_proc * (tau - t_known)) / tau
+        known[j] = True
+    w_out, _ = mdl.solve_out_arr(p, w_in, d_eff, t_eff, c.t_amb, c.rh)
+    return {"t": [t_now + timedelta(hours=float(h)) for h in h_fut], "w": w_out + corr, "w_in": w_in, "m": m_ahead,
+            "known": known, "d": d_future}
+
+
+def _transit_mean(prof: Optional[Dict], m_tr: float, fallback: float) -> float:
+    """Средняя влажность первых m_tr тонн, которые выйдут из шахты (порции равной массы)."""
+    if prof is None or m_tr <= 0:
+        return fallback
+    m = prof["m"]
+    step = m[0] * 2.0
+    weights = np.clip((m_tr - (m - 0.5 * step)) / step, 0.0, 1.0)
+    return float(np.sum(prof["w"] * weights) / np.sum(weights)) if np.sum(weights) > 0 else fallback
+
+
 @dataclass
 class LiveForecast:
     w_out_now: float = 0.0          # истинная на выходе при текущем D (с поправкой)
@@ -179,6 +291,7 @@ class LiveForecast:
     w_goal: float = 0.0                    # на какую влажность подбирается D (цель прохода или поправленная по силосу)
     silo: Optional[Dict] = None            # выравнивание средней влажности приёмного силоса (см. live_forecast)
     t_grain_est: float = 0.0
+    transit: Optional[Dict] = None         # что выйдет из шахты в ближайшие часы при выбранном D (transit_profile)
     warnings: List[str] = field(default_factory=list)
 
 
@@ -200,9 +313,20 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
     corr = st.corr if use_corr else 0.0
     w_in = st.w_in
     d_now = st.d
+    t_now = max(now, st.last) if now else st.last
     fc.w_out_now = mdl.solve_pass(p, c, w_in, 1.0, d_now).w_out + corr
     fc.w_out_now_read = mdl.read_from_true(p, fc.w_out_now, st.t_grain)
+
+    def choose_d(w_goal_: float) -> Tuple[float, float, str]:
+        raw_ = mdl.d_for_target(p, c, w_in, w_goal_ - corr)
+        if raw_ > 100.5:
+            return 100.0, raw_, "даже при D = 100 снимется больше, чем нужно — цель прохода можно поставить ниже"
+        if raw_ < 1.0:
+            return 1.0, raw_, "сушилка не успевает: даже при D = 1 цель прохода не достигается"
+        return float(round(raw_)), raw_, ""
+
     w_goal = w_target
+    fc.d_rec, fc.d_rec_raw, fc.d_note = choose_d(w_goal)
     if silo and st.silo_w is not None and st.unloaded > 1.0:
         m_total = m_pass * (100.0 - w_in) / (100.0 - w_target)
         m_done = st.unloaded
@@ -212,22 +336,25 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
         fc.silo = {"m_total": m_total, "m_done": m_done, "w_done": st.silo_w, "w_done_read": st.silo_w_read,
                    "m_tr": m_tr, "w_tr": fc.w_out_now, "m_new": m_new, "need": None, "limited": False,
                    "late": m_new < max(0.05 * m_total, 5.0), "lim": silo_lim}
-        if not fc.silo["late"]:
-            need = (w_target * m_total - st.silo_w * m_done - fc.w_out_now * m_tr) / m_new
+        # зерно, которое уже в шахте, выйдет с влажностью по своей истории (все режимы за его путь) и по новому D:
+        # при другом D оно пойдёт быстрее или медленнее. Поэтому D и цель для нового зерна уточняются по кругу.
+        d_try_ = d_override if d_override else (fc.d_rec if not fc.silo["late"] else d_now)
+        for _ in range(4):
+            prof = transit_profile(p, st, c, d_try_, corr, t_now)
+            w_tr = _transit_mean(prof, m_tr, fc.w_out_now)
+            fc.silo["w_tr"] = w_tr
+            if fc.silo["late"]:
+                break
+            need = (w_target * m_total - st.silo_w * m_done - w_tr * m_tr) / m_new
             w_goal = min(max(need, w_target - silo_lim), w_target + silo_lim)
             fc.silo.update(need=need, limited=abs(need - w_goal) > 0.05)
+            fc.d_rec, fc.d_rec_raw, fc.d_note = choose_d(w_goal)
+            if d_override or abs(fc.d_rec - d_try_) < 0.5:
+                break
+            d_try_ = fc.d_rec
     fc.w_goal = w_goal
-    raw = mdl.d_for_target(p, c, w_in, w_goal - corr)
-    fc.d_rec_raw = raw
-    if raw > 100.5:
-        fc.d_rec = 100.0
-        fc.d_note = "даже при D = 100 снимется больше, чем нужно — цель прохода можно поставить ниже"
-    elif raw < 1.0:
-        fc.d_rec = 1.0
-        fc.d_note = "сушилка не успевает: даже при D = 1 цель прохода не достигается"
-    else:
-        fc.d_rec = float(round(raw))
     d_use = d_override if d_override else fc.d_rec
+    fc.transit = transit_profile(p, st, c, d_use, corr, t_now)
     fc.w_out_rec = mdl.solve_pass(p, c, w_in, 1.0, d_use).w_out + corr
     if fc.silo:
         sl = fc.silo
@@ -236,7 +363,6 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
             sl["m_done"] + sl["m_tr"] + max(sl["m_new"], 0.0), 1e-9)
     q_new = mdl.q_at(p, d_use)
     fc.tau_h = p.lag_k * p.m_dryer / q_new if q_new > 0 else float("inf")
-    t_now = max(now, st.last) if now else st.last
     fc.visible_at = t_now + timedelta(hours=fc.tau_h) if fc.tau_h < 1e6 else None
     # остаток прохода: масса на выходе прохода по ожидаемой влажности (с выравниванием — средняя по силосу)
     w_pass_out = fc.silo["avg"] if fc.silo else fc.w_out_rec
@@ -271,6 +397,19 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
     if dw > hard + 1e-9:
         fc.warnings.append(f"съём за проход {dw:.1f} п.п. больше допустимого {hard:g}")
     return fc
+
+
+def outlet_soon(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], hours=(1.0, 2.0)) -> str:
+    """«через 1 ч ≈ 23,4 %, через 2 ч ≈ 23,9 %» — что покажет выходной влагомер по прогнозу зерна, которое уже в
+    шахте (transit_profile: все режимы, при которых оно шло, и выбранное D до выхода)."""
+    tr = fc.transit if fc is not None else None
+    if tr is None or not len(tr["t"]):
+        return ""
+    step = (tr["t"][1] - tr["t"][0]) if len(tr["t"]) > 1 else timedelta(0)
+    t0 = tr["t"][0] - step / 2
+    hs = [(x - t0).total_seconds() / 3600.0 for x in tr["t"]]
+    return ", ".join(f"через {h:g} ч ≈ {mdl.read_from_true(p, float(np.interp(h, hs, tr['w'])), st.t_grain):.1f} %"
+                     for h in hours if h <= hs[-1])
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -318,11 +457,14 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
     t_now = max(now, st.last) if now and st.last else (now or st.last)
     q_cur = mdl.q_at(p, st.d)
     tau_cur = p.lag_k * p.m_dryer / q_cur if q_cur > 0 else 0.0
+    soon = outlet_soon(p, st, fc)
+    soon_line = [f"Влагомер на выходе: {soon} (зерно уже в шахте, со всеми режимами за его путь)."] if soon else []
     if abs(diff) < D_STEP_MIN:
         w_now_read = fc.w_out_now_read
         return {"kind": "keep", "head": f"D не менять — {st.d:.0f} с",
-                "sub": [f"На выходе ≈ {fc.w_out_now:.1f} % (влагомер ≈ {w_now_read:.1f} %), цель {fc.w_goal:.1f} %.",
-                        f"Совет {fc.d_rec:.0f} с отличается меньше чем на {D_STEP_MIN:.0f} с — это ≈ 0,5 п.п. на "
+                "sub": [f"Зерно, которое входит сейчас, выйдет ≈ {fc.w_out_now:.1f} % (влагомер ≈ {w_now_read:.1f} %), "
+                        f"цель {fc.w_goal:.1f} %."] + soon_line +
+                       [f"Совет {fc.d_rec:.0f} с отличается меньше чем на {D_STEP_MIN:.0f} с — это ≈ 0,5 п.п. на "
                         f"выходе, на уровне точности влагомера."],
                 "warn": warn, "go": None}
     if st.d_changed_at is not None and t_now is not None:
@@ -331,14 +473,16 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
             seen = st.d_changed_at + timedelta(hours=tau_cur)
             return {"kind": "wait", "head": f"Подождите до {ready:%H:%M} — D не трогать",
                     "sub": [f"D меняли в {st.d_changed_at:%H:%M} ({st.d_prev:.0f} → {st.d:.0f} с); на выходе это станет "
-                            f"видно к {seen:%H:%M}, а пока выходит зерно, которое сушилось при старом D.",
-                            f"Совет сейчас: D = {fc.d_rec:.0f} с — проверьте его после {ready:%H:%M}."],
+                            f"видно к {seen:%H:%M}, а пока выходит зерно, которое сушилось при старом D."] + soon_line +
+                           [f"Совет сейчас: D = {fc.d_rec:.0f} с — проверьте его после {ready:%H:%M}."],
                     "warn": warn, "go": None}
     sub = [f"Сейчас {st.d:.0f} с. На выходе станет ≈ {fc.w_out_rec:.1f} % (влагомер ≈ {read:.1f} %), "
            f"цель {fc.w_goal:.1f} %."]
     if fc.visible_at:
         sub.append(f"Заметно на выходе через {fc.tau_h:.1f} ч — к {fc.visible_at:%H:%M}. После смены запишите её: "
                    f"«Изменить режим…» в журнале.")
+    if soon:
+        sub.append(f"При D = {fc.d_rec:.0f} влагомер на выходе: {soon}.")
     if abs(diff) > D_STEP_BIG:
         sub.append("Большое изменение: сначала проверьте последнюю пробу входа, D и T блоков в журнале и задание "
                    "слева; всё верно — меняйте, сомневаетесь — позвоните инженеру.")
