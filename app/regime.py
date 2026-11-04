@@ -191,7 +191,7 @@ def _make_dialog_class():
                 self.ed[k] = le
                 form.addRow({"d": "Разгрузка D, с", "t_up": "T блока 1, °C", "t_low": "T блока 2, °C"}[k], le)
             self.comment = QLineEdit()
-            self.comment.setPlaceholderText("необязательно: почему, например «по «Сейчас»»")
+            self.comment.setPlaceholderText("необязательно: почему, например «по совету»")
             form.addRow("Комментарий", self.comment)
             lay.addLayout(form)
             self.preview = QLabel()

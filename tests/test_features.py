@@ -824,6 +824,106 @@ def test_quick_entry_follows_journal_edits_in_window():
 
 
 # ---------------------------------------------------------------------------
+# v0.9: боковое меню и «Текущий проход» с одним действием
+# ---------------------------------------------------------------------------
+
+def _live_rows(d_late=None, change_at=None, note_last=""):
+    def r(ts, wi=None, wo=None, d=35, note=""):
+        return {"ts": "25.10.26 " + ts, "w_in": wi, "w_out": wo, "t_a1": 29 if wo else None, "t_a2": 33 if wo else None,
+                "t_up": 60, "t_low": 55, "d": d, "note": note, "batch": "К-07", "pass_no": 1, "t_amb": None, "rh": None}
+    rows = [r("08:00", note="Запуск")]
+    for i in range(12):
+        h, m = 8 + (i + 1) // 2, 30 * ((i + 1) % 2)
+        ts = f"{h:02d}:{m:02d}"
+        d = d_late if (change_at is not None and ts >= change_at) else 35
+        rows.append(r(ts, 30.0, 23.0, d))
+    if note_last:
+        rows.append(r("14:05", note=note_last, d=rows[-1]["d"]))
+    return rows
+
+
+def test_live_advice_follows_operating_rules():
+    """Совет на «Текущем проходе» — правила работы 7.3: < 3 с — не менять; после смены D — подождите τ/2;
+    конец прохода — не менять; рециркуляция и нет данных — куда идти."""
+    from app import pages
+    from app.live import D_STEP_MIN, live_advice
+    st = live_state(_live_rows(), P)
+    c = Conditions(st.t_proc, 10.0, 70.0)
+    base = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0)
+    keep = live_forecast(P, c, st, 400.0, base.w_out_now, 14.0, 6.0, 10.0)     # цель = то, что выходит сейчас
+    a = live_advice(P, st, keep)
+    assert abs(keep.d_rec - st.d) < D_STEP_MIN and a["kind"] == "keep" and a["head"] == "D не менять — 35 с"
+    far = live_forecast(P, c, st, 400.0, base.w_out_now + 3.0, 14.0, 6.0, 10.0)
+    a = live_advice(P, st, far)
+    assert a["kind"] == "change" and a["head"] == f"Поставьте D = {far.d_rec:.0f} с" and "Изменить режим" in " ".join(a["sub"])
+    # D поменяли в 13:30 (35 → 45): до 13:30 + τ(45)/2 — «подождите», потом — обычный совет
+    st2 = live_state(_live_rows(d_late=45, change_at="13:30"), P)
+    t_ch = datetime(2026, 10, 25, 13, 30)
+    assert st2.d_changed_at == t_ch and st2.d_prev == 35 and st2.d == 45
+    fc2 = live_forecast(P, c, st2, 400.0, base.w_out_now + 3.0, 14.0, 6.0, 10.0)
+    tau = P.lag_k * P.m_dryer / q_at(P, 45)
+    a = live_advice(P, st2, fc2, now=t_ch + timedelta(hours=0.4 * tau))
+    assert a["kind"] == "wait" and a["head"].startswith("Подождите до") and "13:30" in a["sub"][0]
+    assert live_advice(P, st2, fc2, now=t_ch + timedelta(hours=0.6 * tau))["kind"] == "change"
+    # конец прохода: остаток уже в шахте
+    late = live_forecast(P, c, st, 120.0, 24.0, 14.0, 6.0, 10.0, silo=True)
+    assert late.silo["late"] and live_advice(P, st, late)["head"].startswith("D для этого прохода уже не менять")
+    # своё D, рециркуляция, нет данных
+    tr = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0, d_override=40)
+    assert live_advice(P, st, tr, d_try=40)["head"].startswith("При D = 40 с")
+    st3 = live_state(_live_rows(note_last="рециркуляция"), P)
+    fc3 = live_forecast(P, Conditions(st3.t_proc, 10.0, 70.0), st3, 400.0, 24.0, 14.0, 6.0, 10.0)
+    a = live_advice(P, st3, fc3)
+    assert st3.recirc and a["kind"] == "info" and a["go"] == pages.RECIRC
+    a = live_advice(P, live_state([], P), None)
+    assert a["kind"] == "nodata" and a["go"] == pages.JOURNAL
+
+
+def test_plot_clear_really_clears():
+    """SimplePlot.clear() очищает данные: раньше PlotWidget перекрывал его своим clear, и при каждом пересчёте серии и
+    линии цели копились (старая цель оставалась на графике, график со временем тормозил)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    import pyqtgraph as pg
+    from app.plots import SimplePlot
+    p = SimplePlot()
+    for k in range(4):
+        p.clear()
+        p.add_points([0, 1, 2], [20, 22, 24], "dot", 7)
+        p.add_hline(24.8 - k, "target")
+        for _ in range(3):
+            app.processEvents()
+    lines = [i.value() for i in p.getPlotItem().vb.addedItems if isinstance(i, pg.InfiniteLine)]
+    assert len(p._series) == 1 and lines == [21.8]
+
+
+def test_nav_panel_sections_and_operator_visibility():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QWidget
+    _app = QApplication.instance() or QApplication([])  # noqa: F841
+    from app.nav import NavPanel
+    nav = NavPanel("DryerCalc", "проба")
+    seen = []
+    nav.currentChanged.connect(seen.append)
+    for name, sec in (("Журнал проб", "Смена"), ("Текущий проход", "Смена"), ("План сушки партии", "Планирование"),
+                      ("Справка", None)):
+        nav.addTab(QWidget(), name, sec, "назначение " + name)
+    assert nav.count() == 4 and nav.currentIndex() == 0 and nav.lbl_title.text() == "Журнал проб"
+    assert nav.list.count() == 7                     # 2 заголовка разделов + отступ перед «Справкой» + 4 страницы
+    nav.setCurrentIndex(2)
+    assert seen == [0, 2] and nav.lbl_sub.text() == "назначение План сушки партии"   # первая страница — сразу текущая
+    nav.list.setCurrentRow(0)                        # заголовок раздела выбрать нельзя
+    assert nav.currentIndex() == 2
+    nav.setTabVisible(2, False)                      # режим сушильщика: «Планирование» пропадает целиком
+    assert nav.currentIndex() == 0 and nav._headers["Планирование"].isHidden() and not nav._headers["Смена"].isHidden()
+    nav._step(-1)
+    assert nav.tabText(nav.currentIndex()) == "Справка"
+    nav._step(1)
+    assert nav.currentIndex() == 0 and nav.indexOfText("Текущий проход") == 1
+
+
+# ---------------------------------------------------------------------------
 # «Правила работы» (docs/rules_ru.txt): то, что там написано о разборе журнала, должно оставаться правдой.
 # Если тест упал после изменения программы — обновите разделы 4–8, 10 и 20 правил.
 # ---------------------------------------------------------------------------

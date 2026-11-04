@@ -105,3 +105,90 @@ def scroll_wrap(w: QWidget, max_w: Optional[int] = None) -> QScrollArea:
     if max_w:
         sc.setMaximumWidth(max_w)
     return sc
+
+
+class Collapsible(QWidget):
+    """«▸ Заголовок» — по щелчку раскрывает содержимое (пояснение или виджет). Длинные пояснения на страницах
+    свёрнуты, чтобы не заслонять главное; состояние раскрытия меняет только сам человек."""
+
+    def __init__(self, title: str, content=None, expanded: bool = False, parent: Optional[QWidget] = None):
+        from PySide6.QtWidgets import QToolButton, QVBoxLayout
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self.button = QToolButton()
+        self.button.setText(title)
+        self.button.setCheckable(True)
+        self.button.setChecked(expanded)
+        self.button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.button.setAutoRaise(True)
+        self.button.toggled.connect(self._toggled)
+        lay.addWidget(self.button, 0, Qt.AlignLeft)
+        if content is None or isinstance(content, str):
+            lb = QLabel(content or "")
+            lb.setWordWrap(True)
+            lb.setTextFormat(Qt.RichText)
+            lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            content = lb
+        self.content = content
+        lay.addWidget(content)
+        content.setVisible(expanded)
+
+    def _toggled(self, on: bool) -> None:
+        self.button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        self.content.setVisible(on)
+
+    def set_expanded(self, on: bool) -> None:
+        self.button.setChecked(on)
+
+    def is_expanded(self) -> bool:
+        return self.button.isChecked()
+
+
+class Tile(QFrame):
+    """Плитка «подпись / крупное число / пояснение» для главных цифр страницы."""
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None):
+        from PySide6.QtWidgets import QVBoxLayout
+        super().__init__(parent)
+        self.setObjectName("tile")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 8)
+        lay.setSpacing(0)
+        self.lbl_title = QLabel(title)
+        self.lbl_value = QLabel("—")
+        self.lbl_sub = QLabel("")
+        self.lbl_sub.setWordWrap(True)
+        self.lbl_title.setWordWrap(True)
+        self.setMinimumWidth(10)
+        for w in (self.lbl_title, self.lbl_value, self.lbl_sub):
+            lay.addWidget(w)
+        lay.addStretch(1)
+
+    def set(self, value: str, sub: str = "", tip: str = "") -> None:
+        self.lbl_value.setText(value)
+        self.lbl_sub.setText(sub)
+        self.setToolTip(tip)
+
+    def style_for(self, th, pt: float) -> None:
+        from .theme import mix
+        border = mix(th.window, th.text, 0.18).name()
+        self.setStyleSheet(f"#tile {{ background:{th.base.name()}; border:1px solid {border}; border-radius:6px; }}")
+        self.lbl_title.setStyleSheet(f"color:{th.muted};")
+        self.lbl_value.setStyleSheet(f"font-size:{pt + 4:.1f}pt; font-weight:600; color:{th.base_text.name()};")
+        self.lbl_sub.setStyleSheet(f"color:{th.muted};")
+
+
+def size_by_current(tabs) -> None:
+    """Вложенные вкладки (QTabWidget): минимальный размер — только по открытой вкладке, а не по самой широкой из
+    скрытых (у скрытых он ещё и не обновляется после смены шрифта в режиме сушильщика)."""
+    from PySide6.QtWidgets import QSizePolicy
+
+    def upd(i: int) -> None:
+        for k in range(tabs.count()):
+            pol = QSizePolicy.Preferred if k == i else QSizePolicy.Ignored
+            tabs.widget(k).setSizePolicy(pol, pol)
+    tabs.currentChanged.connect(upd)
+    upd(tabs.currentIndex())

@@ -2,7 +2,7 @@
 двойной щелчок — показать всё, правая кнопка — меню (показать всё, сохранить / скопировать картинку).
 
 Интерфейс прежний (SimplePlot: add_line, add_points, add_hline, set_labels, set_title, include_zero, clear),
-поэтому вкладки программы не зависят от того, чем рисуется график. Цвета берутся из темы (светлая/тёмная) по
+поэтому разделы программы не зависят от того, чем рисуется график. Цвета берутся из темы (светлая/тёмная) по
 смыслу линии: «line», «target», «ref», «dot».
 """
 from __future__ import annotations
@@ -57,6 +57,9 @@ class SimplePlot(pg.PlotWidget):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent, axisItems={"bottom": _Axis("bottom"), "left": _Axis("left")})
+        # PlotWidget кладёт в экземпляр ссылку на PlotItem.clear — она перекрывала наш clear(): данные графика не
+        # очищались, при каждом пересчёте серии и линии цели копились (старая цель оставалась на графике)
+        self.__dict__.pop("clear", None)
         self._series: List[_Series] = []
         self._hlines: List[Tuple[float, str, bool]] = []
         self._title = ""

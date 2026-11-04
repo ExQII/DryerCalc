@@ -1,4 +1,4 @@
-"""Вкладка «Рециркуляция»: досушка содержимого сушилки по кругу (без подачи из силоса)."""
+"""Раздел «Досушка» (рециркуляция): досушка содержимого сушилки по кругу (без подачи из силоса)."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDateTimeEdit, QFormLayo
 from . import model as mdl
 from .plots import SimplePlot
 from .theme import theme_for
-from .ui_common import scroll_wrap, dspin, fmt_hours, item, table
+from .ui_common import Collapsible, scroll_wrap, dspin, fmt_hours, item, table
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -40,7 +40,7 @@ class RecircTab(QWidget):
         self.cool.setChecked(True)
         b_j = QPushButton("Взять из журнала (последние пробы)")
         b_j.clicked.connect(self._from_journal)
-        b_c = QPushButton("T блоков и наружный воздух — из «Расчёт по модели»")
+        b_c = QPushButton("T блоков и наружный воздух — из «План сушки партии»")
         b_c.clicked.connect(self._from_calc)
         f.addRow("Масса в сушилке", self.mass)
         f.addRow("Влажность сейчас (средняя, после охл.)", self.w0)
@@ -53,16 +53,18 @@ class RecircTab(QWidget):
         f.addRow("Начало рециркуляции", self.start)
         f.addRow(self.cool)
         lv.addWidget(gb)
-        self.hint = QLabel(
+        self.hint_box = Collapsible(
+            "Как считается досушка",
             "Рециркуляция — зерно ходит по кругу через шахту без подачи из силоса: досушить то, что осталось в "
             "сушилке после окончания подачи, или высушить небольшую партию (не больше вместимости). Шахта должна "
-            "быть полной, иначе воздух идёт мимо зерна. Средняя влажность в сушилке в конце прохода ≈ середина "
-            "между входом и выходом. Расчёт: эмпирическая модель — та же скорость съёма влаги R(W), что и в проходе, "
-            "при W = средней по сушилке; физическая — кривая сушки по накопленному времени в горячей зоне. В журнале "
-            "октября рециркуляция шла 1,5 ч, и её результат на выходе ещё не был виден (зерно проходит шахту ≈ 3 ч), "
-            "поэтому для этого режима модель пока не проверена — записывайте пробы во время рециркуляции.")
-        self.hint.setWordWrap(True)
-        lv.addWidget(self.hint)
+            "быть полной, иначе воздух идёт мимо зерна.<br><br>Средняя влажность в сушилке в конце прохода ≈ "
+            "середина между входом и выходом. Расчёт: эмпирическая модель — та же скорость съёма влаги R(W), что и "
+            "в проходе, при W = средней по сушилке; физическая — кривая сушки по накопленному времени в горячей "
+            "зоне.<br><br>В журнале октября рециркуляция шла 1,5 ч, и её результат на выходе ещё не был виден "
+            "(зерно проходит шахту ≈ 3 ч), поэтому для этого режима модель пока не проверена — записывайте пробы "
+            "во время рециркуляции.")
+        self.hint = self.hint_box.content
+        lv.addWidget(self.hint_box)
         lv.addStretch(1)
         left.setMaximumWidth(470)
 

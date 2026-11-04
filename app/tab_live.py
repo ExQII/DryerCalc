@@ -1,4 +1,9 @@
-"""Вкладка «Сейчас»: прогноз по факту текущего прохода и подсказка разгрузки D."""
+"""Раздел «Текущий проход»: что делать с разгрузкой D прямо сейчас, по свежим пробам журнала.
+
+Сверху крупно — одно действие («Поставьте D = 42 с», «D не менять», «Подождите до 09:30»), под ним пять плиток
+с главными цифрами (выход, цель, приёмный силос, конец прохода, конец партии), подробности — по «Подробнее»,
+ниже таблица «что будет при другом D» и график проб. Логика совета — live.live_advice (правила работы, 7.3).
+"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -6,14 +11,14 @@ from typing import TYPE_CHECKING, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush
-from PySide6.QtWidgets import (QApplication, QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton, QSplitter,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
+                               QPushButton, QSplitter, QVBoxLayout, QWidget)
 
 from . import model as mdl
-from .live import LiveState, live_forecast, live_state
+from .live import LiveState, live_advice, live_forecast, live_state
 from .plots import SimplePlot
 from .theme import theme_for
-from .ui_common import scroll_wrap, dspin, fmt_hours, fnum, item, table
+from .ui_common import Collapsible, Tile, scroll_wrap, dspin, fmt_hours, fnum, item, table
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -26,20 +31,24 @@ class LiveTab(QWidget):
         self.state: Optional[LiveState] = None
         lay = QHBoxLayout(self)
 
+        self.fc = None
+        self.advice = None
         left = QWidget()
         lv = QVBoxLayout(left)
-        gb = QGroupBox("Текущий проход (последний участок журнала)")
+        lv.setContentsMargins(0, 0, 6, 0)
+        gb = QGroupBox("По журналу")
         self.lbl_state = QLabel("—")
         self.lbl_state.setWordWrap(True)
         self.lbl_state.setTextFormat(Qt.RichText)
         QVBoxLayout(gb).addWidget(self.lbl_state)
         lv.addWidget(gb)
 
-        gb = QGroupBox("Задание")
+        gb = QGroupBox("Задание на проход")
         f = QFormLayout(gb)
         self.m_pass = dspin(1, 20000, 500, 0, 10, " т")
         self.w_target = dspin(8, 40, 24, 1, 0.5, " %")
         self.lbl_target_read = QLabel()
+        self.lbl_target_read.setWordWrap(True)
         self.wk_final = dspin(8, 30, 14, 1, 0.5, " %")
         self.t_amb = dspin(-40, 45, 10, 1, 1, " °C")
         self.rh = dspin(5, 100, 70, 0, 5, " %")
@@ -48,50 +57,103 @@ class LiveTab(QWidget):
         self.cb_corr = QCheckBox("Поправка по последним замерам выхода")
         self.cb_corr.setChecked(True)
         self.cb_now = QCheckBox("Считать до текущего времени (а не до последней пробы)")
-        self.cb_silo = QCheckBox("Выравнивать среднюю влажность в приёмном силосе")
+        self.cb_silo = QCheckBox("Выравнивать среднюю по силосу")
         self.cb_silo.setChecked(True)
         self.cb_silo.setToolTip(
             "Всё, что выгружено за проход, ложится в один силос — важна его средняя влажность. Если часть уже ушла "
             "суше или сырее цели, программа подберёт D так, чтобы оставшееся зерно выровняло среднее, но не дальше "
             "чем на заданное число п.п. от цели прохода.")
         self.silo_lim = dspin(0.2, 3.0, 1.0, 1, 0.1, " п.п.")
-        b_mass = QPushButton("Взять массу партии из «Расчёт по модели»")
+        b_mass = QPushButton("Масса партии — из «План сушки партии»")
         b_mass.clicked.connect(lambda: self.m_pass.setValue(self.win.in_mass.value()))
-        b_w = QPushButton("T и RH из таблицы погоды (на время последней пробы)")
+        b_w = QPushButton("T и RH из таблицы погоды")
+        b_w.setToolTip("Наружный воздух из таблицы погоды на время последней пробы.")
         b_w.clicked.connect(self._weather)
-        f.addRow("Масса на входе этого прохода", self.m_pass)
+        self.m_pass.setToolTip("Масса зерна на входе этого прохода, т (на первом проходе — масса партии).")
+        self.w_target.setToolTip("Желаемая влажность на выходе этого прохода — средняя по приёмному силосу, после "
+                                 "охлаждения (как в лаборатории).")
+        f.addRow("Масса на входе прохода", self.m_pass)
         f.addRow(b_mass)
-        f.addRow("Цель на выходе прохода (после охл.)", self.w_target)
+        f.addRow("Цель прохода (после охл.)", self.w_target)
         f.addRow(self.lbl_target_read)
         f.addRow("Цель партии Wк", self.wk_final)
-        f.addRow("Наружный воздух, T", self.t_amb)
-        f.addRow("Наружный воздух, RH", self.rh)
-        f.addRow(b_w)
-        f.addRow("Проверить своё D", self.d_try)
+        lv.addWidget(gb)
+        gb = QGroupBox("Приёмный силос")
+        f = QFormLayout(gb)
         f.addRow(self.cb_silo)
-        f.addRow("…но не дальше от цели прохода, ±", self.silo_lim)
+        f.addRow("…не дальше от цели, ±", self.silo_lim)
+        lv.addWidget(gb)
+        gb = QGroupBox("Наружный воздух")
+        f = QFormLayout(gb)
+        f.addRow("T", self.t_amb)
+        f.addRow("RH", self.rh)
+        f.addRow(b_w)
+        lv.addWidget(gb)
+        gb = QGroupBox("Проверить своё D")
+        f = QFormLayout(gb)
+        f.addRow("Что будет при D", self.d_try)
+        lv.addWidget(gb)
+        self.gb_calc = QGroupBox("Расчёт")
+        f = QFormLayout(self.gb_calc)
         f.addRow(self.cb_corr)
         f.addRow(self.cb_now)
-        lv.addWidget(gb)
+        lv.addWidget(self.gb_calc)
         b = QPushButton("Обновить по журналу")
         b.clicked.connect(self.refresh)
         lv.addWidget(b)
-        self.lbl_hint = QLabel(
-            "Как пользоваться: внесите свежие пробы в журнал (вкладка «Журнал», строка быстрого ввода), "
-            "задайте массу партии на этом проходе и желаемую влажность на выходе. Программа подскажет D и покажет, "
-            "когда изменение станет видно на выходе: зерно, уже находящееся в шахте, выходит со старой скоростью, "
-            "поэтому не меняйте D чаще, чем раз в половину этого времени.")
-        self.lbl_hint.setWordWrap(True)
-        lv.addWidget(self.lbl_hint)
+        self.hint = Collapsible(
+            "Как пользоваться",
+            "1. Внесите пробу в «Журнал проб».<br>2. Посмотрите сюда: крупная строка сверху — что сделать с D.<br>"
+            "3. «Поставьте D = …» — поставьте и запишите изменение («Изменить режим…» в журнале). «D не менять» "
+            "или «Подождите» — ничего не трогайте.<br><br>Почему не чаще: зерно, уже находящееся в шахте, выходит "
+            "со старой скоростью — смена D видна на выходе только через время «Заметно через …». Разница меньше 3 с "
+            "— это ≈ 0,5 п.п. на выходе, на уровне точности влагомера. Подробно — «Справка» → «Правила работы», "
+            "раздел 7.")
+        self.lbl_hint = self.hint.content
+        lv.addWidget(self.hint)
         lv.addStretch(1)
 
         right = QSplitter(Qt.Vertical)
         top = QWidget()
         tv = QVBoxLayout(top)
+        tv.setContentsMargins(0, 0, 0, 0)
+        # главное действие
+        self.card = QFrame()
+        self.card.setObjectName("adviceCard")
+        cv = QVBoxLayout(self.card)
+        cv.setContentsMargins(14, 10, 14, 10)
+        cv.setSpacing(4)
+        ch = QHBoxLayout()
+        self.lbl_head = QLabel("—")
+        self.lbl_head.setWordWrap(True)
+        ch.addWidget(self.lbl_head, 1)
+        self.btn_go = QPushButton()
+        self.btn_go.setVisible(False)
+        self.btn_go.clicked.connect(self._go)
+        ch.addWidget(self.btn_go, 0, Qt.AlignTop)
+        cv.addLayout(ch)
+        self.lbl_sub = QLabel()
+        self.lbl_sub.setWordWrap(True)
+        self.lbl_sub.setTextFormat(Qt.RichText)
+        cv.addWidget(self.lbl_sub)
+        tv.addWidget(self.card)
+        # главные цифры
+        tiles = QHBoxLayout()
+        tiles.setSpacing(8)
+        self.t_out = Tile("Выход (влагомер)")
+        self.t_goal = Tile("Цель на влагомере")
+        self.t_silo = Tile("Приёмный силос")
+        self.t_pass = Tile("Конец прохода")
+        self.t_batch = Tile("Конец партии")
+        self.tiles = (self.t_out, self.t_goal, self.t_silo, self.t_pass, self.t_batch)
+        for t in self.tiles:
+            tiles.addWidget(t, 1)
+        tv.addLayout(tiles)
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.RichText)
-        tv.addWidget(self.summary)
+        self.details = Collapsible("Подробнее: силос, допуск, расчёт", self.summary)
+        tv.addWidget(self.details)
         tv.addWidget(QLabel("Что будет при другом D (вход и температура — как сейчас)"))
         self.tbl = table(["D, с", "Q, т/ч", "W вых, %", "Влагомер покажет, %", "Съём, п.п.", "Видно через, ч",
                           "Конец прохода", "Среднее по силосу, %", "T зерна ≈, °C"])
@@ -100,10 +162,10 @@ class LiveTab(QWidget):
         self.plot = SimplePlot()
         self.plot.set_labels("часы от начала прохода", "влажность, %")
         right.addWidget(self.plot)
-        right.setSizes([430, 330])
-        lay.addWidget(scroll_wrap(left, 500), 0)
+        right.setSizes([470, 290])
+        lay.addWidget(scroll_wrap(left, 370), 0)
         lay.addWidget(right, 1)
-        left.setMaximumWidth(470)
+        left.setMaximumWidth(350)
 
         for w in (self.m_pass, self.w_target, self.wk_final, self.t_amb, self.rh, self.d_try, self.silo_lim):
             w.valueChanged.connect(self.recalc)
@@ -133,7 +195,8 @@ class LiveTab(QWidget):
     def _weather(self) -> None:
         ws = self.win.weather_series()
         if not len(ws):
-            self.summary.setText("Таблица погоды пуста (вкладка «Погода и влагомер»).")
+            self.summary.setText("Таблица погоды пуста (раздел «Погода и влагомер»).")
+            self.details.set_expanded(True)
             return
         end = (self.state.last if self.state and self.state.last else datetime.now())
         t, rh = ws.at(end)
@@ -176,20 +239,62 @@ class LiveTab(QWidget):
                 + (f", средняя влажность в силосе <b>{st.silo_w:.1f} %</b> (влагомер {st.silo_w_read:.1f} %)"
                    if st.silo_w is not None else "") + "<br>"
                 f"Поправка модели по {st.corr_n} последним замерам: <b>{st.corr:+.2f} п.п.</b>"
-                + ("<br><b>Сейчас рециркуляция</b> (из силоса не подаётся) — время досушки на вкладке «Рециркуляция»."
+                + ("<br><b>Сейчас рециркуляция</b> (из силоса не подаётся) — время досушки в разделе «Досушка»."
                    if st.recirc else ""))
         else:
             self.lbl_state.setText(st.message or "—")
         self.recalc()
 
+    # ------------------------------------------------------------------
+    def set_operator(self, op: bool) -> None:
+        """Режим сушильщика: без инженерных настроек расчёта."""
+        self.gb_calc.setVisible(not op)
+
+    def _go(self) -> None:
+        name = (self.advice or {}).get("go")
+        if name:
+            self.win.tabs.setCurrentIndex(self.win.tabs.indexOfText(name))
+
+    def _show_advice(self, adv: dict) -> None:
+        """Карточка с одним действием: цвет по смыслу (зелёная — не менять, жёлтая — поставить / подождать,
+        голубая — сведения), предупреждения — красным."""
+        self.advice = adv
+        th = theme_for(self)
+        pt = QApplication.font().pointSizeF()
+        kind = adv["kind"]
+        if kind == "keep":
+            bg, fg = th.banner("green")
+        elif kind in ("change", "wait"):
+            bg, fg = th.banner("amber")
+        else:
+            bg, fg = th.summary_bg, th.summary_fg
+        self.card.setStyleSheet(f"#adviceCard {{ background:{bg}; border-radius:8px; }} "
+                                f"#adviceCard QLabel {{ color:{fg}; background:transparent; }}")
+        self.lbl_head.setStyleSheet(f"font-size:{pt + 9:.1f}pt; font-weight:700;")
+        self.lbl_sub.setStyleSheet(f"font-size:{pt + 1:.1f}pt;")
+        self.lbl_head.setText(adv["head"])
+        err = "#ffb4b4" if th.dark else "#8a1c1c"
+        sub = "<br>".join(adv["sub"]) + "".join(f"<br><span style='color:{err}'><b>⚠ {w}</b></span>" for w in adv["warn"])
+        self.lbl_sub.setText(sub)
+        go = adv.get("go")
+        self.btn_go.setVisible(bool(go))
+        if go:
+            self.btn_go.setText(f"Открыть «{go}»")
+        for t in self.tiles:
+            t.style_for(th, pt)
+
+    def _clear_tiles(self) -> None:
+        for t in self.tiles:
+            t.set("—")
+
     def recalc(self) -> None:
         p = self.win.params
         th = theme_for(self)
-        self.summary.setStyleSheet(f"background:{th.summary_bg}; color:{th.summary_fg}; padding:10px; font-size:{QApplication.font().pointSizeF() + 2:.1f}pt;")
+        self.summary.setStyleSheet(f"background:{th.summary_bg}; color:{th.summary_fg}; padding:10px;")
         self.lbl_hint.setStyleSheet(f"color:{th.muted};")
         tg_now = self.state.t_grain if self.state is not None else None
         target_read = mdl.read_from_true(p, self.w_target.value(), tg_now)
-        self.lbl_target_read.setText(f"Цель прохода на выходном влагомере ≈ {target_read:.1f} % "
+        self.lbl_target_read.setText(f"На выходном влагомере это ≈ {target_read:.1f} % "
                                      f"(поправка {target_read - self.w_target.value():+.1f} п.п.)")
         self.lbl_target_read.setStyleSheet(f"color:{th.muted};")
         self.tbl.setRowCount(0)
@@ -199,7 +304,10 @@ class LiveTab(QWidget):
         if st is None:
             return
         if not st.ok:
+            self.fc = None
             self.summary.setText(st.message)
+            self._show_advice(live_advice(p, st, None))
+            self._clear_tiles()
             return
 
         soft, hard = self.win.limits()
@@ -259,7 +367,52 @@ class LiveTab(QWidget):
         for wtxt in fc.warnings:
             lines.append(f"<span style='color:{th.error}'>⚠ {wtxt}.</span>")
         self.summary.setText("<br>".join(lines))
+        self._show_advice(live_advice(p, st, fc, d_try, now=datetime.now()))
+        self._fill_tiles(p, st, fc, target_read)
 
+        self._table(p, st, fc, c, d_use, now, th, target_read)
+
+    def _fill_tiles(self, p, st, fc, target_read: float) -> None:
+        goal_read = mdl.read_from_true(p, fc.w_goal, st.t_grain)
+        if st.w_out_read is not None:
+            dev = st.w_out_read - goal_read
+            self.t_out.set(f"{st.w_out_read:.1f} %",
+                           (f"проба {st.last_sample:%H:%M} · " if st.last_sample else "") + f"от цели {dev:+.1f} п.п.",
+                           "Последняя проба выходного влагомера (как показал прибор) и её отличие от цели прохода на "
+                           "влагомере.")
+        else:
+            self.t_out.set("—", "проб выхода ещё нет")
+        sub = f"после охлаждения {self.w_target.value():g} %"
+        if abs(fc.w_goal - self.w_target.value()) >= 0.05:
+            sub = f"для силоса сейчас {fc.w_goal:.1f} % (цель прохода {self.w_target.value():g} %)"
+        self.t_goal.set(f"{goal_read:.1f} %", sub, "С чем сравнивать выходной влагомер: цель прохода в его показаниях "
+                                                 "(поправка на горячее зерно — «Погода и влагомер»).")
+        sl = fc.silo
+        if st.silo_w is not None:
+            self.t_silo.set(f"{st.silo_w:.1f} %",
+                            f"{st.unloaded:.0f} т" + (f" · к концу ≈ {sl['avg']:.1f} %" if sl else ""),
+                            "Средняя по массе влажность всего, что ушло в приёмный силос с начала прохода (истинная, "
+                            "с поправкой влагомера), и ожидаемая к концу прохода.")
+        else:
+            self.t_silo.set("—", f"выгружено {st.unloaded:.0f} т")
+        if fc.pass_end:
+            rem = "выгружен" if fc.remaining <= 0.05 else f"осталось {fc.remaining:.0f} т"
+            self.t_pass.set(f"{fc.pass_end:%d.%m %H:%M}", rem, "Когда закончится выгрузка массы этого прохода при "
+                                                               "советуемом D.")
+        else:
+            self.t_pass.set("—")
+        if fc.batch_end:
+            n = len(fc.rest_plan.passes) if fc.rest_plan is not None else 0
+            rng = (f"90 %: {fc.batch_end_range[0]:%d.%m %H:%M} … {fc.batch_end_range[1]:%d.%m %H:%M}"
+                   if fc.batch_end_range else "")
+            self.t_batch.set(f"{fc.batch_end:%d.%m %H:%M}",
+                             (f"ещё {n} прох. до {self.wk_final.value():g} %" if n else "это последний проход"),
+                             ("С охлаждением. " + (f"Допуск {rng}." if rng else "")).strip())
+        else:
+            self.t_batch.set("—")
+
+    def _table(self, p, st, fc, c, d_use, now, th, target_read: float) -> None:
+        sl = fc.silo
         # таблица вариантов D
         cands = sorted({max(1, min(100, round(x))) for x in (fc.d_rec - 10, fc.d_rec - 5, fc.d_rec, fc.d_rec + 5,
                                                              fc.d_rec + 10, st.d, d_use)})
@@ -303,10 +456,10 @@ class LiveTab(QWidget):
                 ys_out.append(wo)
         self.plot.add_points(xs_in, ys_in, "ref", 6)
         self.plot.add_points(xs_out, ys_out, "dot", 7)
-        self.plot.add_hline(target_read, "target")
+        self.plot.add_hline(mdl.read_from_true(p, fc.w_goal, st.t_grain), "target")
         if fc.visible_at:
             h0 = (fc.visible_at - st.start).total_seconds() / 3600.0
             self.plot.add_line([h0, h0 + max(fc.tau_h, 1.0)], [mdl.read_from_true(p, fc.w_out_rec, st.t_grain)] * 2,
                                "line", 3)
-        self.plot.set_title("серые — вход, синие — выход по влагомеру; красная — цель на влагомере; "
+        self.plot.set_title("серые — вход, синие — выход по влагомеру; красная — цель на влагомере сейчас; "
                             "отрезок — ожидаемый выход после смены D")

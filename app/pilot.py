@@ -19,9 +19,11 @@ import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence
 
+from .pages import OLD_NAMES, OPERATOR_PAGES
+
 OPERATOR = "operator"
 ENGINEER = "engineer"
-OPERATOR_TABS = ("Сейчас (по факту)", "Рециркуляция", "Журнал", "Справка")
+OPERATOR_TABS = OPERATOR_PAGES          # разделы сушильщика: «Смена» и «Справка»
 
 
 # ----------------------------------------------------------------------------
@@ -162,7 +164,8 @@ def export_xlsx(path: str, st: Dict, events: List[Dict]) -> None:
         c.font = Font(bold=True)
     for e in st["feedback"]:
         d = e["detail"] if isinstance(e["detail"], dict) else {"text": str(e["detail"])}
-        ws2.append([e["ts"], d.get("who", ""), d.get("mode", ""), d.get("tab", ""), d.get("text", "")])
+        ws2.append([e["ts"], d.get("who", ""), d.get("mode", ""), OLD_NAMES.get(d.get("tab", ""), d.get("tab", "")),
+                    d.get("text", "")])
     for col, w in zip("ABCDE", (17, 18, 11, 22, 100)):
         ws2.column_dimensions[col].width = w
     for row in ws2.iter_rows(min_row=2):

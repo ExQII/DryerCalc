@@ -2,7 +2,7 @@
 
 * «Пора внести пробу» — последняя проба в журнале старше интервала проб + запас, а сушка идёт
   (последний участок журнала не закончен охлаждением/остановкой и последней записи меньше 8 ч).
-* «Проход заканчивается» — по прогнозу вкладки «Сейчас» до конца прохода осталось меньше заданного времени
+* «Проход заканчивается» — по прогнозу раздела «Текущий проход» до конца прохода осталось меньше заданного времени
   (одно напоминание на проход): пора готовить силос и следующий проход.
 * «Выход ушёл от цели» — последнее показание выходного влагомера отличается от цели прохода (в пересчёте
   на показание влагомера) больше чем на заданный порог (одно напоминание на запись).
@@ -75,7 +75,7 @@ def check(rows: List[Dict], now: datetime, state: Dict, cfg: ReminderCfg, pass_e
         mins = int((now - last_sample).total_seconds() // 60)
         out.append(("sample", "Пора внести пробу",
                     f"Последняя проба в журнале — в {last_sample:%H:%M} ({mins} мин назад). Отберите пробу на входе и "
-                    f"выходе и внесите её (вкладка «Журнал», строка быстрого ввода)."))
+                    f"выходе и внесите её (раздел «Журнал проб», строка быстрого ввода)."))
         state["sample_told"] = now
         state["sample_for"] = last_sample
     # 2) конец прохода
@@ -100,7 +100,7 @@ def check(rows: List[Dict], now: datetime, state: Dict, cfg: ReminderCfg, pass_e
                 side = "выше" if dev > 0 else "ниже"
                 out.append(("deviation", "Выход ушёл от цели",
                             f"В {last_out[0]:%H:%M} выходной влагомер показал {last_out[1]:.1f} % — на {abs(dev):.1f} п.п. "
-                            f"{side} цели ({target_read:.1f} %). Проверьте D на вкладке «Сейчас»; помните, что смена D "
+                            f"{side} цели ({target_read:.1f} %). Проверьте D в разделе «Текущий проход»; помните, что смена D "
                             f"видна на выходе только через несколько часов."))
             state["dev_for"] = last_out[0]
     return out
@@ -108,7 +108,7 @@ def check(rows: List[Dict], now: datetime, state: Dict, cfg: ReminderCfg, pass_e
 
 def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: float, hard: float, weather=None,
                  now: Optional[datetime] = None) -> Tuple[Optional[datetime], Optional[float]]:
-    """(ожидаемый конец текущего прохода, цель прохода в показаниях влагомера) — как на вкладке «Сейчас»."""
+    """(ожидаемый конец текущего прохода, цель прохода в показаниях влагомера) — как в разделе «Текущий проходчас»."""
     from .live import live_forecast, live_state
     st = live_state(rows, p, now=now, weather=weather)
     if not st.ok:

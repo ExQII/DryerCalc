@@ -1,4 +1,4 @@
-"""Вкладка «Проверка и опыты»: прогноз против факта по проходам журнала, сравнение моделей, дрейф,
+"""Раздел «Точность модели»: прогноз против факта по проходам журнала, сравнение моделей, дрейф,
 допуск прогнозов и план опытов (какие режимы поставить, чтобы модель училась быстрее)."""
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from .analysis import backtest, drift_text, rate_sigma_from_backtest
 from .doe import explored_passes, suggest, typical_regime
 from .plots import SimplePlot
 from .theme import theme_for
-from .ui_common import dspin, fnum, item, scroll_wrap, table
+from .ui_common import dspin, fnum, item, scroll_wrap, size_by_current, table
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -32,6 +32,7 @@ class CheckTab(QWidget):
         QVBoxLayout(self).addWidget(tabs)
         tabs.addTab(self._build_backtest(), "Прогноз против факта")
         tabs.addTab(self._build_doe(), "План опытов")
+        size_by_current(tabs)
         tabs.currentChanged.connect(lambda _i: self.on_show())
         cfg = self.win.storage.get_json("calib_cfg", {}) or {}
         self.half.setValue(float(cfg.get("half_life", 0.0)))
@@ -212,7 +213,7 @@ class CheckTab(QWidget):
         self.d_n.setValue(4)
         self.d_one = QCheckBox("Менять один фактор (D или T), второй — привычный")
         self.d_one.setChecked(True)
-        b_w = QPushButton("W вх — из «Расчёт по модели»")
+        b_w = QPushButton("W вх — из «План сушки партии»")
         b_w.clicked.connect(lambda: self.d_w.setValue(self.win.in_w0.value()))
         f.addRow("Влажность зерна на входе", self.d_w)
         f.addRow(b_w)
@@ -231,8 +232,8 @@ class CheckTab(QWidget):
             "которые (1) дальше всего от уже изученных и (2) там, где модели расходятся сильнее всего, — такой "
             "проход даёт больше всего информации. Все кандидаты проверены на ваш лимит съёма по ОБЕИМ моделям "
             "(берётся худшая), на пределы T блоков и T зерна. Правила: меняйте режим в начале прохода и держите его "
-            "весь проход; записывайте пробы как обычно; после прохода нажмите «Калибровать модель» на вкладке "
-            "«Журнал». Если зерно семенное — согласуйте T с инструкцией.")
+            "весь проход; записывайте пробы как обычно; после прохода нажмите «Калибровать модель» в разделе "
+            "«Журнал проб». Если зерно семенное — согласуйте T с инструкцией.")
         self.doe_hint.setWordWrap(True)
         lv.addWidget(self.doe_hint)
         lv.addStretch(1)

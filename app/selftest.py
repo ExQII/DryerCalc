@@ -38,8 +38,8 @@ def run(out_path: str) -> int:
 
         tmp = tempfile.mkdtemp(prefix="dryercalc_selftest_")
         win = MainWindow(Storage(os.path.join(tmp, "t.db")))
-        check(win.tbl_sc.rowCount() >= 6, f"вкладка «Расчёт по модели»: сценариев {win.tbl_sc.rowCount()}")
-        check(win.sm_tbl.rowCount() >= 3, f"вкладка «По производительности»: проходов {win.sm_tbl.rowCount()}")
+        check(win.tbl_sc.rowCount() >= 6, f"«План сушки партии»: сценариев {win.tbl_sc.rowCount()}")
+        check(win.sm_tbl.rowCount() >= 3, f"«Быстрая оценка»: проходов {win.sm_tbl.rowCount()}")
 
         sample = resource_path("examples/journal_sample_oct2026.csv")
         check(sample.exists(), f"пример журнала найден: {sample.name}")
@@ -126,7 +126,7 @@ def run(out_path: str) -> int:
         win.tab_live.refresh()
         st = win.tab_live.state
         check(st is not None and st.ok and "D =" in win.tab_live.summary.text(),
-              f"«Сейчас»: проход {st.batch if st else '?'}, выгружено {st.unloaded:.0f} т" if st else "«Сейчас» не посчитан")
+              f"«Текущий проход»: проход {st.batch if st else '?'}, выгружено {st.unloaded:.0f} т" if st else "«Текущий проход» не посчитан")
         win.tab_check.refresh()
         _worker.wait_all()
         check(win.tab_check.tbl.rowCount() == 4, f"проверка модели: проходов {win.tab_check.tbl.rowCount()}")
@@ -157,18 +157,25 @@ def run(out_path: str) -> int:
         check("СЛОВА-ЛОВУШКИ" in win.tab_help.rules.toPlainText(), "правила работы встроены в «Справку»")
         # --- v0.6: режим сушильщика, PIN, замечания, статистика пилота ---
         from . import pilot as _pilot
+        from . import pages as _pages
         win.apply_mode(_pilot.OPERATOR)
         app.processEvents()
         tb = win.tabs
         vis = [tb.tabText(i) for i in range(tb.count()) if tb.isTabVisible(i)]
         check(vis == list(_pilot.OPERATOR_TABS), "режим сушильщика: " + ", ".join(vis))
-        tb.setCurrentIndex(next(i for i in range(tb.count()) if tb.tabText(i) == "Журнал"))
+        tb.setCurrentIndex(tb.indexOfText(_pages.JOURNAL))
         app.processEvents()
         win.grab().save(os.path.join(os.path.dirname(os.path.abspath(out_path)), "selftest_operator.png"))
+        _w_op = win.minimumSizeHint().width()
         win.apply_mode(_pilot.ENGINEER)
+        for _ in range(5):
+            app.processEvents()
+        win._relayout()
+        _w_eng = win.minimumSizeHint().width()
+        check(max(_w_op, _w_eng) <= 1366, f"окно помещается в экран 1366 px: сушильщик {_w_op}, инженер {_w_eng} px")
         h = _pilot.pin_hash("2580")
         check(_pilot.pin_ok("2580", h) and not _pilot.pin_ok("0000", h), "PIN режима инженера (sha256)")
-        win.add_feedback("самопроверка", "тестовое замечание", "Журнал")
+        win.add_feedback("самопроверка", "тестовое замечание", _pages.JOURNAL)
         st_p = _pilot.pilot_stats(win.storage.load_events(), win.journal_rows())
         check(len(st_p["feedback"]) == 1 and st_p["quick_samples"] >= 1 and st_p["modes"],
               f"пилот: замечаний {len(st_p['feedback'])}, быстрых проб {st_p['quick_samples']}")
@@ -272,6 +279,17 @@ def run(out_path: str) -> int:
         win.tbl_j.item(_last, 7).setText(_d_cell)
         win._save_journal()
         win._qe_prefill(after_add=True)
+        # --- v0.9: боковое меню, названия по смыслу работы, «Текущий проход» с одним действием ---
+        _nav = win.tabs
+        check([_nav.tabText(i) for i in range(_nav.count())] == [x[0] for x in _pages.PAGES] and _nav.list.count() > 10,
+              "боковое меню: " + ", ".join(_nav.tabText(i) for i in range(_nav.count())))
+        _nav.setCurrentIndex(_nav.indexOfText(_pages.LIVE))
+        app.processEvents()
+        win.tab_live.refresh()
+        _adv = win.tab_live.advice or {}
+        check(bool(_adv.get("head")) and win.tab_live.lbl_head.text() == _adv["head"]
+              and win.tab_live.t_pass.lbl_value.text() not in ("", "—") and _nav.lbl_title.text() == _pages.LIVE,
+              f"«{_pages.LIVE}»: «{_adv.get('head', '?')}», конец прохода {win.tab_live.t_pass.lbl_value.text()}")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)
@@ -285,7 +303,7 @@ def run(out_path: str) -> int:
             tabs.setCurrentIndex(i)
             app.processEvents()
             pm = win.grab()
-            check((not pm.isNull()) and pm.width() >= 800, f"вкладка {i + 1} «{tabs.tabText(i)}» отрисована {pm.width()}×{pm.height()}")
+            check((not pm.isNull()) and pm.width() >= 800, f"раздел {i + 1} «{tabs.tabText(i)}» отрисован {pm.width()}×{pm.height()}")
             pm.save(os.path.join(shots_dir, f"selftest_tab{i + 1}.png"))
 
         # --- светлая и тёмная темы: контраст всех цветных надписей и переключение на ходу ---

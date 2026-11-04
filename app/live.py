@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from . import model as mdl
+from .pages import JOURNAL, RECIRC
 
 
 @dataclass
@@ -48,6 +49,9 @@ class LiveState:
     silo_w: Optional[float] = None       # средневзвешенная по массе влажность ушедшего в приёмный силос (истинная), %
     silo_w_read: Optional[float] = None  # то же по показаниям выходного влагомера, %
     silo_n: int = 0                      # сколько проб выхода в это легло
+    d_changed_at: Optional[datetime] = None   # когда в этом проходе последний раз меняли D (строка с новым D)
+    d_prev: Optional[float] = None            # каким D было до этого
+    last_sample: Optional[datetime] = None    # время последней пробы выхода
     series: List[Tuple[datetime, Optional[float], Optional[float]]] = field(default_factory=list)  # (t, вход, выход)
 
 
@@ -77,7 +81,14 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         return st
     st.seg = pass_of[seg]
     st.start, st.last = rs[0]["dt"], rs[-1]["dt"]
+    prev_d = None
     for r in rs:
+        if r.get("d_f") is not None:
+            if prev_d is not None and abs(r["d_f"] - prev_d) > 1e-9:
+                st.d_changed_at, st.d_prev = r["dt"], prev_d
+            prev_d = r["d_f"]
+        if r.get("w_out") is not None:
+            st.last_sample = r["dt"]
         if r.get("w_in") is not None:
             st.w_in = r["w_in"]
         if r.get("w_out") is not None:
@@ -139,7 +150,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.corr_n = len(res)
     if st.burner_off:
         st.message = ("Горелки выключены (в журнале «охлаждение» / «откл. т.б.»): проход закончен, идёт охлаждение. "
-                      "Для рециркуляции — вкладка «Рециркуляция».")
+                      "Для рециркуляции — раздел «Досушка».")
         return st
     if st.w_in is None or st.d is None or st.t_proc is None:
         st.message = "В текущем проходе не хватает данных: нужны влага на входе, разгрузка D и температура."
@@ -260,3 +271,75 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
     if dw > hard + 1e-9:
         fc.warnings.append(f"съём за проход {dw:.1f} п.п. больше допустимого {hard:g}")
     return fc
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Главное на экране «Текущий проход»: одно действие с D и почему
+# ----------------------------------------------------------------------------------------------------------------
+
+D_STEP_MIN = 3.0      # разница с советом меньше 3 с (≈ 0,5 п.п. на выходе) — D не менять (правила работы, 7.3)
+D_STEP_BIG = 10.0     # больше 10 с — сначала проверить пробу входа, D и T блоков в журнале и задание
+
+
+def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d_try: Optional[float] = None,
+                now: Optional[datetime] = None) -> Dict:
+    """{"kind": "change" | "keep" | "wait" | "info" | "nodata", "head": крупная строка, "sub": [строки],
+    "warn": [предупреждения], "go": раздел, куда отправить (или None)}.
+
+    Правила работы (раздел 7.3), зашитые в совет:
+      * совет отличается от текущего D меньше чем на 3 с — «D не менять»: это ≈ 0,5 п.п. на выходе, на уровне
+        точности влагомера, а лишние перестановки раскачивают выход;
+      * после смены D — ждать хотя бы половину времени «будет видно на выходе» (τ при текущем D), иначе следующая
+        смена делается вслепую, по зерну, которое ещё шло со старым D;
+      * совет требует изменения больше 10 с — сначала проверить последнюю пробу входа, D и T блоков в журнале.
+    now — настоящее время (для «подождите до …»); без него — время последней записи."""
+    if not st.ok or fc is None:
+        go = RECIRC if st.burner_off else JOURNAL
+        return {"kind": "nodata", "head": "Совета пока нет", "sub": [st.message or "Нет данных текущего прохода."],
+                "warn": [], "go": go}
+    warn = ([fc.d_note[0].upper() + fc.d_note[1:]] if fc.d_note else []) + [w[0].upper() + w[1:] for w in fc.warnings]
+    read = mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
+    if st.recirc:
+        return {"kind": "info", "head": "Идёт рециркуляция",
+                "sub": [f"Из силоса не подаётся — сколько досушивать, смотрите в разделе «{RECIRC}»."], "warn": warn,
+                "go": RECIRC}
+    sl = fc.silo
+    if sl and sl["late"]:
+        return {"kind": "info", "head": f"D для этого прохода уже не менять — {st.d:.0f} с",
+                "sub": [("До конца прохода выйдет только зерно, которое уже в шахте" if sl["m_tr"] >= 1 else
+                         "Масса прохода уже выгружена")
+                        + f": среднее по силосу ≈ {sl['avg']:.1f} %.", "Готовьте следующий проход."],
+                "warn": warn, "go": None}
+    if d_try:
+        return {"kind": "info", "head": f"При D = {d_try:.0f} с на выходе ≈ {fc.w_out_rec:.1f} %",
+                "sub": [f"Влагомер покажет ≈ {read:.1f} %. Подобранное для цели {fc.w_goal:.1f} %: D = {fc.d_rec:.0f} с."],
+                "warn": warn, "go": None}
+    diff = fc.d_rec - st.d
+    t_now = max(now, st.last) if now and st.last else (now or st.last)
+    q_cur = mdl.q_at(p, st.d)
+    tau_cur = p.lag_k * p.m_dryer / q_cur if q_cur > 0 else 0.0
+    if abs(diff) < D_STEP_MIN:
+        w_now_read = fc.w_out_now_read
+        return {"kind": "keep", "head": f"D не менять — {st.d:.0f} с",
+                "sub": [f"На выходе ≈ {fc.w_out_now:.1f} % (влагомер ≈ {w_now_read:.1f} %), цель {fc.w_goal:.1f} %.",
+                        f"Совет {fc.d_rec:.0f} с отличается меньше чем на {D_STEP_MIN:.0f} с — это ≈ 0,5 п.п. на "
+                        f"выходе, на уровне точности влагомера."],
+                "warn": warn, "go": None}
+    if st.d_changed_at is not None and t_now is not None:
+        ready = st.d_changed_at + timedelta(hours=tau_cur / 2.0)
+        if t_now < ready:
+            seen = st.d_changed_at + timedelta(hours=tau_cur)
+            return {"kind": "wait", "head": f"Подождите до {ready:%H:%M} — D не трогать",
+                    "sub": [f"D меняли в {st.d_changed_at:%H:%M} ({st.d_prev:.0f} → {st.d:.0f} с); на выходе это станет "
+                            f"видно к {seen:%H:%M}, а пока выходит зерно, которое сушилось при старом D.",
+                            f"Совет сейчас: D = {fc.d_rec:.0f} с — проверьте его после {ready:%H:%M}."],
+                    "warn": warn, "go": None}
+    sub = [f"Сейчас {st.d:.0f} с. На выходе станет ≈ {fc.w_out_rec:.1f} % (влагомер ≈ {read:.1f} %), "
+           f"цель {fc.w_goal:.1f} %."]
+    if fc.visible_at:
+        sub.append(f"Заметно на выходе через {fc.tau_h:.1f} ч — к {fc.visible_at:%H:%M}. После смены запишите её: "
+                   f"«Изменить режим…» в журнале.")
+    if abs(diff) > D_STEP_BIG:
+        sub.append("Большое изменение: сначала проверьте последнюю пробу входа, D и T блоков в журнале и задание "
+                   "слева; всё верно — меняйте, сомневаетесь — позвоните инженеру.")
+    return {"kind": "change", "head": f"Поставьте D = {fc.d_rec:.0f} с", "sub": sub, "warn": warn, "go": None}

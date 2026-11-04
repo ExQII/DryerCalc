@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QHBoxL
 from .analysis import batch_meter_points, combine_meter, meter_bias
 from .plots import SimplePlot
 from .theme import theme_for
-from .ui_common import to_num
+from .ui_common import size_by_current, to_num
 from .weather import WeatherSeries, merge_points, parse_dt, read_weather
 
 if TYPE_CHECKING:
@@ -33,6 +33,7 @@ class DataTab(QWidget):
         QVBoxLayout(self).addWidget(tabs)
         tabs.addTab(self._build_weather(), "Погода (наружный воздух)")
         tabs.addTab(self._build_meter(), "Поправка выходного влагомера")
+        size_by_current(tabs)
         self._load()
 
     # ==================================================================
@@ -48,7 +49,7 @@ class DataTab(QWidget):
             "в формате CSV (любая кодировка) или open-meteo.com → Historical Weather → температура 2 м и "
             "относительная влажность 2 м, часовой пояс «auto» → Download CSV. Значения подставляются к строкам "
             "журнала по времени (интерполяция между замерами не дальше 6 ч друг от друга, иначе ближайший в "
-            "пределах 3 ч) и учитываются при калибровке и в режиме «Сейчас».")
+            "пределах 3 ч) и учитываются при калибровке и в «Текущем проходе».")
         self.w_hint.setWordWrap(True)
         lay.addWidget(self.w_hint)
         bar = QHBoxLayout()
@@ -247,7 +248,7 @@ class DataTab(QWidget):
         bl.setContentsMargins(0, 0, 0, 0)
         self.cb_mb = QCheckBox("Учитывать партии (лабораторная W готовой партии)")
         self.cb_mb.setToolTip("Второй источник поправки, кроме пар: средний по массе выходной влагомер последнего "
-                              "прохода партии против лабораторной W после охлаждения (вкладка «Партии и очередь»).")
+                              "прохода партии против лабораторной W после охлаждения (раздел «Партии и очередь»).")
         self.cb_mb.setChecked(True)
         self.cb_mb.stateChanged.connect(lambda _s: self._m_stats())
         bl.addWidget(self.cb_mb)
@@ -337,7 +338,7 @@ class DataTab(QWidget):
             if comb["warn"]:
                 txt += f"<br><span style='color:{th.error}'>⚠ {comb['warn']}</span>"
         elif not points:
-            txt += ("<br>Партий с лабораторной W после охлаждения пока нет — впишите её на вкладке «Партии и очередь», "
+            txt += ("<br>Партий с лабораторной W после охлаждения пока нет — впишите её в разделе «Партии и очередь», "
                     "это ещё один независимый источник поправки.")
         txt += (f"<br>Сейчас в модели: <b>a = {cur:+.2f}</b>" + (f", k_w = {p.out_kw:+.3f}" if p.out_kw else "")
                 + (f", k_t = {p.out_kt:+.3f}" if p.out_kt else "") + ".")

@@ -16,7 +16,7 @@ from .batches import (BATCH_FIELDS, BATCH_HEADERS, BATCH_TEXT, QUALITY_NAMES, RE
                       schedule, season_meter_shift)
 from .plots import SimplePlot
 from .theme import mix as mix_color, theme_for
-from .ui_common import dspin, fmt_hours, fnum, item, table, to_num
+from .ui_common import dspin, fmt_hours, fnum, item, size_by_current, table, to_num
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -107,6 +107,7 @@ class BatchesTab(QWidget):
         tabs.addTab(self._build_quality(), "Качество и режим")
         tabs.addTab(self._build_queue(), "Очередь и смешивание")
         self.sub = tabs
+        size_by_current(tabs)
         tabs.currentChanged.connect(lambda _i: self.on_show())
         self._load()
 
@@ -119,7 +120,7 @@ class BatchesTab(QWidget):
         hint = QLabel(
             "Одна строка — одна партия. Время начала и конца связывает партию с журналом (проходы, часы работы). "
             "Массы — по весовой, влажность — лабораторная или после охлаждения. Топливо — сколько израсходовано за "
-            "партию (по счётчику или накладным), в той же единице, что на вкладке «Расчёт по модели».")
+            "партию (по счётчику или накладным), в той же единице, что в «Плане сушки партии».")
         hint.setWordWrap(True)
         lay.addWidget(hint)
         self.b_hint = hint
@@ -288,7 +289,7 @@ class BatchesTab(QWidget):
                              f"тепловой КПД ≈ <b>{100 * fu['thermal_eff']:.0f} %</b> (на испарение нужно ≈ 2,5 МДж/кг; "
                              f"остальное уходит с отработанным воздухом, на прогрев зерна и через стенки)")
             elif self.win.fuel_lhv() is None:
-                lines.append("Тепловой КПД: задайте теплоту сгорания топлива на вкладке «Расчёт по модели» (группа «Топливо»).")
+                lines.append("Тепловой КПД: задайте теплоту сгорания топлива в разделе «План сушки партии» (группа «Топливо»).")
         q = [(n, b.get(k)) for k, n in (("cracks", "трещиноватость"), ("broken", "битое"), ("test_weight", "натура"),
                                         ("germ", "всхожесть")) if b.get(k) is not None]
         if q or b.get("purpose"):
@@ -364,7 +365,7 @@ class BatchesTab(QWidget):
             return
         if QMessageBox.question(self, "Удельный расход",
                                 f"По {n} партиям: {rate:.1f} {self.win.fuel_unit()} на 1 т испарённой воды.\n"
-                                f"Подставить в «Расчёт по модели» (расход топлива в сценариях)?") == QMessageBox.Yes:
+                                f"Подставить в «План сушки партии» (расход топлива в сценариях)?") == QMessageBox.Yes:
             self.win.in_fuel.setValue(round(rate, 1))
             prices = [_n(b.get("fuel_price")) for b in self._batches() if _n(b.get("fuel_price"))]
             if prices and self.win.in_fuel_price.value() <= 0:
@@ -498,7 +499,7 @@ class BatchesTab(QWidget):
         f.addRow(self.q_cool)
         lv.addWidget(gb)
         self.lbl_q_note = QLabel("Условия (T блоков, наружный воздух) и лимиты съёма для метода по модели берутся "
-                                 "с вкладки «Расчёт по модели».")
+                                 "из раздела «План сушки партии».")
         self.lbl_q_note.setWordWrap(True)
         lv.addWidget(self.lbl_q_note)
         lv.addStretch(1)
