@@ -334,6 +334,9 @@ def run(out_path: str) -> int:
             _win2.tab_live.wk_final.setValue(14.0)
             app.processEvents()
             _win2.close()
+            import shiboken6       # окно удалить, а не только скрыть: иначе смена темы ниже дойдёт и до него
+            shiboken6.delete(_win2)
+            del _win2
             _st2.close()
         finally:
             sys.excepthook = _hook
