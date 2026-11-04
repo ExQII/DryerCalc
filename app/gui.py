@@ -8,6 +8,7 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+import shiboken6
 from PySide6.QtCore import QDateTime, QEvent, QSize, QTimer, Qt
 from PySide6.QtGui import QActionGroup, QBrush, QColor, QFont, QIcon
 from PySide6.QtWidgets import (
@@ -2181,6 +2182,8 @@ class MainWindow(QMainWindow):
 
     def _theme_changed(self) -> None:
         """Тема Windows сменилась на ходу (или палитра окна): при «как в Windows» — перестроить оформление."""
+        if not shiboken6.isValid(self):        # окно уже удалено, а отложенный вызов остался
+            return
         if design.mode() == "system" and design.system_dark() != design.tokens().dark:
             self.set_ui_theme("system", save=False)
         elif theme_for(self).dark != getattr(self, "_theme_dark", None):
