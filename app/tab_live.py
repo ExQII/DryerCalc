@@ -167,7 +167,7 @@ class LiveTab(QWidget):
             tp = f"{st.t_proc:.0f} °C" if st.t_proc is not None else "—"
             self.lbl_state.setText(
                 f"Партия <b>{st.batch or '—'}</b>, проход <b>{(f'{st.pass_no:g}' if st.pass_no is not None else '—')}</b><br>"
-                f"Начало прохода: <b>{st.start:%d.%m %H:%M}</b>; последняя проба: <b>{st.last:%d.%m %H:%M}</b> "
+                f"Начало прохода: <b>{st.start:%d.%m %H:%M}</b>; последняя запись: <b>{st.last:%d.%m %H:%M}</b> "
                 f"({fmt_hours(st.hours)} от начала)<br>"
                 f"Вход сейчас: <b>{fnum(st.w_in)} %</b>; выход (влагомер): <b>{fnum(st.w_out_read)} %</b><br>"
                 f"D: <b>{fnum(st.d, 0)} с</b> (Q = {fnum(mdl.q_at(p, st.d) if st.d else None)} т/ч); "

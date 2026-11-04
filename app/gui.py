@@ -13,15 +13,18 @@ from PySide6.QtGui import QBrush, QColor, QFont, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox, QInputDialog,
     QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter, QSystemTrayIcon,
-    QTableWidget,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStyledItemDelegate,
+    QSystemTrayIcon, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from . import __version__
 from . import model as mdl
 from .calibration import (FIELDS, HEADERS_RU, TEXT_FIELDS, calibrate, chronological_issues, chronological_order,
-                          insert_position, note_trap, read_journal, to_float, write_template)
+                          insert_position, needs_tolerance, note_trap, read_journal, to_float, tolerance_for,
+                          write_template)
+from .regime import (QE_CARRY, REGIME_FIELDS, REGIME_NAMES, default_change_time, fmt_num, has_sample, journal_carry,
+                     regime_at, regime_dialog_class, row_time)
 from . import backup as bkp
 from . import worker
 from .plots import SimplePlot
@@ -39,6 +42,23 @@ from .theme import ensure_style_for_palette, theme_for
 from .weather import WeatherSeries
 
 from .ui_common import SEP, dspin, fmt_hours, item, parse_decimals, parse_ints, scroll_wrap  # noqa: E402,F401
+
+
+class _JournalDelegate(QStyledItemDelegate):
+    """Знает прежнее и новое значение клетки журнала, исправленной вручную (программные изменения сюда не попадают)."""
+
+    def __init__(self, on_edit, parent=None):
+        super().__init__(parent)
+        self._on_edit = on_edit
+
+    def setModelData(self, editor, model, index) -> None:
+        old = index.data(Qt.EditRole)
+        super().setModelData(editor, model, index)
+        new = index.data(Qt.EditRole)
+        old = "" if old is None else str(old).strip()
+        new = "" if new is None else str(new).strip()
+        if old != new:
+            self._on_edit(index.row(), index.column(), old, new)
 
 
 class MainWindow(QMainWindow):
@@ -144,6 +164,38 @@ class MainWindow(QMainWindow):
                         save=False, log=False)
         self.storage.log_event("start", {"mode": self.mode, "version": __version__})
         self.statusBar().showMessage("Готово. Справка — последняя вкладка.", 8000)
+        QTimer.singleShot(1500, self._upgrade_model)
+
+    def _upgrade_model(self) -> None:
+        """Модель, откалиброванная прошлой версией (до 0.8), — дополнить допуски по журналу без перекалибровки.
+
+        Журнал, погода, партии, настройки и подобранная модель хранятся в базе %APPDATA%\\DryerCalc\\dryer.db и
+        переходят в новую версию сами. Новой версии может не хватать данных, которые прошлая не считала, — их
+        программа досчитывает по журналу один раз при первом запуске, не трогая коэффициенты модели."""
+        if not needs_tolerance(self.params) or getattr(self, "_upg_job", None) is not None:
+            return
+        rows = self._table_to_rows()
+        if not rows:
+            return
+        base = self.params
+
+        def done(res) -> None:
+            self._upg_job = None
+            if res is None or self.params is not base:     # мало строк или модель уже поменяли (калибровка)
+                return
+            new_p, text = res
+            self.set_params(new_p)
+            if not self.report.toPlainText().strip():
+                self.report.setPlainText(text)
+            self.statusBar().showMessage("Модель из прошлой версии сохранена без изменений; допуски дополнены по "
+                                         "журналу — калибровать заново не нужно.", 30000)
+            self.storage.log_event("model_upgrade", {"version": __version__, "r_ref": round(new_p.r_ref, 4)})
+
+        def failed(_e) -> None:
+            self._upg_job = None
+
+        self._upg_job = worker.start(tolerance_for, rows, base, half_life_days=self.tab_check.half_life(),
+                                     weather=self.weather_series(), on_done=done, on_error=failed)
 
     # ------------------------------------------------------------------
     # Общие данные для вкладок
@@ -718,8 +770,10 @@ class MainWindow(QMainWindow):
             "верхний), температура блоков (пишется только при изменении, пустое значение = прежнее), разгрузка D, "
             "примечание. Время можно вводить как «08:30» (дата и переход через полночь определяются сами) или "
             "«21.10.26 08:30». Строки-примечания («Остановка», «Запуск», «Закончился …», «открыли с …») делят "
-            "журнал на проходы. Таблицу можно править прямо здесь. Быстрый ввод: время само сдвигается на 30 мин, "
-            "T блоков, D, партия и проход переносятся с прошлой строки — меняйте их, только когда меняются.")
+            "журнал на проходы. Таблицу можно править прямо здесь. Быстрый ввод: время — последняя проба + 30 мин, "
+            "T блоков, D, партия и проход — из последней записи журнала (исправили в таблице — быстрый ввод возьмёт "
+            "исправленное). Поменяли D или T блоков между пробами — «Изменить режим…»: отдельная строка со своим "
+            "временем.")
         hint.setWordWrap(True)
         lay.addWidget(hint)
 
@@ -740,8 +794,15 @@ class MainWindow(QMainWindow):
         lay.addLayout(bar)
 
         qe = QGroupBox("Быстрый ввод пробы — Enter добавляет строку")
-        qe.setToolTip("Время само сдвигается на 30 мин; T блоков, D, партия и проход переносятся с прошлой строки — "
-                      "меняйте их, только когда меняются.")
+        qe.setToolTip("Время — последняя проба + 30 мин; T блоков, D, партия и проход — из последней записи журнала "
+                      "(исправили их в таблице — быстрый ввод возьмёт исправленное). Поменяли режим между пробами — "
+                      "«Изменить режим…»: изменение запишется отдельной строкой со своим временем.")
+        self._qe_auto: Dict[str, str] = {}               # что программа сама подставила в поля (не правка человека)
+        self._qe_auto_time: Optional[datetime] = None
+        self._qe_sync_timer = QTimer(self)
+        self._qe_sync_timer.setSingleShot(True)
+        self._qe_sync_timer.setInterval(250)
+        self._qe_sync_timer.timeout.connect(self._qe_prefill)
         g = QGridLayout(qe)
         g.setVerticalSpacing(2)
         self.qe_time = QDateTimeEdit(QDateTime.currentDateTime())
@@ -750,6 +811,7 @@ class MainWindow(QMainWindow):
         g.addWidget(QLabel("Время пробы"), 0, 0)
         g.addWidget(self.qe_time, 1, 0)
         self.qe: Dict[str, QLineEdit] = {}
+        qe_col: Dict[str, int] = {}
         col = 1
         for key, cap, ph, width in (("w_in", "Влага вход, %", "Вход, %", 70), ("w_out", "Влага выход, %", "Выход, %", 70),
                                     ("t_a1", "T зерна низ", "T низ", 56), ("t_a2", "T зерна верх", "T верх", 56),
@@ -765,6 +827,7 @@ class MainWindow(QMainWindow):
                 le.setFixedWidth(width)
             le.returnPressed.connect(self._qe_add)
             self.qe[key] = le
+            qe_col[key] = col
             g.addWidget(QLabel(cap), 0, col)
             g.addWidget(le, 1, col)
             if not width:
@@ -774,6 +837,12 @@ class MainWindow(QMainWindow):
         b.clicked.connect(self._qe_add)
         g.addWidget(b, 1, col)
         self.qe_add_btn = b
+        b = QPushButton("Изменить режим…")
+        b.setToolTip("Поменяли D или T блоков между пробами — запишите изменение отдельной строкой с его временем: "
+                     "пробы до него останутся со старым режимом, после — с новым.")
+        b.clicked.connect(self._regime_button)
+        g.addWidget(b, 2, qe_col["t_up"], 1, qe_col["d"] - qe_col["t_up"] + 1)     # под T блоков и D: ширину не добавляет
+        self.qe_regime_btn = b
         self.qe_box = qe
         lay.addWidget(qe)
 
@@ -795,6 +864,7 @@ class MainWindow(QMainWindow):
         self.tbl_j.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.tbl_j.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_j.itemChanged.connect(self._journal_changed)
+        self.tbl_j.setItemDelegate(_JournalDelegate(self._cell_edited, self.tbl_j))
         self._rows_cache: Optional[List[Dict]] = None
         jm = self.tbl_j.model()
         for sig in (jm.dataChanged, jm.rowsInserted, jm.rowsRemoved, jm.rowsMoved, jm.modelReset, jm.layoutChanged):
@@ -826,24 +896,50 @@ class MainWindow(QMainWindow):
         self._qe_prefill()
         QTimer.singleShot(0, self.tbl_j.scrollToBottom)      # свежие записи — внизу, их и показываем
 
-    def _qe_prefill(self) -> None:
-        """Время следующей пробы и переносимые значения — по последним строкам журнала."""
-        from .calibration import prepare
+    def _qe_prefill(self, after_add: bool = False) -> List[str]:
+        """Строка быстрого ввода следует за журналом: T блоков, D, партия, проход — из последней записи, время —
+        последняя проба + интервал (regime.journal_carry). Вызывается после любой правки журнала (таймер 0,25 с):
+        исправили D в последней строке — быстрый ввод покажет новое. Поле, которое человек уже поменял для следующей
+        строки (текст не тот, что подставила программа), не трогается. after_add — сразу после добавления строки:
+        все поля принимают значения журнала. Возвращает список «D 35 → 40» того, что поменялось само."""
         rows = self._table_to_rows()
-        if not rows:
+        interval = self.reminder_cfg().sample_min if getattr(self, "_ready", False) else 30.0
+        vals, nxt = journal_carry(rows, interval)
+        changed: List[str] = []
+        for key in QE_CARRY:
+            v = vals.get(key)
+            if v is None:
+                continue
+            txt = str(v) if key == "batch" else fmt_num(v)
+            le = self.qe[key]
+            cur = le.text().strip()
+            auto = self._qe_auto.get(key)
+            if key == "batch":
+                same = auto is not None and cur == auto
+            else:
+                a, c = to_float(auto) if auto else None, to_float(cur) if cur else None
+                same = a is not None and c is not None and abs(a - c) < 1e-9
+            if after_add or ((not cur or same) and not le.hasFocus()):
+                if cur and cur != txt and not after_add:
+                    changed.append(f"{REGIME_NAMES.get(key, {'batch': 'партия', 'pass_no': 'проход'}.get(key, key))} "
+                                   f"{cur} → {txt}")
+                if cur != txt:
+                    le.setText(txt)
+                self._qe_auto[key] = txt
+        if nxt is None and not rows:
             now = datetime.now()
-            self.qe_time.setDateTime(now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0))
-            return
-        prep, reliable = prepare(rows)
-        last = prep[-1]
-        if reliable and last.get("dt") is not None:
-            self.qe_time.setDateTime(last["dt"] + timedelta(minutes=30))
-        for key, val in (("t_up", last.get("t_up_f")), ("t_low", last.get("t_low_f")), ("d", last.get("d_f")),
-                         ("pass_no", last.get("pass_no"))):
-            if val is not None and not self.qe[key].text().strip():
-                self.qe[key].setText(f"{val:g}".replace(".", ","))
-        if last.get("batch") and not self.qe["batch"].text().strip():
-            self.qe["batch"].setText(str(last["batch"]))
+            nxt = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
+        cur_t = self.qe_time.dateTime().toPython().replace(second=0, microsecond=0)
+        if nxt is not None:
+            if after_add or self._qe_auto_time is None or cur_t == self._qe_auto_time:
+                self.qe_time.setDateTime(nxt)
+                self._qe_auto_time = nxt
+        elif after_add:                     # время в журнале не распознано — просто +интервал
+            self.qe_time.setDateTime(self.qe_time.dateTime().addSecs(int(interval * 60)))
+            self._qe_auto_time = None
+        if changed and getattr(self, "_ready", False):
+            self.statusBar().showMessage("Быстрый ввод взял из журнала: " + ", ".join(changed) + ".", 15000)
+        return changed
 
     def _qe_add(self) -> None:
         vals = {k: le.text().strip() for k, le in self.qe.items()}
@@ -884,12 +980,9 @@ class MainWindow(QMainWindow):
         self._save_journal()
         self.storage.log_event("sample", {"ts": row["ts"], "late_min": round(
             (datetime.now() - self.qe_time.dateTime().toPython()).total_seconds() / 60.0, 1)})
-        if pos < len(rows_now):
-            self._qe_prefill_time()
-        else:
-            self.qe_time.setDateTime(self.qe_time.dateTime().addSecs(30 * 60))
         for key in ("w_in", "w_out", "t_a1", "t_a2", "note"):
             self.qe[key].clear()
+        self._qe_prefill(after_add=True)
         self.qe["w_in"].setFocus()
 
     def _confirm_note(self, note: str) -> bool:
@@ -911,13 +1004,113 @@ class MainWindow(QMainWindow):
         box.exec()
         return box.clickedButton() is yes
 
-    def _qe_prefill_time(self) -> None:
-        """Время следующей пробы = последняя запись журнала + 30 мин."""
-        from .calibration import assign_times
-        times, reliable = assign_times(self._table_to_rows())
-        last = max((t for t in times if t is not None), default=None)
-        if reliable and last is not None:
-            self.qe_time.setDateTime(last + timedelta(minutes=30))
+    # ------------------------------------------------------------------
+    # Смена режима сушки (D, T блоков) — отдельной строкой со своим временем
+    # ------------------------------------------------------------------
+    def _table_index_map(self) -> List[int]:
+        """Номера строк таблицы для строк журнала (_table_to_rows пропускает пустые строки таблицы)."""
+        out = []
+        for i in range(self.tbl_j.rowCount()):
+            if any((self.tbl_j.item(i, j).text().strip() if self.tbl_j.item(i, j) else "") for j in range(len(FIELDS))):
+                out.append(i)
+        return out
+
+    def _set_cell(self, i: int, f: str, v) -> None:
+        txt = "" if v is None else (str(v) if f in TEXT_FIELDS else f"{v:g}")
+        it = self.tbl_j.item(i, FIELDS.index(f))
+        if it is None:
+            self.tbl_j.setItem(i, FIELDS.index(f), QTableWidgetItem(txt))
+        else:
+            it.setText(txt)
+
+    def _cell_edited(self, row: int, col: int, old: str, new: str) -> None:
+        """Ручная правка клетки. Поменяли D или T блоков в ПОСЛЕДНЕЙ строке с пробой — спросить: опечатка или режим
+        поменяли после пробы (тогда это отдельная строка со своим временем, а проба остаётся со старым режимом)."""
+        f = FIELDS[col]
+        if f not in REGIME_FIELDS:
+            return
+        idx = self._table_index_map()
+        if not idx or row != idx[-1]:
+            return
+        rows = self._table_to_rows()
+        last = rows[-1]
+        nv = to_float(new) if new else None
+        if not has_sample(last) or nv is None:
+            return
+        ov = to_float(old) if old else None
+        if ov is None:
+            ov = regime_at(rows, len(rows) - 1)[f]          # клетка была пустой — действовало значение сверху
+        if ov is None or abs(ov - nv) < 1e-9:
+            return
+        QTimer.singleShot(0, lambda: self._ask_regime_after_edit(row, f, old, ov, nv))
+
+    def _ask_regime_after_edit(self, row: int, f: str, old_txt: str, ov: float, nv: float) -> None:
+        it = self.tbl_j.item(row, FIELDS.index(f))
+        if it is None or to_float(it.text().strip()) != nv:
+            return                                       # клетку уже поменяли ещё раз
+        rows = self._table_to_rows()
+        last = dict(rows[-1])
+        last[f] = to_float(old_txt) if old_txt else None
+        rows_before = rows[:-1] + [last]                 # журнал без этой правки
+        t0 = row_time(last)
+        ts = default_change_time(rows_before, datetime.now(), after=t0) if t0 else datetime.now()
+        intro = (f"В строке <b>{last.get('ts')}</b> уже записана проба, а {REGIME_NAMES[f]} в ней изменено: "
+                 f"<b>{fmt_num(ov)} → {fmt_num(nv)}</b>.<br><br>"
+                 f"<b>Опечатка</b> (проба взята при {REGIME_NAMES[f]} = {fmt_num(nv)}) — нажмите «Это опечатка», "
+                 f"правка останется.<br>"
+                 f"<b>Режим поменяли после пробы</b> — укажите, когда: проба {str(last.get('ts')).split(' ')[-1]} "
+                 f"останется с прежним {REGIME_NAMES[f]} = {fmt_num(ov)}, а изменение запишется отдельной строкой. "
+                 f"Иначе калибровка припишет пробе чужой режим, а «выгружено» посчитает новое D с момента пробы.<br>"
+                 f"Поменяли и другие значения режима — впишите их здесь же.")
+        dlg = regime_dialog_class()(self, rows_before, {f: nv}, ts,
+                                    min_ts=(t0 + timedelta(minutes=1)) if t0 else None, intro=intro, edit_mode=True)
+        if dlg.exec() != QDialog.Accepted or dlg.plan is None:
+            self.statusBar().showMessage(f"Оставлено как исправление: {REGIME_NAMES[f]} {fmt_num(nv)} в строке "
+                                         f"{last.get('ts')}.", 10000)
+            return
+        if not self._confirm_note(dlg.plan["row"]["note"]):
+            return
+        self._set_cell(row, f, last[f])                  # проба — с прежним режимом
+        self._apply_regime(dlg.plan, dlg.fix_following())
+
+    def _regime_button(self) -> None:
+        rows = self._table_to_rows()
+        cur = regime_at(rows, len(rows))
+        changes = {}
+        for k in REGIME_FIELDS:              # новое значение, уже вписанное в быстрый ввод, — это и есть изменение
+            v = to_float(self.qe[k].text().strip()) if self.qe[k].text().strip() else None
+            if v is not None and (cur[k] is None or abs(v - cur[k]) > 1e-9):
+                changes[k] = v
+        dlg = regime_dialog_class()(self, rows, changes, default_change_time(rows, datetime.now()),
+                                    intro="Запишите изменение режима отдельной строкой с его настоящим временем: "
+                                          "пробы до него останутся со старым режимом, после — с новым.")
+        if dlg.exec() != QDialog.Accepted or dlg.plan is None:
+            return
+        if not self._confirm_note(dlg.plan["row"]["note"]):
+            return
+        self._apply_regime(dlg.plan, dlg.fix_following())
+
+    def _apply_regime(self, plan: Dict, fix_following: bool) -> None:
+        """Вставить строку смены режима на её место по времени; при fix_following — исправить старый режим в строках
+        после неё. Затем быстрый ввод берёт новый режим, время следующей пробы — по последней пробе."""
+        idx = self._table_index_map()
+        pos = plan["pos"]
+        t_ins = idx[pos] if pos < len(idx) else (idx[-1] + 1 if idx else 0)
+        if fix_following:
+            for j, k, v in plan["fixes"]:
+                self._set_cell(idx[j], k, v)
+        self._insert_rows(t_ins, [plan["row"]])
+        self._invalidate_rows()
+        self._save_journal()
+        self._qe_prefill(after_add=True)
+        self.tbl_j.scrollToItem(self.tbl_j.item(t_ins, 0))
+        self.tbl_j.selectRow(t_ins)
+        n_fix = len({j for j, _, _ in plan["fixes"]}) if fix_following else 0
+        self.statusBar().showMessage(
+            f"Изменение режима записано строкой {plan['row']['ts']}: {plan['row']['note']}."
+            + (f" Исправлено строк со старым режимом: {n_fix}." if n_fix else "")
+            + f" Следующая проба — {self.qe_time.dateTime().toString('HH:mm')}.", 20000)
+        self.storage.log_event("regime", {"ts": plan["row"]["ts"], "note": plan["row"]["note"], "fixed": n_fix})
 
     def _insert_rows(self, pos: int, rows: List[Dict]) -> None:
         self._loading = True
@@ -1028,6 +1221,9 @@ class MainWindow(QMainWindow):
 
     def _invalidate_rows(self, *_a) -> None:
         self._rows_cache = None
+        timer = getattr(self, "_qe_sync_timer", None)
+        if timer is not None and not getattr(self, "_loading", False):
+            timer.start()
 
     def _table_to_rows(self) -> List[Dict]:
         """Строки журнала из таблицы. Разбор таблицы кэшируется до её следующего изменения (на журнале сезона —
@@ -1672,6 +1868,7 @@ class MainWindow(QMainWindow):
         self.recalc()
         self.recalc_simple()
         self.tab_check.mark_dirty()
+        QTimer.singleShot(500, self._upgrade_model)     # копия от прошлой версии — дополнить допуски модели
 
     def _open_data_dir(self) -> None:
         from PySide6.QtCore import QUrl

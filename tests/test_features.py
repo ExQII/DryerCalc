@@ -658,6 +658,172 @@ def test_meter_bias_from_batches():
 
 
 # ---------------------------------------------------------------------------
+# v0.8.1: базы прошлых версий, быстрый ввод следует за журналом, смена режима отдельной строкой
+# ---------------------------------------------------------------------------
+
+OLD_DBS = [os.path.join(ROOT, "tests", "data", f"dryer_v{v}.db") for v in ("0.5.0", "0.6.0", "0.7.0")]
+COEFS = ("r_ref", "b_w", "b_dt", "b_amb", "b_rh", "eta", "kappa", "calib_info", "phys_info", "out_bias", "m_dryer",
+         "lag_k", "q_table", "calibrated")
+
+
+def test_old_version_databases_keep_journal_and_model():
+    """Базы, оставленные версиями 0.5–0.7 (tools/make_old_db.py): новая версия читает журнал, партии, пары
+    влагомера и подобранную модель как есть; допуски v0.8 досчитываются без перекалибровки."""
+    import json
+    import shutil
+    from app.calibration import needs_tolerance, tolerance_for
+    from app.model import param_sigma
+    for src in OLD_DBS:
+        db = _tmp("dryer.db")
+        shutil.copy(src, db)
+        raw = json.loads(sqlite3.connect(src).execute("SELECT value FROM settings WHERE key='params'").fetchone()[0])
+        st = Storage(db)
+        p = st.load_params()
+        assert all(getattr(p, k) == raw[k] for k in COEFS if k in raw), src
+        rows = st.load_journal()
+        assert len(rows) == 159 and len(st.get_list("batches")) == 3 and len(st.get_list("meter_pairs")) == 5
+        assert needs_tolerance(p) and param_sigma(p, 22.0, 90.0, 0.0, 90.0) == 0.0
+        q, text = tolerance_for(rows, p)
+        assert all(getattr(q, k) == getattr(p, k) for k in COEFS), "коэффициенты модели не должны меняться"
+        assert q.unc_cov and q.explored and not needs_tolerance(q) and "сохранена без изменений" in text
+        assert param_sigma(q, 22.0, 90.0, 0.0, 90.0) > 0.03 and param_sigma(q, 22.0, 60.0, 10.0, 70.0) < 0.005
+        st.save_params(q)
+        st.close()
+        q2 = Storage(db).load_params()
+        assert q2.unc_cov == q.unc_cov and q2.r_ref == p.r_ref
+
+
+def test_tolerance_for_saved_model_matches_calibration():
+    """На том же журнале допуски «без перекалибровки» совпадают с теми, что даёт калибровка; если журнал с тех пор
+    пополнился и модель отстала — коэффициенты те же, а разброс честно больше."""
+    import numpy as np
+    from app.calibration import tolerance_for
+    rows = _sample_rows()
+    p, _ = calibrate(rows, P)
+    old = replace(p, unc_feats=None, unc_cov=None, unc_lev=0.0, explored=None)
+    q, _ = tolerance_for(rows, old)
+    assert q.unc_feats == p.unc_feats and q.explored == p.explored and abs(q.struct_base - p.struct_base) < 1e-12
+    assert np.allclose(q.unc_cov, p.unc_cov, rtol=1e-9, atol=1e-15) and abs(q.unc_lev - p.unc_lev) < 1e-12
+    # сушилка «стала сушить» на 15 % быстрее, чем помнит модель: выход ниже на соответствующую величину
+    grown = rows + [dict(r, ts=r["ts"].replace("10.26", "11.26").replace(".10.", ".11."),
+                         w_out=None if r.get("w_out") is None else r["w_out"] - 0.9) for r in rows]
+    q3, _ = tolerance_for(grown, old)
+    assert q3.r_ref == old.r_ref and q3.b_w == old.b_w and q3.unc_lev > 1.5 * q.unc_lev
+
+
+def test_quick_entry_carry_and_next_sample_time():
+    from app.regime import journal_carry
+
+    def r(ts, wi=None, wo=None, d=None, tu=None, tl=None, note="", batch="К-07", pass_no=1):
+        return {"ts": "25.10.26 " + ts, "w_in": wi, "w_out": wo, "t_a1": None, "t_a2": None, "t_up": tu, "t_low": tl,
+                "d": d, "note": note, "batch": batch, "pass_no": pass_no, "t_amb": None, "rh": None}
+    rows = [r("09:30", 30, 24, 35, 60, 55), r("10:00", 30, 24)]          # пустые клетки = прежний режим
+    vals, nxt = journal_carry(rows)
+    assert (vals["d"], vals["t_up"], vals["t_low"], vals["batch"], vals["pass_no"]) == (35, 60, 55, "К-07", 1)
+    assert nxt == datetime(2026, 10, 25, 10, 30)
+    rows[-1]["d"] = 40                                                    # исправили D в последней строке
+    assert journal_carry(rows)[0]["d"] == 40
+    # смена режима в 10:05 между пробами — следующая проба по-прежнему 10:30
+    vals, nxt = journal_carry(rows + [r("10:05", d=42, note="Режим: D 40→42 с")])
+    assert vals["d"] == 42 and nxt == datetime(2026, 10, 25, 10, 30)
+    # «Запуск» после долгой остановки — от события
+    assert journal_carry(rows + [r("10:10", note="Остановка"), r("12:10", note="Запуск")])[1] == datetime(2026, 10, 25, 12, 40)
+    assert journal_carry(rows, 20.0)[1] == datetime(2026, 10, 25, 10, 20)
+    assert journal_carry([dict(x, ts="") for x in rows])[1] is None and journal_carry([]) == ({}, None)
+
+
+def test_regime_change_row_and_fix_of_later_rows():
+    from app.calibration import note_trap, observe_all, prepare
+    from app.regime import plan_regime_change, regime_note
+
+    def r(ts, wi=None, wo=None, d=None, note=""):
+        return {"ts": "25.10.26 " + ts, "w_in": wi, "w_out": wo, "t_a1": None, "t_a2": None, "t_up": 60, "t_low": 55,
+                "d": d, "note": note, "batch": "К-07", "pass_no": 2, "t_amb": None, "rh": None}
+    rows = [r("09:00", 30, 24, 35), r("09:30", 30, 24, 35), r("10:00", 30, 24, 35), r("10:30", 30, 24, 40),
+            r("11:00", 30, 24, None), r("11:30", 30, 24, 40)]
+    # вовремя: после последней пробы — в конец, исправлять нечего
+    pl = plan_regime_change(rows, datetime(2026, 10, 25, 11, 35), {"d": 44})
+    assert pl["pos"] == 6 and pl["changed"] == ["d"] and pl["fixes"] == []
+    assert pl["row"]["note"] == "Режим: D 40→44 с" and pl["row"]["batch"] == "К-07" and pl["row"]["pass_no"] == 2
+    assert (pl["row"]["d"], pl["row"]["t_up"], pl["row"]["t_low"]) == (44, 60, 55)
+    # задним числом: D поменяли в 09:10, а 09:30 и 10:00 записаны со старым 35; в 10:30 уже 40 — дальше не трогаем
+    pl = plan_regime_change(rows, datetime(2026, 10, 25, 9, 10), {"d": 38}, "по «Сейчас»")
+    assert pl["pos"] == 1 and pl["fixes"] == [(1, "d", 38), (2, "d", 38)]
+    assert pl["row"]["note"] == "Режим: D 35→38 с — по «Сейчас»"
+    assert plan_regime_change(rows, datetime(2026, 10, 25, 9, 10), {"d": 35})["changed"] == []
+    # примечание — не слово-команда: участок не рвётся, строка не идёт в калибровку как проба
+    note = regime_note({"d": 35, "t_up": 60, "t_low": 55}, {"d": 38, "t_up": 65, "t_low": None})
+    assert note == "Режим: D 35→38 с; T блоков 60/55→65/55 °C" and note_trap(note) is None
+    full = rows[:1] + [pl["row"]] + rows[1:]
+    prep, _ = prepare(full)
+    assert len({x["seg"] for x in prep}) == 1 and len(observe_all(full, P)[0]) == len(observe_all(rows, P)[0])
+
+
+def test_quick_entry_follows_journal_edits_in_window():
+    """Окно: исправили D/T блоков в таблице — быстрый ввод берёт исправленное; своё значение человека не трогает;
+    правка D в последней строке с пробой — вопрос «опечатка или режим поменяли»; старая модель — допуски сами."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import shutil
+    from PySide6.QtCore import QDateTime
+    from PySide6.QtWidgets import QApplication, QDialog, QLineEdit
+    app = QApplication.instance() or QApplication([])
+    from app import regime, worker
+    from app.calibration import FIELDS
+    from app.gui import MainWindow
+    db = _tmp("dryer.db")
+    shutil.copy(OLD_DBS[-1], db)
+    win = MainWindow(Storage(db))
+    r_ref = win.params.r_ref
+    win._upgrade_model()
+    worker.wait_all()
+    for _ in range(20):
+        app.processEvents()
+    assert win.params.unc_cov and win.params.r_ref == r_ref and "без изменений" in win.statusBar().currentMessage()
+    assert win.qe["d"].text() == "35" and win.qe_time.dateTime().toString("HH:mm") == "07:00"
+    last, col_d = win.tbl_j.rowCount() - 1, FIELDS.index("d")
+
+    def edit(i, col, txt):          # правка клетки человеком — через делегат таблицы, как при вводе с клавиатуры
+        ed = QLineEdit(txt)
+        win.tbl_j.itemDelegate().setModelData(ed, win.tbl_j.model(), win.tbl_j.model().index(i, col))
+        for _ in range(5):
+            app.processEvents()
+        win._qe_sync_timer.stop()
+        win._qe_prefill()
+
+    answers = []
+    dlg_cls = regime.regime_dialog_class()
+    orig = dlg_cls.exec
+
+    def fake_exec(self):
+        a = answers.pop(0)
+        if a == "typo":
+            return dlg_cls.TYPO
+        self.ts.setDateTime(QDateTime(a["ts"]))
+        for k, v in a.get("vals", {}).items():
+            self.ed[k].setText(v)
+        return QDialog.Accepted if self.plan and self.plan["changed"] else QDialog.Rejected
+    dlg_cls.exec = fake_exec
+    try:
+        answers.append("typo")
+        edit(last, col_d, "40")
+        assert win.tbl_j.item(last, col_d).text() == "40" and win.qe["d"].text() == "40" and not answers
+        t0 = regime.row_time(win._table_to_rows()[-1])
+        answers.append({"ts": t0 + timedelta(minutes=6), "vals": {"t_low": "58"}})
+        edit(last, FIELDS.index("t_up"), "70")
+        rows = win._table_to_rows()
+        assert rows[-2]["t_up"] is None and rows[-2]["d"] == 40           # проба — с прежним режимом
+        assert rows[-1]["t_up"] == 70 and rows[-1]["t_low"] == 58 and rows[-1]["note"].startswith("Режим: T блоков")
+        assert (win.qe["t_up"].text(), win.qe["t_low"].text()) == ("70", "58")
+        assert win.qe_time.dateTime().toPython() == t0 + timedelta(minutes=30)
+        win.qe["d"].setText("45")                                             # своё значение для следующей строки
+        edit(win.tbl_j.rowCount() - 1, col_d, "42")
+        assert win.qe["d"].text() == "45"
+    finally:
+        dlg_cls.exec = orig
+    win.close()
+
+
+# ---------------------------------------------------------------------------
 # «Правила работы» (docs/rules_ru.txt): то, что там написано о разборе журнала, должно оставаться правдой.
 # Если тест упал после изменения программы — обновите разделы 4–8, 10 и 20 правил.
 # ---------------------------------------------------------------------------

@@ -245,8 +245,9 @@ class DataTab(QWidget):
         bw = QWidget()
         bl = QVBoxLayout(bw)
         bl.setContentsMargins(0, 0, 0, 0)
-        self.cb_mb = QCheckBox("Учитывать партии: средний выходной влагомер последнего прохода против лабораторной "
-                               "W готовой партии (вкладка «Партии и очередь»)")
+        self.cb_mb = QCheckBox("Учитывать партии (лабораторная W готовой партии)")
+        self.cb_mb.setToolTip("Второй источник поправки, кроме пар: средний по массе выходной влагомер последнего "
+                              "прохода партии против лабораторной W после охлаждения (вкладка «Партии и очередь»).")
         self.cb_mb.setChecked(True)
         self.cb_mb.stateChanged.connect(lambda _s: self._m_stats())
         bl.addWidget(self.cb_mb)

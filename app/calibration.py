@@ -761,6 +761,105 @@ def _param_cov(x: np.ndarray, wt: np.ndarray, a: np.ndarray, res: np.ndarray, gr
     return cov * deff, deff
 
 
+def _fit_use(feats: Dict[str, np.ndarray], ii: np.ndarray, has_rh: bool, has_amb: bool) -> List[str]:
+    """Какие показатели подбираются по журналу: при 12+ строках — те, у признака которых есть разброс; влияние
+    погоды — только если T/RH наружные есть хотя бы у половины строк."""
+    use: List[str] = []
+    if len(ii) >= 12:
+        for k in feats:
+            if float(np.std(feats[k][ii])) > 0.02:
+                use.append(k)
+    if "b_rh" in use and not has_rh:
+        use.remove("b_rh")
+    if "b_amb" in use and not has_amb:
+        use.remove("b_amb")
+    return use
+
+
+def _tolerance_fields(obs: List[Dict], ii: np.ndarray, feats: Dict[str, np.ndarray], use: List[str], x: np.ndarray,
+                      wt: np.ndarray, a: np.ndarray, res: np.ndarray, segs: List[Dict], segs_phys: List[Dict],
+                      used_arr: Dict[str, np.ndarray], p: DryerParams) -> Tuple[Dict, float]:
+    """Поля DryerParams для честных допусков (v0.8): ковариация коэффициентов, её среднее на журнале, типичное
+    расхождение моделей и изученные пределы. Возвращает (поля, эффект плана)."""
+    cov_fit, deff = _param_cov(x, wt, a, np.asarray(res), np.asarray([obs[i]["seg"] for i in ii]))
+    # коэффициенты, не подобранные по журналу (нет данных или разброса), известны только приблизительно —
+    # их априорная неопределённость тоже входит в допуск
+    fixed = [k for k in feats if k not in use]
+    unc_feats = ["const"] + list(use) + fixed
+    cov = np.zeros((len(unc_feats), len(unc_feats)))
+    cov[:len(cov_fit), :len(cov_fit)] = cov_fit
+    for j, k in enumerate(fixed, start=len(cov_fit)):
+        cov[j, j] = PRIOR_SD[k] ** 2
+    f_full = np.column_stack([np.ones(len(ii))] + [feats[k][ii] for k in unc_feats[1:]])
+    lev = float(np.mean(np.einsum("ij,jk,ik->i", f_full, cov, f_full))) if len(ii) else 0.0
+    phys_by = {sp["seg"]: sp for sp in segs_phys}
+    rel = [abs(phys_by[sg["seg"]]["dw_pred"] - sg["dw_pred"]) / max(sg["dw_pred"], 0.5) for sg in segs if sg["seg"] in phys_by]
+    struct_base = float(np.median(rel)) if rel else p.struct_base
+    explored = {"d": [float(used_arr["d"].min()), float(used_arr["d"].max())],
+                "t": [float(used_arr["t_proc"].min()), float(used_arr["t_proc"].max())],
+                "w": [float(used_arr["w_in"].min()), float(used_arr["w_in"].max())]}
+    return {"unc_feats": unc_feats, "unc_cov": cov.tolist(), "unc_lev": lev, "struct_base": struct_base,
+            "explored": explored}, deff
+
+
+def _tolerance_line(unc: Dict, deff: float) -> str:
+    ex = unc["explored"]
+    return (f"ДОПУСКИ: разброс коэффициентов ±{100 * math.sqrt(unc['unc_lev']):.1f} % скорости сушки в изученных режимах "
+            f"(с поправкой на зависимость строк внутри прохода ×{deff:.1f}); вне их он растёт. Типичное расхождение "
+            f"моделей на проходах журнала {100 * unc['struct_base']:.0f} %. Изучено: D {ex['d'][0]:.0f}–"
+            f"{ex['d'][1]:.0f} с, T {ex['t'][0]:.0f}–{ex['t'][1]:.0f} °C, W вх {ex['w'][0]:.0f}–{ex['w'][1]:.0f} %.")
+
+
+def needs_tolerance(p: DryerParams) -> bool:
+    """Модель откалибрована версией до 0.8: коэффициенты есть, данных для честных допусков нет."""
+    return bool(p.calibrated) and not p.unc_cov
+
+
+def tolerance_for(rows: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days: float = 0.0,
+                  weather=None) -> Optional[Tuple[DryerParams, str]]:
+    """Допуски для уже подобранной модели — БЕЗ перекалибровки (для модели, откалиброванной прошлой версией).
+
+    Коэффициенты p (R_ref, показатели, η, κ) не меняются. По журналу считаются только: разброс коэффициентов —
+    по остаткам именно этой модели (если журнал с тех пор пополнился и модель «отстала», остатки больше и допуск
+    честно шире), типичное расхождение двух моделей и изученные пределы D, T, W. Тот же отбор строк, выбросов и весов,
+    что при калибровке. None — пригодных строк меньше 3."""
+    if weather is not None:
+        rows = weather.fill_rows(rows)
+    obs, _skipped, _lag = observe_all(rows, p)
+    n = len(obs)
+    if n < 3:
+        return None
+    wts_all = np.asarray(recency_weights(obs, half_life_days), dtype=float)
+    y = np.log(np.fromiter((o["r"] for o in obs), dtype=float, count=n))
+    feats = _features(obs, p)
+    coef = {"b_w": p.b_w, "b_dt": p.b_dt, "b_amb": p.b_amb, "b_rh": p.b_rh}
+    res_all = y - math.log(max(p.r_ref, 1e-9)) - sum(coef[k] * feats[k] for k in feats)     # остатки ln R этой модели
+    idx = np.arange(n)
+    if n >= 15:                                         # выбросы — по тому же правилу 3·MAD, что при калибровке
+        med = float(np.median(res_all))
+        mad = float(np.median(np.abs(res_all - med))) * 1.4826
+        if mad > 1e-9:
+            keep = np.abs(res_all - med) <= 3.0 * mad
+            if 0.7 * n <= int(keep.sum()) < n:
+                idx = idx[keep]
+    has_rh = sum(o["has_rh"] for o in obs) >= 0.5 * n
+    has_amb = sum(o["has_amb"] for o in obs) >= 0.5 * n
+    use = _fit_use(feats, idx, has_rh, has_amb)
+    wt = wts_all[idx]
+    x = np.column_stack([np.ones(len(idx))] + [feats[k][idx] for k in use])
+    a = x.T @ (wt[:, None] * x) + np.diag(np.array([0.0] + [lam] * len(use)))
+    used = [obs[i] for i in idx]
+    used_arr = _obs_arr(used)
+    segs = segment_summary(used, replace(p, model_kind="empirical"), used_arr)
+    segs_phys = segment_summary(used, replace(p, model_kind="physics"), used_arr)
+    unc, deff = _tolerance_fields(obs, idx, feats, use, x, wt, a, res_all[idx], segs, segs_phys, used_arr, p)
+    text = (f"Модель, откалиброванная прошлой версией программы ({p.calib_info}), сохранена без изменений: "
+            f"R_ref = {p.r_ref:.2f}, b_w = {p.b_w:.2f}, b_dt = {p.b_dt:.2f}, η = {p.eta:.2f}. По пригодным строкам журнала "
+            f"(их {len(used)}) к ней дополнены только данные для допусков — перекалибровка не нужна.\n"
+            + _tolerance_line(unc, deff))
+    return replace(p, **unc), text
+
+
 def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days: float = 0.0,
                   skipped: Optional[Dict[str, int]] = None, lag: bool = True, n_rows: Optional[int] = None,
                   report: bool = True) -> Tuple[DryerParams, Dict]:
@@ -788,15 +887,7 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
         """Взвешенная регрессия ln R с регуляризацией к априорным показателям (ridge к prior)."""
         ii = np.asarray(idx, dtype=int)
         m = len(ii)
-        use: List[str] = []
-        if m >= 12:
-            for k in feats:
-                if float(np.std(feats[k][ii])) > 0.02:
-                    use.append(k)
-        if "b_rh" in use and not has_rh:
-            use.remove("b_rh")
-        if "b_amb" in use and not has_amb:
-            use.remove("b_amb")
+        use = _fit_use(feats, ii, has_rh, has_amb)
         wt = wts_all[ii]
         y_adj = y[ii].copy()
         for k in feats:
@@ -858,25 +949,8 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
     segs_phys = segment_summary(used, phys, used_arr)
     # --- v0.8: данные для честных допусков ---
     x_m, wt_m, a_m, ii_m = fit.last
-    cov_fit, deff = _param_cov(x_m, wt_m, a_m, np.asarray(res), np.asarray([obs[i]["seg"] for i in ii_m]))
-    # коэффициенты, не подобранные по журналу (нет данных или разброса), известны только приблизительно —
-    # их априорная неопределённость тоже входит в допуск
-    fixed = [k for k in feats if k not in use]
-    unc_feats = ["const"] + list(use) + fixed
-    cov = np.zeros((len(unc_feats), len(unc_feats)))
-    cov[:len(cov_fit), :len(cov_fit)] = cov_fit
-    for j, k in enumerate(fixed, start=len(cov_fit)):
-        cov[j, j] = PRIOR_SD[k] ** 2
-    f_full = np.column_stack([np.ones(len(ii_m))] + [feats[k][ii_m] for k in unc_feats[1:]])
-    lev = float(np.mean(np.einsum("ij,jk,ik->i", f_full, cov, f_full))) if len(ii_m) else 0.0
-    phys_by = {sp["seg"]: sp for sp in segs_phys}
-    rel = [abs(phys_by[sg["seg"]]["dw_pred"] - sg["dw_pred"]) / max(sg["dw_pred"], 0.5) for sg in segs if sg["seg"] in phys_by]
-    struct_base = float(np.median(rel)) if rel else p.struct_base
-    explored = {"d": [float(used_arr["d"].min()), float(used_arr["d"].max())],
-                "t": [float(used_arr["t_proc"].min()), float(used_arr["t_proc"].max())],
-                "w": [float(used_arr["w_in"].min()), float(used_arr["w_in"].max())]}
-    new_p = replace(new_p, unc_feats=unc_feats, unc_cov=cov.tolist(), unc_lev=lev,
-                    struct_base=struct_base, explored=explored)
+    unc, deff = _tolerance_fields(obs, ii_m, feats, use, x_m, wt_m, a_m, np.asarray(res), segs, segs_phys, used_arr, p)
+    new_p = replace(new_p, **unc)
     seg_mae = _mean([abs(s["dw_pred"] - s["dw_obs"]) for s in segs]) if segs else float("nan")
     seg_mae_phys = _mean([abs(s["dw_pred"] - s["dw_obs"]) for s in segs_phys]) if segs_phys else float("nan")
     w_pred, q_pred = predict_out(new_p, used, used_arr)
@@ -908,11 +982,7 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
         f"Ошибка прогноза w_вых по строкам: ±{phys_rep['mae']:.2f} п.п. (смещение {phys_rep['bias']:+.2f}, максимум {phys_rep['max']:.2f})",
     ]
     lines.append("")
-    lines.append(f"ДОПУСКИ: разброс коэффициентов ±{100 * math.sqrt(lev):.1f} % скорости сушки в изученных режимах "
-                 f"(с поправкой на зависимость строк внутри прохода ×{deff:.1f}); вне их он растёт. Типичное расхождение "
-                 f"моделей на проходах журнала {100 * struct_base:.0f} %. Изучено: D {explored['d'][0]:.0f}–"
-                 f"{explored['d'][1]:.0f} с, T {explored['t'][0]:.0f}–{explored['t'][1]:.0f} °C, W вх "
-                 f"{explored['w'][0]:.0f}–{explored['w'][1]:.0f} %.")
+    lines.append(_tolerance_line(unc, deff))
     if segs:
         lines.append("")
         lines.append(f"Съём за проход, средняя ошибка по {len(segs)} участкам: эмпирическая ±{seg_mae:.2f} п.п., "

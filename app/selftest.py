@@ -233,6 +233,45 @@ def run(out_path: str) -> int:
         _cm = win.tab_data._m_comb
         check(_cm.get("n_batches", 0) >= 1 and _cm.get("a") is not None and win.tab_data.tbl_mb.rowCount() >= 1,
               f"поправка влагомера по партиям: партий {_cm.get('n_batches', 0)}, итог a = {_cm.get('a', 0):+.2f}")
+        # --- v0.8.1: модель прошлой версии, быстрый ввод следует за журналом, смена режима отдельной строкой ---
+        from dataclasses import replace as _rp
+        from datetime import timedelta as _td
+        from . import worker as _wk
+        from .calibration import to_float as _tf
+        from .regime import plan_regime_change as _plan, row_time as _rt
+        _full = win.params
+        win.set_params(_rp(_full, unc_feats=None, unc_cov=None, unc_lev=0.0, explored=None))
+        win._upgrade_model()
+        _wk.wait_all()
+        for _ in range(20):
+            app.processEvents()
+        _np = win.params
+        check(bool(_np.unc_cov) and (_np.r_ref, _np.b_w, _np.b_dt, _np.eta) == (_full.r_ref, _full.b_w, _full.b_dt, _full.eta),
+              "модель прошлой версии: коэффициенты те же, допуски дополнены по журналу без перекалибровки"
+              f" (±{100 * _np.unc_lev ** 0.5:.1f} %, при калибровке ±{100 * (_full.unc_lev or 0) ** 0.5:.1f} %)"
+              if _np.unc_cov else f"допуски не дополнены: calibrated={_np.calibrated}, {_np.calib_info}")
+        _last = win.tbl_j.rowCount() - 1
+        _d_cell = win.tbl_j.item(_last, 7).text()
+        _d0 = _tf(win.qe["d"].text())
+        win._set_cell(_last, "d", _d0 + 5)
+        for _ in range(5):
+            app.processEvents()
+        win._qe_sync_timer.stop()
+        win._qe_prefill()
+        check(_tf(win.qe["d"].text()) == _d0 + 5, f"быстрый ввод следует за журналом: D {_d0:g} → {win.qe['d'].text()}")
+        _rows = win._table_to_rows()
+        _t0 = _rt(_rows[-1])
+        _pl = _plan(_rows, _t0 + _td(minutes=5), {"d": _d0 + 10})
+        win._apply_regime(_pl, False)
+        _rows2 = win._table_to_rows()
+        check(len(_rows2) == len(_rows) + 1 and _rows2[-1]["note"].startswith("Режим: D") and _rows2[-2]["d"] == _d0 + 5
+              and _tf(win.qe["d"].text()) == _d0 + 10 and win.qe_time.dateTime().toPython() == _t0 + _td(minutes=30),
+              f"смена режима отдельной строкой: «{_rows2[-1]['note']}», следующая проба "
+              f"{win.qe_time.dateTime().toString('HH:mm')}")
+        win.tbl_j.removeRow(win.tbl_j.rowCount() - 1)
+        win.tbl_j.item(_last, 7).setText(_d_cell)
+        win._save_journal()
+        win._qe_prefill(after_add=True)
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

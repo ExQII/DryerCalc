@@ -10,6 +10,8 @@ venv/
 # данные и отчёты самопроверки (база пользователя не хранится в репозитории)
 *.db
 *.db.tmp
+# …кроме баз прошлых версий для теста перехода на новую версию (tools/make_old_db.py)
+!tests/data/*.db
 selftest*.txt
 selftest*.png
 error.log
