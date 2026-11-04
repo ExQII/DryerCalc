@@ -132,9 +132,14 @@ def stats_text(st: Dict) -> str:
              "Запуски по режимам: " + (", ".join(f"{'сушильщик' if k == OPERATOR else 'инженер' if k == ENGINEER else k} "
                                                  f"{v}" for k, v in st["modes"].items()) or "—") + "."]
     if cov["expected"]:
-        lines.append(f"Пробы в проходах: {cov['actual']} из ожидаемых {cov['expected']} "
-                     f"(покрытие {100 * cov['coverage']:.0f} %), проходов {cov['passes']}; медианный интервал "
-                     f"{cov['median_interval']:.0f} мин, интервалов длиннее 40 мин — {100 * (cov['late_share'] or 0):.0f} %.")
+        share = f"{100 * cov['coverage']:.0f} %" if cov.get("coverage") is not None else "—"
+        if cov.get("median_interval") is not None:
+            late = f"{100 * cov['late_share']:.0f} %" if cov.get("late_share") is not None else "—"
+            gaps = f"медианный интервал {cov['median_interval']:.0f} мин, интервалов длиннее 40 мин — {late}"
+        else:       # в каждом проходе за период по одной пробе — интервалов между пробами ещё нет
+            gaps = "интервалов между пробами пока нет — в каждом проходе по одной пробе"
+        lines.append(f"Пробы в проходах: {cov['actual']} из ожидаемых {cov['expected']} (покрытие {share}), "
+                     f"проходов {cov['passes']}; {gaps}.")
     else:
         lines.append("Проходов с пробами за период нет.")
     lines.append(f"Внесено строкой быстрого ввода: {st['quick_samples']}.")

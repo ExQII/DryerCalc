@@ -322,6 +322,29 @@ def run(out_path: str) -> int:
               and abs(_st.unloaded - mdl.q_at(win.params, 35) * 19.0) < 1e-6,
               f"проходы по рециркуляции: {len(_ps)} (силосы {' → '.join(_st.sources)} — один проход, выгружено "
               f"{_st.unloaded:.0f} т); рециркуляция при {_ps[-1]['w_end']:.1f} % — досушка и конец партии")
+        # --- v1.1.1: запуск с сохранённой целью партии Wк; статистика пилота при одной пробе в проходе ---
+        _errs: List[str] = []
+        _hook = sys.excepthook
+        sys.excepthook = lambda t, e, tb: _errs.append(f"{t.__name__}: {e}")
+        try:
+            _st2 = Storage(os.path.join(tmp, "saved.db"))
+            _st2.set_json("ui_live", {"m_pass": 900.0, "w_target": 15.5, "wk": 13.5, "t_amb": 4.0, "rh": 75.0})
+            _win2 = MainWindow(_st2)
+            _win2.tab_live.refresh()
+            _win2.tab_live.wk_final.setValue(14.0)
+            app.processEvents()
+            _win2.close()
+            _st2.close()
+        finally:
+            sys.excepthook = _hook
+        _cov = {"expected": 1, "actual": 1, "intervals": [], "coverage": 1.0, "late_share": None,
+                "median_interval": None, "passes": 1}
+        _ptxt = _pilot.stats_text({"start": _t0, "end": _t0, "days": [_t0.date()], "modes": {}, "coverage": _cov,
+                                   "quick_samples": 1, "reminders": {}, "reaction_median": None, "reactions": 0,
+                                   "feedback": []})
+        check(not _errs and "пока нет" in _ptxt,
+              "запуск с сохранённой целью партии Wк и статистика пилота при одной пробе — без ошибок"
+              if not _errs else f"ошибка при запуске с сохранёнными настройками: {_errs[0]}")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

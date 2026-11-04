@@ -1348,6 +1348,66 @@ def test_sample_journal_passes_unchanged():
     assert rep["n_used"] == 120
 
 
+def test_startup_with_saved_settings_raises_nothing():
+    """1.1.0 падала при запуске, если в настройках сохранена цель партии Wк не по умолчанию: смена Wк при загрузке
+    настроек пересчитывала проход раньше, чем построен журнал. Запуск с сохранёнными настройками всех разделов —
+    без единой ошибки (ошибки в обработчиках Qt идут в sys.excepthook, а не наружу)."""
+    import shutil
+    app = _qapp()
+    from app.gui import MainWindow
+    errors = []
+    old_hook = sys.excepthook
+    sys.excepthook = lambda *a: errors.append(a)
+    try:
+        db = _tmp("saved.db")
+        shutil.copy(OLD_DBS[-1], db)
+        st = Storage(db)
+        st.set_json("ui_live", {"m_pass": 900.0, "w_target": 15.5, "wk": 13.5, "t_amb": 4.0, "rh": 75.0,
+                                "corr": False, "silo": True, "silo_lim": 15.0})
+        st.set_json("ui_simple", {"mass": 650.0, "w0": 27.0, "wk": 13.5, "lim": 6.0, "n": 3, "over": 0.5,
+                                  "cool": True, "mode": "manual", "q": "5"})
+        st.set_json("ui_queue", {"method": "q", "q": 40.0, "lim": 6.0, "change": 20.0, "cool": True})
+        st.set_json("ui_theme", {"mode": "dark"})
+        win = MainWindow(st)
+        lt = win.tab_live
+        assert lt.wk_final.value() == 13.5 and lt.m_pass.value() == 900.0
+        win.tabs.setCurrentIndex([win.tabs.tabText(i) for i in range(win.tabs.count())].index("Текущий проход"))
+        lt.refresh()
+        lt.wk_final.setValue(14.0)                    # после запуска смена Wк пересчитывает проход
+        for _ in range(10):
+            app.processEvents()
+        assert lt.state is not None and win.storage.get_json("ui_live")["wk"] == 14.0
+        for i in range(win.tabs.count()):            # и все разделы открываются без ошибок
+            win.tabs.setCurrentIndex(i)
+            for _ in range(3):
+                app.processEvents()
+        win.close()
+    finally:
+        sys.excepthook = old_hook
+        from app import design
+        design.apply(app, "light", design.base_pt())
+    assert not errors, "".join(str(e[1]) for e in errors)
+
+
+def test_pilot_stats_with_single_sample_per_pass():
+    """1.0.0: «Пилотный запуск» падал, если в проходах за период по одной пробе — интервалов между пробами нет."""
+    from app.pilot import export_xlsx, pilot_stats, stats_text
+    st = Storage(_tmp("p1.db"))
+    t0 = datetime(2026, 11, 4, 16, 0)
+    rows = [{"ts": t.strftime("%d.%m.%y %H:%M"), "w_in": wi, "w_out": wo, "t_a1": 30 if wo else None,
+             "t_a2": 34 if wo else None, "t_up": 60, "t_low": 60, "d": 35, "note": note, "batch": "П-1",
+             "pass_no": 1, "t_amb": None, "rh": None}
+            for t, wi, wo, note in ((t0, None, None, "Запуск"), (t0 + timedelta(minutes=30), 26.0, 21.8, ""))]
+    st.log_event("start", {"mode": "operator"}, ts=t0)
+    st.log_event("sample", {}, ts=t0 + timedelta(minutes=31))
+    stt = pilot_stats(st.load_events(), rows)
+    assert stt["coverage"]["expected"] == 1 and stt["coverage"]["median_interval"] is None
+    text = stats_text(stt)
+    assert "1 из ожидаемых 1" in text and "интервалов между пробами пока нет" in text
+    export_xlsx(_tmp("p1.xlsx"), stt, st.load_events())
+    st.close()
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):

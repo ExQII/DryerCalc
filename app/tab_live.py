@@ -263,11 +263,13 @@ class LiveTab(QWidget):
 
         for w in (self.m_pass, self.w_target, self.t_amb, self.rh, self.d_try, self.silo_lim):
             w.valueChanged.connect(self.recalc)
-        self.wk_final.valueChanged.connect(self.refresh)       # от цели партии зависит, досушка ли рециркуляция
         self.cb_corr.stateChanged.connect(self.recalc)
         self.cb_silo.stateChanged.connect(self.recalc)
         self.cb_now.stateChanged.connect(self.refresh)
         self._load()
+        # от цели партии зависит, досушка ли рециркуляция — пересчитать проход. Подключено после загрузки настроек:
+        # раздел строится раньше журнала, и пересчёт во время загрузки читал бы ещё не созданную таблицу журнала
+        self.wk_final.valueChanged.connect(self.refresh)
 
     # ------------------------------------------------------------------
     def _load(self) -> None:
@@ -308,6 +310,8 @@ class LiveTab(QWidget):
         self.refresh()
 
     def refresh(self) -> None:
+        if not getattr(self.win, "_ready", False):       # окно ещё строится: журнала пока нет, пересчёт — после
+            return
         p = self.win.params
         now = datetime.now() if self.cb_now.isChecked() else None
         # рециркуляция, когда выход уже у цели партии (Wк + 1 п.п.), — досушка и конец партии
