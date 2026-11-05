@@ -1226,7 +1226,7 @@ def test_docs_rendered_as_pages():
     text = open(os.path.join(ROOT, "docs", "manual_ru.txt"), encoding="utf-8-sig").read()
     h = to_html(text)
     assert "=====" not in h and "<h1" in h and "Инструкция для пользователя" in h
-    assert "<a name='s7'></a>" in h and "href='#s7'" in h and "7. Раздел «Текущий проход»" in h
+    assert "<a name='s8'></a>" in h and "href='#s8'" in h and "8. Раздел «Текущий проход»" in h
     assert _sentence("СУШИЛЬЩИК: КАК ПОЛЬЗОВАТЬСЯ РАЗДЕЛОМ «ТЕКУЩИЙ ПРОХОД» И PDF") == \
         "Сушильщик: как пользоваться разделом «Текущий проход» и PDF"
     rules = to_html(open(os.path.join(ROOT, "docs", "rules_ru.txt"), encoding="utf-8-sig").read())
@@ -1406,6 +1406,147 @@ def test_pilot_stats_with_single_sample_per_pass():
     assert "1 из ожидаемых 1" in text and "интервалов между пробами пока нет" in text
     export_xlsx(_tmp("p1.xlsx"), stt, st.load_events())
     st.close()
+
+
+# ---------------------------------------------------------------------------
+# v1.2: масса на выходные
+# ---------------------------------------------------------------------------
+
+def test_weekend_mass_fills_window_exactly():
+    """Масса на выходные: партия со всеми проходами, охлаждением и остановками ровно заполняет окно; число
+    проходов — как у рекомендованного сценария «План сушки партии»; допуск — та же схема при скорости ×(1 ± zσ)."""
+    from app import model as mdl
+    from app.weekend import WeekendInput, weekend_mass
+    c = Conditions(60, 8, 75)
+    st, en = datetime(2026, 11, 6, 18, 0), datetime(2026, 11, 9, 8, 0)
+    for kind in ("empirical", "physics"):
+        p = replace(P, model_kind=kind)
+        r = weekend_mass(p, c, WeekendInput(st, en, 28.0, 14.0, stops_h=2.0))
+        assert r.ok and r.hours == 60.0 and abs(r.plan.total_time_h - 60.0) < 0.02
+        opt = {o.key: o for o in r.options}
+        assert set(opt) == {"safe", "calc", "full"} and abs((opt["calc"].end - en).total_seconds()) < 90
+        assert r.mass_lo < r.mass < r.mass_hi
+        assert abs((opt["safe"].end_slow - en).total_seconds()) < 90 and opt["safe"].end < en   # успеет и при медленной
+        assert abs((opt["full"].end_fast - en).total_seconds()) < 90 and opt["full"].end > en   # не встанет и при быстрой
+        plans = mdl.scenarios(p, c, r.mass, 28.0, 14.0, 6, st, None, True)
+        assert len(plans[mdl.recommend(plans, 6.0, 10.0)].passes) == r.n_passes == len(r.plan.passes)
+        # время по прямой: T(M) = a·M + b
+        assert abs(r.h_per_t * r.mass + r.fixed_h - 60.0) < 0.02 and abs(r.fixed_h - r.n_passes * p.overhead_h) < 1e-6
+        assert r.pass1_end == st + timedelta(hours=r.plan.passes[0].time_h + 2.0)
+
+
+def test_weekend_mass_by_throughput_closed_form():
+    """Метод «по производительности»: масса из формулы вручную — Σ масса на выходе прохода / Q + охлаждение."""
+    from app.model import q_full
+    from app.weekend import WeekendInput, weekend_mass
+    st, en = datetime(2026, 11, 6, 18, 0), datetime(2026, 11, 9, 8, 0)
+    r = weekend_mass(P, Conditions(), WeekendInput(st, en, 28.0, 14.0, method="q", q=18.2, lim=6.0))
+    n = 3                                               # 14 п.п. при лимите 6 — 3 прохода по 4,67
+    ws = [28.0 - 14.0 * k / n for k in range(n + 1)]
+    f = [(100 - ws[0]) / (100 - w) for w in ws[1:]]     # масса на выходе прохода на 1 т сырого
+    a = sum(x / 18.2 for x in f) + f[-1] / q_full(P)
+    m = (62.0 - n * P.overhead_h) / a
+    assert r.ok and r.n_passes == n and abs(r.mass - m) < 0.01 and r.mass_lo is None
+    assert [o.key for o in r.options] == ["calc"] and r.options[0].end_fast is None
+
+
+def test_weekend_capacity_short_window_and_weekday():
+    from app.weekend import WeekendInput, next_weekday_time, weekend_mass
+    c = Conditions(60, 8, 75)
+    st, en = datetime(2026, 11, 6, 18, 0), datetime(2026, 11, 9, 8, 0)
+    r = weekend_mass(P, c, WeekendInput(st, en, 28.0, 14.0, capacity=300.0))
+    bins = next(o for o in r.options if o.key == "bins")
+    assert r.capacity_short > 0 and bins.mass == 300.0 and bins.end < en
+    r2 = weekend_mass(P, c, WeekendInput(st, st + timedelta(hours=2), 28.0, 14.0))
+    assert not r2.ok and "накладных" in r2.message
+    assert not weekend_mass(P, c, WeekendInput(en, st, 28.0, 14.0)).ok
+    assert not weekend_mass(P, c, WeekendInput(st, en, 14.0, 14.0)).ok
+    assert next_weekday_time(datetime(2026, 11, 6, 18, 0), 0, 8) == datetime(2026, 11, 9, 8, 0)
+    assert next_weekday_time(datetime(2026, 11, 9, 7, 0), 0, 8) == datetime(2026, 11, 9, 8, 0)
+    assert next_weekday_time(datetime(2026, 11, 9, 9, 0), 0, 8) == datetime(2026, 11, 16, 8, 0)
+
+
+def test_allowable_storage_of_wet_corn_follows_table():
+    """Допустимый срок хранения сырой кукурузы: узлы таблицы FSA1058 точно, между ними — монотонно."""
+    from app.weekend import STORAGE_DAYS, STORAGE_MC, STORAGE_TF, allowable_storage_days
+
+    def c_of(f):
+        return (f - 32) * 5 / 9
+    for i, tf in enumerate(STORAGE_TF):
+        for j, mc in enumerate(STORAGE_MC):
+            d, flag = allowable_storage_days(mc, c_of(tf))
+            assert abs(d - STORAGE_DAYS[i][j]) < 1e-6 * STORAGE_DAYS[i][j] and flag == ""
+    assert abs(allowable_storage_days(25, c_of(60))[0] - 10) < 1e-6 and abs(allowable_storage_days(30, c_of(70))[0] - 4) < 1e-6
+    prev = None
+    for w in (16, 20, 24, 27, 30):                      # влажнее — меньше
+        d = allowable_storage_days(w, 12.0)[0]
+        assert prev is None or d < prev
+        prev = d
+    prev = None
+    for t in (0, 5, 10, 15, 20, 23):                    # теплее — меньше
+        d = allowable_storage_days(26, t)[0]
+        assert prev is None or d < prev
+        prev = d
+    assert allowable_storage_days(26, -10)[0] == allowable_storage_days(26, c_of(35))[0]   # холоднее таблицы — с запасом
+    hot, flag = allowable_storage_days(30, 30.0)
+    assert hot < 3 and "T выше" in flag and "30 %" in allowable_storage_days(33, 10)[1]
+    assert allowable_storage_days(14, 20)[0] is None
+
+
+def test_weekend_tab_ui_queue_and_settings():
+    """Раздел «Масса на выходные»: начало — ближайший час, если нет ни журнала, ни очереди; расчётная масса уходит
+    в очередь; при следующем открытии начало — после очереди, день и час выхода хозяйства запомнены."""
+    app = _qapp()
+    from PySide6.QtCore import QDateTime
+    from app import icons, pages
+    from app.gui import MainWindow
+    from app.weekend import next_weekday_time
+    errors = []
+    old_hook = sys.excepthook
+    sys.excepthook = lambda *a: errors.append(a)
+    try:
+        db = _tmp("weekend.db")
+        win = MainWindow(Storage(db))
+        names = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+        assert pages.WEEKEND in names and "weekend" in icons.names()
+        win.tabs.setCurrentIndex(names.index(pages.WEEKEND))
+        wt = win.tab_weekend
+        assert "ближайший час" in wt.lbl_start_src.text() and not wt.b_queue.isVisibleTo(win)
+        st = next_weekday_time(datetime.now(), 4, 18)          # ближайшая пятница 18:00
+        sun = next_weekday_time(st, 6, 20)                     # человек выбрал воскресенье 20:00
+        wt.start.setDateTime(QDateTime(st.year, st.month, st.day, st.hour, 0, 0))
+        wt.end.setDateTime(QDateTime(sun.year, sun.month, sun.day, sun.hour, 0, 0))
+        wt.w0.setValue(28.0)
+        wt.wk.setValue(14.0)
+        wt.already.setValue(200.0)
+        r = wt.result
+        assert r.ok and abs(r.hours - 50.0) < 1e-6 and wt.lbl_head.text().startswith("Намолотить ≈")
+        assert "домолотить ещё" in wt.lbl_sub.text() and wt.tbl_opt.rowCount() == len(r.options) == 3
+        assert len(wt.gantt.entries) == 3 and wt.gantt.marks[0][0] == sun
+        assert "задано вручную" in wt.lbl_start_src.text()
+        wt._add_to_queue()
+        q = win.tab_batches._queue()
+        assert len(q) == 1 and q[0]["name"] == f"Выходные {st:%d.%m}" and q[0]["mass"] == round(r.mass / 10) * 10
+        assert q[0]["ready"] == f"{st:%d.%m.%Y %H:%M}"
+        q_end = win.tab_batches.queue_end()
+        assert q_end is not None and q_end > st
+        d = win.storage.get_json("ui_weekend")
+        assert d["w0"] == 28.0 and (d["ret_dow"], d["ret_h"], d["ret_m"]) == (6, 20, 0)
+        win.close()
+        win2 = MainWindow(Storage(db))                       # следующий раз: начало — после очереди
+        win2.tabs.setCurrentIndex(names.index(pages.WEEKEND))
+        wt2 = win2.tab_weekend
+        assert wt2.b_queue.isVisibleTo(win2) and "очереди" in wt2.lbl_start_src.text()
+        s2 = wt2.start.dateTime().toPython()
+        assert abs((s2 - win2.tab_batches.queue_end()).total_seconds()) < 60
+        e2 = wt2.end.dateTime().toPython()
+        assert (e2.weekday(), e2.hour, e2.minute) == (6, 20, 0) and e2 > s2 and wt2.w0.value() == 28.0
+        for _ in range(5):
+            app.processEvents()
+        win2.close()
+    finally:
+        sys.excepthook = old_hook
+    assert not errors, "".join(str(e[1]) for e in errors)
 
 
 if __name__ == "__main__":

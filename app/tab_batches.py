@@ -27,19 +27,23 @@ QUEUE_HEADERS = ["Партия", "Масса, т", "W₀, %", "Wк, %", "Гот�
 
 
 class GanttChart(QWidget):
-    """Полосы партий во времени; внутри полосы — проходы (чередование оттенков), промежутки — накладные."""
+    """Полосы партий во времени; внутри полосы — проходы (чередование оттенков), промежутки — накладные.
+    Усик справа от полосы — допуск окончания 90 % (end_range); вертикальный пунктир — отметка времени (marks)."""
 
-    def __init__(self):
+    def __init__(self, empty_text: str = "Добавьте партии в очередь"):
         super().__init__()
         self.entries: List[QueueEntry] = []
+        self.marks: List[tuple] = []
+        self.empty_text = empty_text
         self.setMinimumHeight(150)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(700, 220)
 
-    def set_entries(self, entries: List[QueueEntry]) -> None:
+    def set_entries(self, entries: List[QueueEntry], marks=None) -> None:
         self.entries = [e for e in entries if e.plan is not None and e.start and e.end]
+        self.marks = list(marks or [])          # [(время, подпись)]
         self.update()
 
     def paintEvent(self, _e) -> None:  # noqa: N802
@@ -50,14 +54,15 @@ class GanttChart(QWidget):
         p.fillRect(0, 0, w, h, th.plot_bg)
         if not self.entries:
             p.setPen(th.plot_ink)
-            p.drawText(QRectF(0, 0, w, h), Qt.AlignCenter, "Добавьте партии в очередь")
+            p.drawText(QRectF(0, 0, w, h), Qt.AlignCenter, self.empty_text)
             p.end()
             return
         fm = QFontMetrics(self.font())
         left = max(fm.horizontalAdvance(e.name) for e in self.entries) + 16
-        top, bottom, right = 8, 26, 12
-        t0 = min(e.start for e in self.entries)
-        t1 = max(e.end for e in self.entries)
+        top, bottom, right = (8 + fm.height() + 4 if self.marks else 8), 26, 12
+        ends = [e.end for e in self.entries] + [e.end_range[1] for e in self.entries if e.end_range]
+        t0 = min([e.start for e in self.entries] + [t for t, _ in self.marks])
+        t1 = max(ends + [t for t, _ in self.marks])
         span = max((t1 - t0).total_seconds() / 3600.0, 1.0)
         pw = w - left - right
         row_h = min(34.0, (h - top - bottom) / len(self.entries))
@@ -94,6 +99,24 @@ class GanttChart(QWidget):
             p.setPen(QPen(th.plot_ink, 1))
             p.setBrush(Qt.NoBrush)
             p.drawRect(QRectF(x_of(e.start), y, x_of(e.end) - x_of(e.start), bh))
+            if e.end_range:                      # допуск окончания: усик с засечками
+                a, b = x_of(e.end_range[0]), x_of(e.end_range[1])
+                ym = y + bh / 2
+                p.setPen(QPen(th.plot_ink, 1.5))
+                p.drawLine(QPointF(a, ym), QPointF(b, ym))
+                for xx in (a, b):
+                    p.drawLine(QPointF(xx, ym - bh * 0.3), QPointF(xx, ym + bh * 0.3))
+        for t, label in self.marks:              # отметки времени: пунктир через все полосы, подпись сверху
+            x = x_of(t)
+            pen = QPen(th.role("target"), 1.5)
+            pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            p.drawLine(QPointF(x, top - 2), QPointF(x, h - bottom))
+            p.setPen(th.plot_ink)
+            txt = f"{label} {t:%d.%m %H:%M}"
+            tw = fm.horizontalAdvance(txt)
+            tx = min(max(x - tw / 2, 2.0), w - tw - 2)
+            p.drawText(QRectF(tx, 4, tw + 2, fm.height()), Qt.AlignLeft | Qt.AlignVCenter, txt)
         p.end()
 
 
@@ -645,16 +668,33 @@ class BatchesTab(QWidget):
         self.tbl_q.selectRow(j)
         self.recalc_queue()
 
+    def queue_schedule(self) -> List[QueueEntry]:
+        """Очередь партий по текущим настройкам раздела (как в таблице «Очередь»)."""
+        soft, hard = self.win.limits()
+        return schedule(self._queue(), self.win.params, self.win.conditions(), self.q_start.dateTime().toPython(),
+                        method=self.q_method.currentData(), soft=soft, hard=hard, q=self.q_q.value(),
+                        lim=self.q_lim.value(), cool=self.q_cool.isChecked(), changeover_h=self.q_change.value())
+
+    def queue_end(self) -> Optional[datetime]:
+        """Когда сушилка освободится после всей очереди (None — очередь пуста или не считается)."""
+        ends = [e.end for e in self.queue_schedule() if e.end]
+        return max(ends) if ends else None
+
+    def add_to_queue(self, name: str, mass: float, w0: float, wk: float, ready: Optional[datetime]) -> None:
+        items = self._queue()
+        items.append({"name": name, "mass": round(mass, 1), "w0": w0, "wk": wk,
+                      "ready": f"{ready:%d.%m.%Y %H:%M}" if ready else ""})
+        self._fill_queue(items)
+        self._save_queue()
+        self.recalc_queue()
+
     def recalc_queue(self) -> None:
         mute(self.lbl_q_note)
         self.q_q.setEnabled(self.q_method.currentData() == "q")
         self.q_lim.setEnabled(self.q_method.currentData() == "q")
         if self._loading:
             return
-        soft, hard = self.win.limits()
-        entries = schedule(self._queue(), self.win.params, self.win.conditions(), self.q_start.dateTime().toPython(),
-                           method=self.q_method.currentData(), soft=soft, hard=hard, q=self.q_q.value(),
-                           lim=self.q_lim.value(), cool=self.q_cool.isChecked(), changeover_h=self.q_change.value())
+        entries = self.queue_schedule()
         self.tbl_qr.setRowCount(len(entries))
         for i, e in enumerate(entries):
             if e.plan is None:

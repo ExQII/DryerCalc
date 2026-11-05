@@ -1,7 +1,8 @@
 """Иконки разделов и знаков — нарисованы кодом (без файлов и без интернета), линией 1,6 на сетке 24×24.
 
 Каждая иконка — о содержании раздела: журнал — тетрадь, текущий проход — шкала-прибор, досушка — круг по кругу,
-план партии — ступени влажности по проходам, быстрая оценка — секундомер, партии — мешки, погода — облако,
+план партии — ступени влажности по проходам, масса на выходные — календарь с залитыми
+выходными, быстрая оценка — секундомер, партии — мешки, погода — облако,
 точность — мишень, настройки — регуляторы, справка — вопрос. Знак программы — зерно кукурузы. Оформление:
 солнце (светлое), месяц (тёмное), полузалитый круг (как в Windows).
 """
@@ -63,6 +64,22 @@ def _plan(p: QPainter, c: QColor) -> None:
     p.drawLine(QPointF(3.5, 20.5), QPointF(20.5, 20.5))
     p.setBrush(c)
     p.drawEllipse(QPointF(19.5, 16), 1.4, 1.4)
+
+
+def _weekend(p: QPainter, c: QColor) -> None:
+    """Календарь: будни — точки, два дня выходных — залиты."""
+    _pen(p, c)
+    p.drawRoundedRect(QRectF(3.5, 5.0, 17, 15.5), 2.4, 2.4)
+    p.drawLine(QPointF(3.5, 9.5), QPointF(20.5, 9.5))
+    for x in (8.0, 16.0):
+        p.drawLine(QPointF(x, 3.0), QPointF(x, 6.6))
+    p.setPen(Qt.NoPen)
+    p.setBrush(c)
+    for y in (13.2, 17.0):
+        for x in (7.0, 10.5):
+            p.drawEllipse(QPointF(x, y), 0.95, 0.95)
+        for x in (14.0, 17.5):
+            p.drawRoundedRect(QRectF(x - 1.45, y - 1.45, 2.9, 2.9), 0.6, 0.6)
 
 
 def _quick(p: QPainter, c: QColor) -> None:
@@ -187,7 +204,8 @@ def _kernel(p: QPainter, c: QColor) -> None:
 
 
 _DRAW: Dict[str, Callable[[QPainter, QColor], None]] = {
-    "journal": _journal, "live": _live, "recirc": _recirc, "plan": _plan, "quick": _quick, "batches": _batches,
+    "journal": _journal, "live": _live, "recirc": _recirc, "plan": _plan, "weekend": _weekend, "quick": _quick,
+    "batches": _batches,
     "data": _data, "check": _check, "settings": _settings, "help": _help, "chev_right": _chev_right,
     "chev_down": _chev_down, "kernel": _kernel, "sun": _sun, "moon": _moon, "auto": _auto,
 }

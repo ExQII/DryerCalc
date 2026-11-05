@@ -257,6 +257,7 @@ class QueueEntry:
     note: str = ""
     passes: int = 0
     max_dw: float = 0.0
+    end_range: Optional[Tuple[datetime, datetime]] = None   # 90 %: окончание при быстрой … медленной сушке
 
 
 def schedule(items: Sequence[Dict], p: mdl.DryerParams, c: mdl.Conditions, start: datetime, method: str = "model",

@@ -344,6 +344,17 @@ def run(out_path: str) -> int:
         check(not _errs and "пока нет" in _ptxt,
               "запуск с сохранённой целью партии Wк и статистика пилота при одной пробе — без ошибок"
               if not _errs else f"ошибка при запуске с сохранёнными настройками: {_errs[0]}")
+        # --- v1.2: масса на выходные — партия ровно заполняет окно до выхода хозяйства ---
+        from .weekend import WeekendInput as _WI, allowable_storage_days as _asd, weekend_mass as _wm
+        _wr = _wm(win.params, win.conditions(), _WI(_t0, _t0 + _td(hours=62), 28.0, 14.0))
+        win.tabs.setCurrentIndex(win.tabs.indexOfText(_pages.WEEKEND))
+        app.processEvents()
+        _wres = win.tab_weekend.result
+        check(_wr.ok and abs(_wr.plan.total_time_h - 62.0) < 0.02 and _wr.mass_lo is not None
+              and _wr.mass_lo < _wr.mass < _wr.mass_hi and _wres is not None and _wres.ok
+              and abs(_asd(25.0, (60 - 32) * 5 / 9)[0] - 10.0) < 1e-6,
+              f"масса на выходные: окно 62 ч, 28 → 14 % — {_wr.mass:.0f} т (90 %: {_wr.mass_lo or 0:.0f}–"
+              f"{_wr.mass_hi or 0:.0f} т), {_wr.n_passes} прох.; раздел открыт: {_wres.mass if _wres else 0:.0f} т")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

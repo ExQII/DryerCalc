@@ -39,6 +39,7 @@ from .tab_data import DataTab
 from .tab_help import HelpTab
 from .tab_live import LiveTab
 from .tab_recirc import RecircTab
+from .tab_weekend import WeekendTab
 from .reminders import ReminderCfg, check as reminders_check, live_numbers
 from . import pilot
 from . import design, icons
@@ -105,6 +106,7 @@ class MainWindow(QMainWindow):
         self.tab_recirc = built[pg.RECIRC] = RecircTab(self)
         built[pg.JOURNAL] = self._build_journal_tab()
         self.tab_batches = built[pg.BATCHES] = BatchesTab(self)
+        self.tab_weekend = built[pg.WEEKEND] = WeekendTab(self)      # после очереди и журнала: берёт из них начало
         self.tab_data = built[pg.DATA] = DataTab(self)
         self.tab_check = built[pg.CHECK] = CheckTab(self)
         built[pg.SETTINGS] = self._build_settings_tab()
