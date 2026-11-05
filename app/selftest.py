@@ -355,6 +355,34 @@ def run(out_path: str) -> int:
               and abs(_asd(25.0, (60 - 32) * 5 / 9)[0] - 10.0) < 1e-6,
               f"масса на выходные: окно 62 ч, 28 → 14 % — {_wr.mass:.0f} т (90 %: {_wr.mass_lo or 0:.0f}–"
               f"{_wr.mass_hi or 0:.0f} т), {_wr.n_passes} прох.; раздел открыт: {_wres.mass if _wres else 0:.0f} т")
+        # --- v1.3: число проходов задаётся вручную; поправка влагомера с фото журнала октября убирается ---
+        _w0s, _wks = win.in_w0.value(), win.in_wk.value()
+        win.in_w0.setValue(35.0)
+        win.in_wk.setValue(14.0)
+        win.in_npass.setValue(3)
+        app.processEvents()
+        _star = [i for i in range(win.tbl_sc.rowCount()) if "★" in win.tbl_sc.item(i, 0).text()]
+        _np_ok = len(_star) == 1 and len(win.plans[_star[0]].passes) == 3 and "задано" in win.status.text()
+        win.in_npass.setValue(0)
+        win.in_w0.setValue(_w0s)
+        win.in_wk.setValue(_wks)
+        check(_np_ok, "число проходов вручную: с 35 % в 3 прохода — ★ этот сценарий (съём по 7 п.п.)")
+        from dataclasses import replace as _rp2
+        _st3 = Storage(os.path.join(tmp, "photo.db"))
+        _st3.replace_journal(rows)
+        _st3.save_params(_rp2(mdl.DryerParams(), out_bias=0.8, r_ref=1.83, b_w=0.69, b_dt=0.87, eta=0.52,
+                              calib_info="04.11.2026, строк 120, ошибка w_вых ±0.44 п.п."))
+        _win3 = MainWindow(_st3)
+        _r_old = _win3.params.r_ref
+        _win3._startup_model()
+        _wk.wait_all()
+        for _ in range(30):
+            app.processEvents()
+        _p3 = _win3.params
+        check(_p3.out_bias == 0.0 and _p3.r_ref < 0.95 * _r_old and "фото" in _p3.calib_info
+              and not _win3._has_photo_bias(),
+              f"поправка влагомера +0,8 с фото убрана, модель перекалибрована: R₀ {_r_old:.2f} → {_p3.r_ref:.2f}")
+        _win3.close()
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

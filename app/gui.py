@@ -14,7 +14,7 @@ from PySide6.QtGui import QActionGroup, QBrush, QColor, QFont, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox,
     QInputDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStyledItemDelegate,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter, QStyledItemDelegate,
     QSystemTrayIcon, QTableWidget,
     QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
@@ -188,7 +188,90 @@ class MainWindow(QMainWindow):
                         save=False, log=False)
         self.storage.log_event("start", {"mode": self.mode, "version": __version__})
         self.statusBar().showMessage("Готово. Разделы — в меню слева; Ctrl+Tab — следующий раздел.", 8000)
-        QTimer.singleShot(1500, self._upgrade_model)
+        QTimer.singleShot(1500, self._startup_model)
+
+    # поправка выходного влагомера по четырём пробам с фото журнала октября — стояла по умолчанию до 1.3
+    PHOTO_BIAS = 0.8
+
+    def _startup_model(self) -> None:
+        """Один раз после запуска: убрать поправку влагомера с фото журнала октября (с перекалибровкой), иначе —
+        дополнить допуски модели прошлой версии."""
+        if not shiboken6.isValid(self):              # окно удалено раньше, чем сработал отложенный вызов
+            return
+        if self._has_photo_bias():
+            self._drop_photo_bias()
+        else:
+            self._upgrade_model()
+
+    def _has_photo_bias(self) -> bool:
+        """В модели стоит поправка с фото (+0,8 постоянная, без k_w и k_t) и её ещё не убирали. Поправку, внесённую по
+        парам проб или вручную, не трогаем: у неё другое значение или отметка в базе."""
+        if (self.storage.get_json("meter_photo", {}) or {}).get("done"):
+            return False
+        p = self.params
+        return abs(p.out_bias - self.PHOTO_BIAS) < 1e-9 and not p.out_kw and not p.out_kt
+
+    def _drop_photo_bias(self) -> None:
+        """Поправка влагомера — только внесённая в программу. Прежняя +0,8 п.п. взята по четырём пробам с фото журнала
+        октября, а ошибка выходного влагомера меняется от прохода к проходу (он откалиброван на сухое зерно) — одно
+        число её не описывает. Поправка входит в рассчитанный съём, поэтому модель перекалибровывается по журналу
+        без неё (как кнопкой «Калибровать модель», в фоне). Мало строк журнала — стартовая модель без поправки, если
+        модель не калибровали по своему журналу, иначе пометка «перекалибруйте»."""
+        from dataclasses import replace as _replace
+        if getattr(self, "_cal_job", None) is not None:          # идёт другая калибровка — позже
+            QTimer.singleShot(5000, self._startup_model)
+            return
+        old = self.params
+        base = _replace(old, out_bias=0.0)
+        note = "поправка влагомера с фото журнала октября убрана"
+
+        def finish(new_p: mdl.DryerParams, how: str, msg: str) -> None:
+            self.set_params(new_p)
+            self.storage.set_json("meter_photo", {"done": datetime.now().strftime("%d.%m.%Y %H:%M"), "how": how,
+                                                  "r_ref_old": round(old.r_ref, 4), "r_ref_new": round(new_p.r_ref, 4)})
+            self.storage.log_event("meter_photo_removed", {"how": how, "r_ref_old": round(old.r_ref, 4),
+                                                           "r_ref_new": round(new_p.r_ref, 4)})
+            self.statusBar().showMessage(
+                f"Поправка выходного влагомера +{self.PHOTO_BIAS:g} п.п. (четыре пробы с фото журнала октября) убрана "
+                f"— теперь только та, что вы внесёте (пары проб, «Настройки сушилки»). {msg}", 120000)
+
+        def fallback() -> None:
+            if old.calib_info.startswith("стартовая"):            # модель не калибровали по своему журналу
+                d = mdl.DryerParams()
+                new_p = _replace(base, r_ref=d.r_ref, b_w=d.b_w, b_dt=d.b_dt, eta=d.eta, struct_base=d.struct_base,
+                                 calib_info=d.calib_info, phys_info=d.phys_info, calibrated=True)
+                finish(new_p, "стартовая без поправки", "Стартовая модель — тоже без неё.")
+            else:
+                new_p = _replace(base, calibrated=False, calib_info=f"{note} — перекалибруйте по журналу",
+                                 phys_info=f"{note} — перекалибруйте по журналу")
+                finish(new_p, "нужна калибровка", "Журнала для калибровки мало — перекалибруйте модель, когда он "
+                                                  "наберётся.")
+
+        rows = self._table_to_rows()
+        if not rows:
+            fallback()
+            return
+
+        def done(res) -> None:
+            self._cal_job = None
+            if self.params is not old:                           # параметры уже поменяли — не перетирать
+                return
+            new_p, rep = res
+            if rep["n_used"] < 12:
+                fallback()
+                return
+            new_p = _replace(new_p, calib_info=f"{new_p.calib_info} ({note})")
+            self.report.setPlainText(rep["text"])
+            finish(new_p, "перекалибровано", f"Модель перекалибрована по журналу без неё: расход влаги R₀ "
+                                             f"{old.r_ref:.2f} → {new_p.r_ref:.2f} т воды/ч.")
+
+        def failed(_e) -> None:
+            self._cal_job = None
+            if self.params is old:
+                fallback()
+
+        self._cal_job = worker.start(calibrate, rows, base, half_life_days=self.tab_check.half_life(),
+                                     weather=self.weather_series(), on_done=done, on_error=failed)
 
     def _upgrade_model(self) -> None:
         """Модель, откалиброванная прошлой версией (до 0.8), — дополнить допуски по журналу без перекалибровки.
@@ -241,6 +324,10 @@ class MainWindow(QMainWindow):
 
     def limits(self):
         return self.in_soft.value(), self.in_hard.value()
+
+    def plan_passes(self) -> Optional[int]:
+        """Число проходов, заданное в «План сушки партии» (None — авто, по лимиту съёма)."""
+        return self.in_npass.value() or None
 
     def fuel_unit(self) -> str:
         return self.in_fuel_unit.text().strip() or "ед."
@@ -562,8 +649,17 @@ class MainWindow(QMainWindow):
         self.in_manual.setPlaceholderText("например 40,35,35 или 75")
         self.in_cool = QCheckBox("Финальное охлаждение на D = 100")
         self.in_cool.setChecked(True)
+        self.in_npass = QSpinBox()
+        self.in_npass.setRange(0, 10)
+        self.in_npass.setSpecialValueText("авто — по лимиту съёма")
+        self.in_npass.setSuffix(" прох.")
+        self.in_npass.setToolTip("Сколько проходов вы хотите сделать (например, с 35 % в 3 прохода — по 7 п.п.). "
+                                 "Этот сценарий станет ★ рекомендованным, даже если съём больше желаемого; цвет "
+                                 "строки по-прежнему покажет, в каком он лимите. «Авто» — наименьшее число проходов в "
+                                 "желаемом лимите съёма.")
         f.addRow("Желаемый съём за проход ≤", self.in_soft)
         f.addRow("Допустимый съём за проход ≤", self.in_hard)
+        f.addRow("Число проходов", self.in_npass)
         f.addRow("Привычная разгрузка D", self.in_dfix)
         f.addRow("D по проходам (с), ручной", self.in_manual)
         f.addRow(self.in_cool)
@@ -632,6 +728,7 @@ class MainWindow(QMainWindow):
             wdg.valueChanged.connect(self.recalc)
         self.in_start.dateTimeChanged.connect(self.recalc)
         self.in_cool.stateChanged.connect(self.recalc)
+        self.in_npass.valueChanged.connect(self.recalc)
         for le in (self.in_manual, self.in_tlist, self.in_fuel_unit):
             le.editingFinished.connect(self.recalc)
         return w
@@ -657,7 +754,8 @@ class MainWindow(QMainWindow):
             self.status.setText("Начальная влажность не выше целевой: сушка не нужна.")
             return
 
-        plans = mdl.scenarios(p, c, m0, w0, wk, 6, start, t_list, cool)
+        n_fix = self.plan_passes()
+        plans = mdl.scenarios(p, c, m0, w0, wk, max(6, n_fix or 0), start, t_list, cool)
         uniq: List[mdl.Plan] = []   # одинаковые сценарии (когда лишние проходы не нужны) показываем один раз
         for pl in plans:
             if not uniq or len(pl.passes) != len(uniq[-1].passes):
@@ -665,6 +763,16 @@ class MainWindow(QMainWindow):
         plans = uniq
         soft, hard = self.in_soft.value(), self.in_hard.value()
         rec = mdl.recommend(plans, soft, hard)
+        self._npass_note = ""
+        if n_fix:                    # число проходов задано: этот сценарий — ★, лимит съёма только подсвечивает
+            rec = next((i for i, pl in enumerate(plans) if len(pl.passes) == n_fix), rec)
+            pl = plans[rec] if rec is not None else None
+            if pl is not None:
+                mx = pl.max_dw
+                over = (f" — больше допустимого {hard:g} п.п.: проверьте качество (трещиноватость)" if mx > hard + 1e-9
+                        else f" — больше желаемого {soft:g} п.п. (допустимо до {hard:g})" if mx > soft + 1e-9 else "")
+                self._npass_note = (f"Число проходов задано: {n_fix} — съём по {mx:.1f} п.п. за проход{over}. "
+                                    f"«Авто» — наименьшее число проходов в желаемом лимите.")
         extra: List[mdl.Plan] = [mdl.plan_manual(p, c, m0, w0, wk, [self.in_dfix.value()], start, t_list=t_list,
                                                  cool=cool, name=f"Как у вас: D={self.in_dfix.value():g}")]
         manual = parse_ints(self.in_manual.text())
@@ -694,7 +802,7 @@ class MainWindow(QMainWindow):
         for i, pl in enumerate(plans):
             level, text = pl.verdict(soft, hard)
             is_auto = i < n_auto
-            title = pl.name + (" ★" if i == rec and is_auto else "")
+            title = pl.name + ((" ★ задано" if n_fix else " ★") if i == rec and is_auto else "")
             end = pl.end.strftime("%d.%m %H:%M") if pl.end else "—"
             if fuel > 0:
                 amount = pl.water_total * fuel
@@ -770,7 +878,8 @@ class MainWindow(QMainWindow):
         rng = self.plan_ranges[rows[0].row()] if rows[0].row() < len(getattr(self, "plan_ranges", [])) else None
         sig = getattr(self, "plan_sigmas", [])
         if rows[0].row() < len(sig):
-            self.status.setText(mdl.sigma_text(sig[rows[0].row()][1]) + ".")
+            note = getattr(self, "_npass_note", "")
+            self.status.setText((note + "\n\n" if note else "") + mdl.sigma_text(sig[rows[0].row()][1]) + ".")
         self.tbl_det.setRowCount(len(pl.passes))
         for i, ps in enumerate(pl.passes):
             read = mdl.read_from_true(self.params, ps.w_out, ps.t_grain or None)
@@ -1335,7 +1444,7 @@ class MainWindow(QMainWindow):
         return ReminderCfg.from_dict(self.storage.get_json("reminders", {}))
 
     def _check_reminders(self, now: Optional[datetime] = None) -> list:
-        if not getattr(self, "_ready", False):
+        if not shiboken6.isValid(self) or not getattr(self, "_ready", False):    # окно удалено, вызов отложен
             return []
         cfg = self.reminder_cfg()
         if not cfg.enabled:
@@ -1709,7 +1818,9 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout(inner)
         self.s_mdryer = dspin(1, 500, 60, 0, 1, " т")
         self.s_overhead = dspin(0, 24, 1.0, 2, 0.25, " ч")
-        self.s_bias = dspin(-5, 5, 0.8, 2, 0.1, " п.п.")
+        self.s_bias = dspin(-5, 5, 0.0, 2, 0.1, " п.п.")
+        self.s_bias.setToolTip("Только то, что вы внесли: по парам проб («Погода и влагомер» → «Применить поправку в "
+                               "модель») или вручную. 0 — без поправки. После изменения — перекалибровать модель.")
         self.s_kw = dspin(-0.5, 0.5, 0.0, 3, 0.01)
         self.s_kt = dspin(-0.5, 0.5, 0.0, 3, 0.01)
         self.s_sigma = dspin(0, 50, 5, 1, 0.5, " %")
@@ -1723,7 +1834,7 @@ class MainWindow(QMainWindow):
         for cb in (self.s_src, self.s_model):         # длинные пункты не раздувают ширину страницы
             cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             cb.setMinimumContentsLength(18)
-        self.s_rref = dspin(0.05, 100, 1.83, 3, 0.1, " т воды/ч")
+        self.s_rref = dspin(0.05, 100, 1.57, 3, 0.1, " т воды/ч")
         self.s_wref = dspin(10, 50, 22, 1, 1, " %")
         self.s_tref = dspin(20, 150, 60, 1, 0.5, " °C")
         self.s_tambref = dspin(-40, 45, 10, 1, 1, " °C")
@@ -2218,6 +2329,7 @@ class MainWindow(QMainWindow):
         d["tlist"] = self.in_tlist.text()
         d["fuel_unit"] = self.in_fuel_unit.text()
         d["cool"] = self.in_cool.isChecked()
+        d["npass"] = self.in_npass.value()
         self.storage.set_json("ui", d)
 
     def _load_ui_state(self) -> None:
@@ -2230,6 +2342,7 @@ class MainWindow(QMainWindow):
         self.in_fuel_unit.setText(d.get("fuel_unit", "м³"))
         if "cool" in d:
             self.in_cool.setChecked(bool(d["cool"]))
+        self.in_npass.setValue(int(d.get("npass", 0) or 0))
 
     def closeEvent(self, event) -> None:  # noqa: N802
         try:
@@ -2240,6 +2353,8 @@ class MainWindow(QMainWindow):
             self._save_ui_state()
             self._save_simple_state()
         finally:
+            for t in self.findChildren(QTimer):     # закрытое окно больше ничего не считает (напоминания, автосохранение)
+                t.stop()
             super().closeEvent(event)
 
 

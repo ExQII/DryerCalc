@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Optional
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QCheckBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget)
+                               QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from . import model as mdl
 from .live import LiveState, live_advice, live_forecast, live_state, outlet_soon
@@ -94,6 +94,13 @@ class LiveTab(QWidget):
         self.lbl_target_read = mute(QLabel())
         self.lbl_target_read.setWordWrap(True)
         self.wk_final = dspin(8, 30, 14, 1, 0.5, " %")
+        self.npass = QSpinBox()
+        self.npass.setRange(0, 10)
+        self.npass.setSpecialValueText("авто — по лимиту съёма")
+        self.npass.setSuffix(" прох.")
+        self.npass.setToolTip("Сколько проходов в партии по заданию (например, с 35 % в 3 прохода). Тогда «Конец "
+                              "партии» считается на оставшиеся по заданию проходы, а не на наименьшее число в лимите "
+                              "съёма. Номер текущего прохода — из журнала.")
         self.t_amb = dspin(-40, 45, 10, 1, 1, " °C")
         self.rh = dspin(5, 100, 70, 0, 5, " %")
         self.d_try = dspin(0, 100, 0, 0, 1, " с")
@@ -123,6 +130,7 @@ class LiveTab(QWidget):
         f.addRow("Цель прохода", self.w_target)
         f.addRow(self.lbl_target_read)
         f.addRow("Цель партии Wк", self.wk_final)
+        f.addRow("Проходов в партии", self.npass)
         f.addRow(self.cb_silo)
         f.addRow("…не дальше от цели, ±", self.silo_lim)
         cols[1].addWidget(gb)
@@ -265,6 +273,7 @@ class LiveTab(QWidget):
             w.valueChanged.connect(self.recalc)
         self.cb_corr.stateChanged.connect(self.recalc)
         self.cb_silo.stateChanged.connect(self.recalc)
+        self.npass.valueChanged.connect(self.recalc)
         self.cb_now.stateChanged.connect(self.refresh)
         self._load()
         # от цели партии зависит, досушка ли рециркуляция — пересчитать проход. Подключено после загрузки настроек:
@@ -280,6 +289,7 @@ class LiveTab(QWidget):
                 w.setValue(float(d[k]))
         self.cb_corr.setChecked(bool(d.get("corr", True)))
         self.cb_silo.setChecked(bool(d.get("silo", True)))
+        self.npass.setValue(int(d.get("npass", 0) or 0))
         if "silo_lim" in d:
             self.silo_lim.setValue(float(d["silo_lim"]))
 
@@ -287,7 +297,7 @@ class LiveTab(QWidget):
         self.win.storage.set_json("ui_live", {
             "m_pass": self.m_pass.value(), "w_target": self.w_target.value(), "wk": self.wk_final.value(),
             "t_amb": self.t_amb.value(), "rh": self.rh.value(), "corr": self.cb_corr.isChecked(),
-            "silo": self.cb_silo.isChecked(), "silo_lim": self.silo_lim.value()})
+            "silo": self.cb_silo.isChecked(), "silo_lim": self.silo_lim.value(), "npass": self.npass.value()})
 
     def _weather(self) -> None:
         ws = self.win.weather_series()
@@ -436,7 +446,8 @@ class LiveTab(QWidget):
         d_try = self.d_try.value() or None
         fc = live_forecast(p, c, st, self.m_pass.value(), self.w_target.value(), self.wk_final.value(), soft, hard,
                            use_corr=self.cb_corr.isChecked(), now=now, d_override=d_try,
-                           silo=self.cb_silo.isChecked(), silo_lim=self.silo_lim.value())
+                           silo=self.cb_silo.isChecked(), silo_lim=self.silo_lim.value(),
+                           n_total=self.npass.value() or None)
         self.fc = fc
         d_use = d_try or fc.d_rec
         lines = [f"Сейчас при D = {st.d:.0f}: на выходе ≈ <b>{fc.w_out_now:.1f} %</b> "

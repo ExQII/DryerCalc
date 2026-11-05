@@ -319,7 +319,7 @@ class LiveForecast:
 def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: float, w_target: float,
                   wk_final: float, soft: float, hard: float, use_corr: bool = True, cool: bool = True,
                   now: Optional[datetime] = None, d_override: Optional[float] = None, silo: bool = False,
-                  silo_lim: float = 1.0) -> LiveForecast:
+                  silo_lim: float = 1.0, n_total: Optional[int] = None) -> LiveForecast:
     """w_target — желаемая истинная влажность на выходе ЭТОГО прохода (средняя по приёмному силосу); wk_final —
     цель партии.
 
@@ -329,7 +329,10 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
         W_нужно = (W_цель·M_всего − W_ушло·M_ушло − W_шахта·M_шахта) / M_новое,
     где M_шахта ≈ lag_k·вместимость — зерно, уже находящееся в шахте: оно выйдет со старым режимом (≈ W при текущем
     D), и подстроить можно только зерно, которое войдёт с этого момента (M_новое). W_нужно ограничивается
-    W_цель ± silo_lim, чтобы силос не стал «полосатым»: сильно разная влажность слоёв плохо хранится."""
+    W_цель ± silo_lim, чтобы силос не стал «полосатым»: сильно разная влажность слоёв плохо хранится.
+
+    n_total — число проходов партии по заданию (None — авто): остальные проходы до цели партии — n_total минус номер
+    текущего, а не наименьшее число в лимите съёма."""
     fc = LiveForecast()
     corr = st.corr if use_corr else 0.0
     w_in = st.w_in
@@ -392,10 +395,18 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
     fc.pass_end = t_now + timedelta(hours=fc.remaining / q_new) if q_new > 0 else None
     # остальные проходы до цели партии
     if fc.pass_end and w_pass_out > wk_final + 0.05:
-        plans = mdl.scenarios(p, c, fc.m_out_pass, w_pass_out, wk_final, 6,
-                              fc.pass_end + timedelta(hours=p.overhead_h), None, cool)
-        k = mdl.recommend(plans, soft, hard)
-        fc.rest_plan = plans[k] if k is not None else plans[-1]
+        n_left = int(round(n_total - st.pass_no)) if n_total and st.pass_no else 0
+        if n_total and st.pass_no and n_left < 1:
+            fc.warnings.append(f"по заданию в партии {n_total} прох., это последний, но цель прохода выше цели "
+                               f"партии — остаток посчитан по лимиту съёма")
+        if n_left >= 1:
+            fc.rest_plan = mdl.plan_by_passes(p, c, fc.m_out_pass, w_pass_out, wk_final, n_left,
+                                              fc.pass_end + timedelta(hours=p.overhead_h), None, cool)
+        else:
+            plans = mdl.scenarios(p, c, fc.m_out_pass, w_pass_out, wk_final, 6,
+                                  fc.pass_end + timedelta(hours=p.overhead_h), None, cool)
+            k = mdl.recommend(plans, soft, hard)
+            fc.rest_plan = plans[k] if k is not None else plans[-1]
         fc.batch_end = fc.rest_plan.end
         n_rest = len(fc.rest_plan.passes)
         start_rest = fc.pass_end + timedelta(hours=p.overhead_h)

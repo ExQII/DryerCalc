@@ -105,6 +105,7 @@ class WeekendInput:
     hard: float = 10.0
     cool: bool = True
     t_list: Optional[List[float]] = None
+    passes: int = 0                      # число проходов задано (0 — авто: по лимиту съёма)
 
 
 @dataclass
@@ -146,14 +147,25 @@ class WeekendResult:
 
 def _builder(p: mdl.DryerParams, c: mdl.Conditions, inp: WeekendInput
              ) -> Tuple[int, Callable[[mdl.DryerParams, float], mdl.Plan], str]:
-    """(число проходов, план(параметры, масса), пометка). Число проходов выбирается один раз — от массы не зависит."""
-    if inp.method == "q":
+    """(число проходов, план(параметры, масса), пометка). Число проходов выбирается один раз — от массы не зависит:
+    заданное (inp.passes) или наименьшее в лимите съёма."""
+    note = ""
+    if inp.passes > 0:
+        n = int(inp.passes)
+        dw = (inp.w0 - inp.wk) / n
+        lim = inp.lim if inp.method == "q" else inp.hard
+        if dw > lim + 1e-9:
+            note = (f"задано {n} прох.: съём по {dw:.1f} п.п. за проход больше "
+                    f"{'лимита' if inp.method == 'q' else 'допустимого'} {lim:g} п.п.")
+    elif inp.method == "q":
         n = max(1, int(math.ceil((inp.w0 - inp.wk) / max(inp.lim, 0.1) - 1e-9)))
-        return n, (lambda pp, m: mdl.plan_simple(pp, m, inp.w0, inp.wk, [inp.q], n, inp.start, inp.cool)), ""
-    plans = mdl.scenarios(p, c, 100.0, inp.w0, inp.wk, 6, inp.start, inp.t_list, inp.cool)
-    k = mdl.recommend(plans, inp.soft, inp.hard)
-    note = "" if k is not None else f"в допустимый съём {inp.hard:g} п.п. за проход не уложиться — взято 6 проходов"
-    n = len((plans[k] if k is not None else plans[-1]).passes)
+    else:
+        plans = mdl.scenarios(p, c, 100.0, inp.w0, inp.wk, 6, inp.start, inp.t_list, inp.cool)
+        k = mdl.recommend(plans, inp.soft, inp.hard)
+        note = "" if k is not None else f"в допустимый съём {inp.hard:g} п.п. за проход не уложиться — взято 6 проходов"
+        n = len((plans[k] if k is not None else plans[-1]).passes)
+    if inp.method == "q":
+        return n, (lambda pp, m: mdl.plan_simple(pp, m, inp.w0, inp.wk, [inp.q], n, inp.start, inp.cool)), note
     return n, (lambda pp, m: mdl.plan_by_passes(pp, c, m, inp.w0, inp.wk, n, inp.start, inp.t_list, inp.cool)), note
 
 

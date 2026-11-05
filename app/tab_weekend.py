@@ -129,6 +129,13 @@ class WeekendTab(QWidget):
         self.lim = dspin(1, 25, float(d.get("lim", 6.0)), 1, 0.5, " п.п.")
         self.cool = QCheckBox("Финальное охлаждение на D = 100")
         self.cool.setChecked(bool(d.get("cool", True)))
+        self.npass = QSpinBox()
+        self.npass.setRange(0, 10)
+        self.npass.setSpecialValueText("авто — по лимиту съёма")
+        self.npass.setSuffix(" прох.")
+        self.npass.setValue(int(d.get("passes", 0) or 0))
+        self.npass.setToolTip("Сколько проходов сделаете с выходной партией. «Авто» — наименьшее число проходов в "
+                              "желаемом лимите съёма (по модели) или по лимиту съёма (по производительности).")
         c = win.conditions()
         self.t_amb = dspin(-40, 45, c.t_amb, 1, 1, " °C")
         self.rh = dspin(5, 100, c.rh, 0, 5, " %")
@@ -140,6 +147,7 @@ class WeekendTab(QWidget):
         f.addRow("Метод", self.method)
         f.addRow("Q выгрузки", self.q)
         f.addRow("Лимит съёма за проход", self.lim)
+        f.addRow("Число проходов", self.npass)
         f.addRow(self.cool)
         f.addRow("Воздух на выходных, T", self.t_amb)
         f.addRow("Воздух на выходных, RH", self.rh)
@@ -255,6 +263,7 @@ class WeekendTab(QWidget):
         for wd in (self.stops, self.w0, self.wk, self.already, self.bin_t, self.q, self.lim, self.t_amb, self.rh):
             wd.valueChanged.connect(self.recalc)
         self.bins.valueChanged.connect(self.recalc)
+        self.npass.valueChanged.connect(self.recalc)
         self.method.currentIndexChanged.connect(self.recalc)
         self.cool.stateChanged.connect(self.recalc)
         self.start.dateTimeChanged.connect(self._start_edited)
@@ -357,7 +366,8 @@ class WeekendTab(QWidget):
         self.win.storage.set_json("ui_weekend", {
             "w0": self.w0.value(), "wk": self.wk.value(), "stops": self.stops.value(), "bins": self.bins.value(),
             "bin_t": self.bin_t.value(), "method": self.method.currentData(), "q": self.q.value(),
-            "lim": self.lim.value(), "cool": self.cool.isChecked(), "ret_dow": self._ret[0], "ret_h": self._ret[1],
+            "lim": self.lim.value(), "cool": self.cool.isChecked(), "passes": self.npass.value(),
+            "ret_dow": self._ret[0], "ret_h": self._ret[1],
             "ret_m": self._ret[2]})
 
     def _add_to_queue(self) -> None:
@@ -365,7 +375,8 @@ class WeekendTab(QWidget):
         if r is None or not r.ok or inp is None:
             return
         name = f"Выходные {inp.start:%d.%m}"
-        self.win.tab_batches.add_to_queue(name, round(r.mass / 10.0) * 10.0, inp.w0, inp.wk, inp.start)
+        self.win.tab_batches.add_to_queue(name, round(r.mass / 10.0) * 10.0, inp.w0, inp.wk, inp.start,
+                                          passes=inp.passes or None)
         self.win.statusBar().showMessage(f"Партия «{name}», {tonnes(r.mass)} т, добавлена в очередь — раздел "
                                          f"«Партии и очередь» → «Очередь и смешивание».", 15000)
 
@@ -376,7 +387,7 @@ class WeekendTab(QWidget):
         p = self.win.params
         th = theme_for(self)
         self.q.setEnabled(self.method.currentData() == "q")
-        self.lim.setEnabled(self.method.currentData() == "q")
+        self.lim.setEnabled(self.method.currentData() == "q" and not self.npass.value())
         self.bin_t.setEnabled(self.bins.value() > 0)
         c0 = self.win.conditions()
         c = mdl.Conditions(c0.t_proc, self.t_amb.value(), self.rh.value())
@@ -393,7 +404,8 @@ class WeekendTab(QWidget):
             start=self.start.dateTime().toPython(), end=self.end.dateTime().toPython(), w0=self.w0.value(),
             wk=self.wk.value(), stops_h=self.stops.value(), already=self.already.value(),
             capacity=self.bins.value() * self.bin_t.value(), method=self.method.currentData(), q=self.q.value(),
-            lim=self.lim.value(), soft=soft, hard=hard, cool=self.cool.isChecked(), t_list=t_list)
+            lim=self.lim.value(), soft=soft, hard=hard, cool=self.cool.isChecked(), t_list=t_list,
+            passes=self.npass.value())
         r = weekend_mass(p, c, inp)
         self.result, self.inp = r, inp
         self._save()

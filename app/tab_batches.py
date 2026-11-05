@@ -22,8 +22,9 @@ from .ui_common import (dspin, fmt_hours, fnum, item, menu_button, mute, set_rol
 if TYPE_CHECKING:
     from .gui import MainWindow
 
-QUEUE_FIELDS = ["name", "mass", "w0", "wk", "ready"]
-QUEUE_HEADERS = ["Партия", "Масса, т", "W₀, %", "Wк, %", "Готова к сушке (дд.мм.гггг чч:мм)"]
+QUEUE_FIELDS = ["name", "mass", "w0", "wk", "ready", "passes"]
+QUEUE_HEADERS = ["Партия", "Масса, т", "W₀, %", "Wк, %", "Готова к сушке\n(дд.мм.гггг чч:мм)",
+                 "Проходов\n(пусто — авто)"]
 
 
 class GanttChart(QWidget):
@@ -642,7 +643,7 @@ class BatchesTab(QWidget):
     def _q_add(self) -> None:
         items = self._queue()
         items.append({"name": f"Партия {len(items) + 1}", "mass": self.win.in_mass.value(), "w0": self.win.in_w0.value(),
-                      "wk": self.win.in_wk.value(), "ready": ""})
+                      "wk": self.win.in_wk.value(), "ready": "", "passes": self.win.plan_passes()})
         self._fill_queue(items)
         self._save_queue()
         self.recalc_queue()
@@ -680,10 +681,11 @@ class BatchesTab(QWidget):
         ends = [e.end for e in self.queue_schedule() if e.end]
         return max(ends) if ends else None
 
-    def add_to_queue(self, name: str, mass: float, w0: float, wk: float, ready: Optional[datetime]) -> None:
+    def add_to_queue(self, name: str, mass: float, w0: float, wk: float, ready: Optional[datetime],
+                     passes: Optional[int] = None) -> None:
         items = self._queue()
         items.append({"name": name, "mass": round(mass, 1), "w0": w0, "wk": wk,
-                      "ready": f"{ready:%d.%m.%Y %H:%M}" if ready else ""})
+                      "ready": f"{ready:%d.%m.%Y %H:%M}" if ready else "", "passes": passes})
         self._fill_queue(items)
         self._save_queue()
         self.recalc_queue()

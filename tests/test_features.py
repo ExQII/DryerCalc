@@ -344,8 +344,9 @@ def test_reports_are_written():
 
 def test_meter_conversion_inverse_and_backward_compatible():
     from app.model import read_from_true, true_from_read
-    assert abs(true_from_read(P, 15.0) - 14.2) < 1e-12          # старая запись: показание − 0,8
-    q = replace(P, out_kw=0.08, out_kt=0.05)
+    assert P.out_bias == 0.0 and true_from_read(P, 15.0) == 15.0       # с 1.3 по умолчанию поправки нет
+    assert abs(true_from_read(replace(P, out_bias=0.8), 15.0) - 14.2) < 1e-12   # постоянная: показание − a
+    q = replace(P, out_bias=0.8, out_kw=0.08, out_kt=0.05)
     for w in (13.0, 20.0, 31.0):
         for t in (None, 25.0, 40.0):
             assert abs(read_from_true(q, true_from_read(q, w, t), t) - w) < 1e-9
@@ -618,12 +619,13 @@ def test_silo_average_targeting():
                 "t_up": 60, "t_low": 55, "d": 35, "note": note, "batch": "К-07", "pass_no": 1, "t_amb": None, "rh": None}
     rows = [r("08:00", note="Запуск")] + [r(f"{8 + (i + 1) // 2:02d}:{30 * ((i + 1) % 2):02d}", 30.0, 23.0)
                                           for i in range(12)]
-    st = live_state(rows, P)
+    pb = replace(P, out_bias=0.8)          # выходной влагомер завышает на 0,8: ушедшее зерно суше цели прохода
+    st = live_state(rows, pb)
     from app.model import true_from_read
-    assert abs(st.silo_w - true_from_read(P, 23.0, 31.0)) < 1e-9 and abs(st.silo_w_read - 23.0) < 1e-9
+    assert abs(st.silo_w - true_from_read(pb, 23.0, 31.0)) < 1e-9 and abs(st.silo_w_read - 23.0) < 1e-9
     c = Conditions(st.t_proc, 10.0, 70.0)
-    plain = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0)
-    fc = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0, silo=True, silo_lim=1.0)
+    plain = live_forecast(pb, c, st, 400.0, 24.0, 14.0, 6.0, 10.0)
+    fc = live_forecast(pb, c, st, 400.0, 24.0, 14.0, 6.0, 10.0, silo=True, silo_lim=1.0)
     sl = fc.silo
     assert plain.silo is None and abs(plain.w_goal - 24.0) < 1e-9
     assert sl["need"] > 25.0 and abs(fc.w_goal - 25.0) < 1e-9 and sl["limited"] and fc.d_rec > plain.d_rec
@@ -772,6 +774,9 @@ def test_quick_entry_follows_journal_edits_in_window():
     from app.gui import MainWindow
     db = _tmp("dryer.db")
     shutil.copy(OLD_DBS[-1], db)
+    st0 = Storage(db)                  # поправку с фото здесь не убираем: проверяется только дополнение допусков
+    st0.set_json("meter_photo", {"done": "тест"})
+    st0.close()
     win = MainWindow(Storage(db))
     r_ref = win.params.r_ref
     win._upgrade_model()
@@ -1292,7 +1297,7 @@ def test_passes_split_by_recirculation_not_by_silo_switch():
     cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
     st1 = live_state(cut, P, final_w=15.0)
     assert st1.start == t0 and abs(st1.unloaded - q_at(P, 35) * 18.5) < 1e-6 and st1.sources == ["2", "4"]
-    assert 20.7 < st1.silo_w < 21.1 and st1.silo_n == 37
+    assert 21.5 < st1.silo_w < 21.9 and st1.silo_n == 37          # без поправки влагомера: средняя показаний
     # подача после рециркуляции — новый проход, номер посчитан сам (в журнале «Проход» не сменили)
     st2 = live_state(rows, P, final_w=15.0)
     assert st2.pass_no == 2 and st2.pass_auto and st2.start == t0 + timedelta(hours=21.4) and not st2.recirc
@@ -1303,7 +1308,7 @@ def test_passes_split_by_recirculation_not_by_silo_switch():
     prep, _ = prepare(rows)
     ps = journal_passes(prep, P, 15.0)
     assert [(x["pass_no"], x["end_kind"], x["batch_end"]) for x in ps] == [(1, "recirc", False), (2, "recirc", True)]
-    assert 20.5 < ps[0]["w_end"] < 21.2 and ps[1]["w_end"] < 15.0 and ps[0]["sources"] == ["2", "4"]
+    assert 21.3 < ps[0]["w_end"] < 21.9 and ps[1]["w_end"] < 15.0 and ps[0]["sources"] == ["2", "4"]
     st3 = live_state(rows, P, final_w=15.0)
     assert st3.recirc and st3.batch_end and st3.recirc_since == t0 + timedelta(hours=40.2)
     fc3 = live_forecast(P, Conditions(st3.t_proc, 10.0, 70.0), st3, 1000.0, 14.5, 14.0, 6.0, 10.0)
@@ -1368,6 +1373,7 @@ def test_startup_with_saved_settings_raises_nothing():
                                   "cool": True, "mode": "manual", "q": "5"})
         st.set_json("ui_queue", {"method": "q", "q": 40.0, "lim": 6.0, "change": 20.0, "cool": True})
         st.set_json("ui_theme", {"mode": "dark"})
+        st.set_json("meter_photo", {"done": "тест"})
         win = MainWindow(st)
         lt = win.tab_live
         assert lt.wk_final.value() == 13.5 and lt.m_pass.value() == 900.0
@@ -1549,12 +1555,175 @@ def test_weekend_tab_ui_queue_and_settings():
     assert not errors, "".join(str(e[1]) for e in errors)
 
 
+# ---------------------------------------------------------------------------
+# v1.3: поправка влагомера — только внесённая; число проходов задаётся вручную
+# ---------------------------------------------------------------------------
+
+def test_photo_meter_bias_removed_once_with_recalibration():
+    """Поправка +0,8 с фото журнала октября убирается один раз, и модель перекалибровывается по журналу без неё (как
+    «Калибровать модель»); поправку, внесённую по парам проб, не трогаем; стартовая модель без журнала — новая
+    стартовая без поправки."""
+    import shutil
+    app = _qapp()
+    from app import worker
+    from app.gui import MainWindow
+    db = _tmp("photo.db")
+    shutil.copy(OLD_DBS[-1], db)
+    win = MainWindow(Storage(db))
+    old = win.params
+    assert old.out_bias == 0.8 and win._has_photo_bias()
+    win._startup_model()
+    worker.wait_all()
+    for _ in range(30):
+        app.processEvents()
+    p = win.params
+    ref, _rep = calibrate(win.journal_rows(), replace(old, out_bias=0.0), half_life_days=win.tab_check.half_life(),
+                          weather=win.weather_series())
+    assert p.out_bias == 0.0 and abs(p.r_ref - ref.r_ref) < 1e-9 and p.r_ref < 0.95 * old.r_ref and p.calibrated
+    assert "фото" in p.calib_info and "убрана" in win.statusBar().currentMessage()
+    assert win.storage.get_json("meter_photo")["how"] == "перекалибровано" and not win._has_photo_bias()
+    win.close()
+    _cleanup_windows()
+    win2 = MainWindow(Storage(db))                      # второй раз не трогает
+    assert win2.params.out_bias == 0.0 and not win2._has_photo_bias()
+    win2.close()
+    _cleanup_windows()
+    db3 = _tmp("pairs.db")                              # поправка по парам проб — своя
+    shutil.copy(OLD_DBS[-1], db3)
+    st = Storage(db3)
+    st.save_params(replace(st.load_params(), out_bias=0.82))
+    st.close()
+    win3 = MainWindow(Storage(db3))
+    assert not win3._has_photo_bias()
+    win3.close()
+    _cleanup_windows()
+    db4 = _tmp("start.db")                              # журнала нет, модель стартовая
+    st = Storage(db4)
+    st.save_params(replace(DryerParams(), out_bias=0.8, r_ref=1.83, b_w=0.69, b_dt=0.87, eta=0.52,
+                           calib_info="стартовая: журнал 18–25.10.2026, 4 прохода, ошибка съёма ±0,14 п.п."))
+    st.close()
+    win4 = MainWindow(Storage(db4))
+    win4._startup_model()
+    d = DryerParams()
+    q = win4.params
+    assert q.out_bias == 0.0 and (q.r_ref, q.b_w, q.eta, q.calib_info) == (d.r_ref, d.b_w, d.eta, d.calib_info)
+    win4.close()
+
+
+def test_default_start_model_is_calibrated_without_meter_bias():
+    """Стартовая модель — калибровка журнала октября без поправки влагомера (с поправкой +0,8 R₀ было бы на ≈14 %
+    больше: показание выше истинной — съём меньше)."""
+    rows, _ = read_journal(SAMPLE)
+    p, rep = calibrate(rows, P)
+    assert P.out_bias == 0.0 and rep["n_used"] == 120
+    for k in ("r_ref", "b_w", "b_dt", "eta"):
+        assert abs(getattr(p, k) - getattr(P, k)) < 0.01, k
+    with_bias, _ = calibrate(rows, replace(P, out_bias=0.8))
+    assert with_bias.r_ref > 1.1 * p.r_ref
+
+
+def test_plan_pass_count_set_by_hand():
+    """«Число проходов» в «План сушки партии»: с 35 % в 3 прохода — ★ этот сценарий, хотя съём 7 п.п. больше
+    желаемых 6; цвет и пояснение говорят, в каком он лимите. Сохраняется и восстанавливается."""
+    app = _qapp()
+    from app.gui import MainWindow
+    db = _tmp("npass.db")
+    win = MainWindow(Storage(db))
+    win.in_w0.setValue(35.0)
+    win.in_wk.setValue(14.0)
+    auto = [pl for pl in win.plans if "★" in win.tbl_sc.item(win.plans.index(pl), 0).text()]
+    assert len(auto[0].passes) == 4                     # авто: 21 п.п. при желаемых 6 — 4 прохода
+    win.in_npass.setValue(3)
+    rows = [i for i in range(win.tbl_sc.rowCount()) if "★" in win.tbl_sc.item(i, 0).text()]
+    assert len(rows) == 1 and len(win.plans[rows[0]].passes) == 3 and "задано" in win.tbl_sc.item(rows[0], 0).text()
+    assert win.tbl_sc.selectionModel().selectedRows()[0].row() == rows[0]
+    assert all(abs(x.dw - 7.0) < 0.3 for x in win.plans[rows[0]].passes)      # D — целые секунды
+    assert "Число проходов задано: 3" in win.status.text() and "больше желаемого 6" in win.status.text()
+    assert win.plan_passes() == 3
+    win.tab_batches._q_add()                            # строка очереди из плана — с заданным числом проходов
+    assert win.tab_batches._queue()[-1]["passes"] == 3
+    for _ in range(3):
+        app.processEvents()
+    win.close()
+    win2 = MainWindow(Storage(db))
+    assert win2.in_npass.value() == 3 and win2.plan_passes() == 3
+    win2.in_npass.setValue(0)
+    assert win2.plan_passes() is None
+    win2.close()
+
+
+def test_pass_count_in_weekend_queue_and_live():
+    """Заданное число проходов — и в «Масса на выходные», и в очереди партий, и в «Текущий проход» (остаток партии:
+    заданное число минус номер текущего прохода)."""
+    from app.weekend import WeekendInput, weekend_mass
+    c = Conditions(60, 8, 75)
+    st, en = datetime(2026, 11, 6, 18, 0), datetime(2026, 11, 9, 8, 0)
+    auto = weekend_mass(P, c, WeekendInput(st, en, 35.0, 14.0))
+    three = weekend_mass(P, c, WeekendInput(st, en, 35.0, 14.0, passes=3))
+    assert auto.n_passes == 4 and three.n_passes == 3 and len(three.plan.passes) == 3 and not three.notes
+    assert abs(three.plan.total_time_h - 62.0) < 0.02
+    two = weekend_mass(P, c, WeekendInput(st, en, 35.0, 14.0, passes=2))
+    assert two.n_passes == 2 and "больше допустимого 10" in two.notes[0]
+    q3 = weekend_mass(P, c, WeekendInput(st, en, 35.0, 14.0, method="q", passes=3))
+    assert q3.n_passes == 3 and "лимита" in q3.notes[0]          # 7 п.п. при лимите 6
+    items = [{"name": "А", "mass": 500, "w0": 35, "wk": 14, "passes": 3}, {"name": "Б", "mass": 500, "w0": 35, "wk": 14}]
+    es = schedule(items, P, c, st)
+    assert [e.passes for e in es] == [3, 4] and "задано: 3" in es[0].note
+    es_q = schedule(items, P, c, st, method="q", lim=6.0)
+    assert [e.passes for e in es_q] == [3, 4]
+    rows, _row, t0 = _silo_journal()
+    cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
+    s1 = live_state(cut, P, final_w=15.0)
+    cc = Conditions(s1.t_proc, 10.0, 70.0)
+    fa = live_forecast(P, cc, s1, 1000.0, 21.0, 14.0, 6.0, 10.0)
+    f4 = live_forecast(P, cc, s1, 1000.0, 21.0, 14.0, 6.0, 10.0, n_total=4)
+    f1 = live_forecast(P, cc, s1, 1000.0, 21.0, 14.0, 6.0, 10.0, n_total=1)
+    assert s1.pass_no == 1 and len(fa.rest_plan.passes) == 2 and len(f4.rest_plan.passes) == 3
+    assert f4.batch_end > fa.batch_end and any("последний" in w for w in f1.warnings)
+    assert len(f1.rest_plan.passes) == len(fa.rest_plan.passes)
+
+
+def _cleanup_windows():
+    """Окна прошлых тестов удаляются: каждое новое окно ставит оформление на всё приложение и перерисовывает все
+    живые окна — без уборки тесты с окнами замедляются квадратично (в программе окно одно)."""
+    if "app.gui" not in sys.modules:
+        return
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QApplication
+    from app import worker
+    from app.gui import MainWindow
+    qa = QApplication.instance()
+    if qa is None:
+        return
+    worker.wait_all()
+    qa.processEvents()
+    for w in qa.topLevelWidgets():
+        if isinstance(w, MainWindow):
+            for t in w.findChildren(type(w._save_timer)):
+                t.stop()
+            w.hide()
+            w.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+
+try:                                    # под pytest — после каждого теста; без pytest — в цикле ниже
+    import pytest
+
+    @pytest.fixture(autouse=True)
+    def _windows_cleanup():
+        yield
+        _cleanup_windows()
+except ImportError:
+    pass
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             try:
                 fn()
+                _cleanup_windows()
                 print("ok  ", name)
             except Exception as e:  # noqa: BLE001
                 failed += 1

@@ -267,6 +267,7 @@ def schedule(items: Sequence[Dict], p: mdl.DryerParams, c: mdl.Conditions, start
 
     method = "model": рекомендованный сценарий модели (минимум проходов в лимите съёма);
     method = "q": по производительности q т/ч и лимиту съёма lim (как раздел «Быстрая оценка»).
+    Число проходов партии можно задать (поле «passes»): тогда оно, а не лимит съёма.
     """
     out: List[QueueEntry] = []
     free = start
@@ -281,7 +282,13 @@ def schedule(items: Sequence[Dict], p: mdl.DryerParams, c: mdl.Conditions, start
             continue
         begin = max(free + timedelta(hours=changeover_h) if out else free, ready or free)
         e.wait_h = (begin - free).total_seconds() / 3600.0 if out else 0.0
-        if method == "q":
+        n_fix = int(_f(it.get("passes")) or 0)
+        if n_fix > 0:                      # число проходов задано
+            plan = (mdl.plan_simple(p, mass, w0, wk, [q], n_fix, begin, cool) if method == "q" else
+                    mdl.plan_by_passes(p, c, mass, w0, wk, n_fix, begin, t_list, cool))
+            e.note = f"проходов задано: {n_fix}" + (f"; съём {plan.max_dw:.1f} п.п. > {hard:g}"
+                                                    if plan.max_dw > hard + 1e-9 else "")
+        elif method == "q":
             n = max(1, int(math.ceil((w0 - wk) / max(lim, 0.1) - 1e-9)))
             plan = mdl.plan_simple(p, mass, w0, wk, [q], n, begin, cool)
         else:

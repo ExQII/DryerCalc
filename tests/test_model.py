@@ -106,8 +106,8 @@ def test_last_pass_never_misses_target_by_rounding():
 
 
 def test_many_passes_hit_d100_limit():
-    """Шесть проходов = съём ~3 п.п./проход меньше, чем даёт D=100: пометка «предел», не провал."""
-    plan = plan_by_passes(P, C, 500.0, 34.0, 14.0, 6)
+    """Восемь проходов = съём 2,5 п.п./проход меньше, чем даёт D=100: пометка «предел», не провал."""
+    plan = plan_by_passes(P, C, 500.0, 34.0, 14.0, 8)
     assert plan.passes[0].d == 100.0 and not plan.passes[0].feasible
     level, text = plan.verdict(6, 10)
     assert level == 1 and "D=100" in text
@@ -331,7 +331,7 @@ def _timed_series(true: DryerParams, hours=26.0, d=35.0, step=0.5, bias=0.8):
 def test_calibration_with_lag_recovers_r_ref_and_drops_leading_hours():
     true = DryerParams(r_ref=2.4, b_w=0.69, b_dt=0.87)
     rows, tau = _timed_series(true)
-    start = DryerParams(r_ref=1.5)
+    start = DryerParams(r_ref=1.5, b_w=0.69, b_dt=0.87, out_bias=0.8)   # показатели и поправка влагомера журнала известны
     obs, skipped, lag = observe_all(rows, start)
     assert lag and skipped.get("ещё идёт прежнее зерно", 0) >= int(tau / 0.5) - 1
     assert min(o["t"] for o in obs) >= tau - 1e-6
