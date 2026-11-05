@@ -472,8 +472,7 @@ def journal_passes(prep: List[Dict], p: Optional[DryerParams] = None, final_w: f
     end_kind — чем закончилась подача: "recirc" (рециркуляция), "cool" (охлаждение) или None (проход идёт);
     w_end — истинная влажность выхода в конце подачи (медиана трёх последних проб до рециркуляции / охлаждения);
     batch_end — партия на этом проходе закончена: охлаждение; рециркуляция, когда выход уже ≤ final_w
-      (досушка); или следующий проход — другой «Партии»;
-    sources — силосы подачи по примечаниям («сушим с 2 с.» → «2»), по порядку."""
+      (досушка); или следующий проход — другой «Партии»."""
     p = p or DryerParams()
     groups: Dict[int, List[Dict]] = {}
     order: List[int] = []
@@ -513,16 +512,10 @@ def journal_passes(prep: List[Dict], p: Optional[DryerParams] = None, final_w: f
             nxt = groups[order[k + 1]][0]
             if (nxt.get("batch_f") or "") != (last.get("batch_f") or ""):
                 batch_end = True                       # дальше другая «Партия»
-        sources: List[str] = []
-        for r in lst:
-            m = re.search(r"(?:сушим|открыл\w*|переключ\w*(?:\s+на)?|набираем|снимаем|подач\w*)\s+(?:с|со|из)?\s*"
-                          r"(\d+)", (r.get("note") or "").lower())
-            if m and (not sources or sources[-1] != m.group(1)):
-                sources.append(m.group(1))
         out.append({"pass": pid, "segs": sorted({r["seg"] for r in lst}), "start": min(dts) if dts else None,
                     "end": max(dts) if dts else None, "batch": label, "batch_no": batch_no,
                     "pass_no": lab_pass if lab_pass is not None else in_batch, "pass_auto": lab_pass is None,
-                    "end_kind": end_kind, "w_end": w_end, "batch_end": batch_end, "sources": sources})
+                    "end_kind": end_kind, "w_end": w_end, "batch_end": batch_end})
     return out
 
 

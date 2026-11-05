@@ -318,9 +318,9 @@ def run(out_path: str) -> int:
                  + [_r(40.2, note="Закончился 5 с., рециркуляция"), _r(40.5, 14.6, 14.2)])
         _ps = _jp(_prep(_rows)[0], win.params, 15.0)
         _st = live_state(_rows[:40], win.params, final_w=15.0)
-        check([(x["pass_no"], x["batch_end"]) for x in _ps] == [(1, False), (2, True)] and _st.sources == ["2", "4"]
+        check([(x["pass_no"], x["batch_end"]) for x in _ps] == [(1, False), (2, True)]
               and abs(_st.unloaded - mdl.q_at(win.params, 35) * 19.0) < 1e-6,
-              f"проходы по рециркуляции: {len(_ps)} (силосы {' → '.join(_st.sources)} — один проход, выгружено "
+              f"проходы по рециркуляции: {len(_ps)} (переключение силоса — один проход, выгружено "
               f"{_st.unloaded:.0f} т); рециркуляция при {_ps[-1]['w_end']:.1f} % — досушка и конец партии")
         # --- v1.1.1: запуск с сохранённой целью партии Wк; статистика пилота при одной пробе в проходе ---
         _errs: List[str] = []

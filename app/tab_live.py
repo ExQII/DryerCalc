@@ -68,8 +68,7 @@ class LiveTab(QWidget):
         self.facts.setVerticalSpacing(3)
         self.facts.setColumnStretch(1, 1)
         self.fact_lbl = {}
-        for i, (key, cap) in enumerate((("batch", "Партия"), ("src", "Подача из силосов"),
-                                        ("start", "Начало прохода"), ("last", "Последняя запись"),
+        for i, (key, cap) in enumerate((("batch", "Партия"), ("start", "Начало прохода"), ("last", "Последняя запись"),
                                         ("w_in", "Вход сейчас"), ("w_out", "Выход, влагомер"), ("d", "Разгрузка D"),
                                         ("t", "T блоков / зерна"), ("unl", "Выгружено"), ("silo", "В силосе"),
                                         ("corr", "Поправка модели"))):
@@ -467,7 +466,6 @@ class LiveTab(QWidget):
         vals = {
             "batch": (f"{st.batch or 'без названия'}, проход {st.pass_no:g}{auto}" if st.pass_no is not None
                       else f"{st.batch or '—'}"),
-            "src": " → ".join(f"{x} с." for x in st.sources) if st.sources else "",
             "start": f"{st.start:%d.%m %H:%M}" if ok else "—",
             "last": (f"{st.last:%d.%m %H:%M}, через {fmt_hours(st.hours)}" if ok and st.last else "—"),
             "w_in": f"{fnum(st.w_in)} %", "w_out": f"{fnum(st.w_out_read)} %",
@@ -478,7 +476,7 @@ class LiveTab(QWidget):
         }
         for key, (k, v) in self.fact_lbl.items():
             v.setText(vals[key] if ok else "—")
-            show = (ok or key in ("batch",)) and (key != "src" or bool(vals["src"]))
+            show = ok or key == "batch"
             k.setVisible(show)
             v.setVisible(show)
         msg = ""

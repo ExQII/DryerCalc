@@ -1302,19 +1302,19 @@ def test_passes_split_by_recirculation_not_by_silo_switch():
     # проход 1 до рециркуляции: переключение силоса 2 → 4 не обнуляет «выгружено» и среднюю по силосу
     cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
     st1 = live_state(cut, P, final_w=15.0)
-    assert st1.start == t0 and abs(st1.unloaded - q_at(P, 35) * 18.5) < 1e-6 and st1.sources == ["2", "4"]
+    assert st1.start == t0 and abs(st1.unloaded - q_at(P, 35) * 18.5) < 1e-6
     assert 21.5 < st1.silo_w < 21.9 and st1.silo_n == 37          # без поправки влагомера: средняя показаний
     # подача после рециркуляции — новый проход, номер посчитан сам (в журнале «Проход» не сменили)
     st2 = live_state(rows, P, final_w=15.0)
     assert st2.pass_no == 2 and st2.pass_auto and st2.start == t0 + timedelta(hours=21.4) and not st2.recirc
-    assert abs(st2.unloaded - q_at(P, 35) * (39.5 - 21.4)) < 1e-6 and st2.sources == ["5"]
+    assert abs(st2.unloaded - q_at(P, 35) * (39.5 - 21.4)) < 1e-6
     # рециркуляция у цели партии — досушка и конец партии
     row(40.2, note="Закончился 5 с., рециркуляция")
     row(40.5, 14.6, 14.2)
     prep, _ = prepare(rows)
     ps = journal_passes(prep, P, 15.0)
     assert [(x["pass_no"], x["end_kind"], x["batch_end"]) for x in ps] == [(1, "recirc", False), (2, "recirc", True)]
-    assert 21.3 < ps[0]["w_end"] < 21.9 and ps[1]["w_end"] < 15.0 and ps[0]["sources"] == ["2", "4"]
+    assert 21.3 < ps[0]["w_end"] < 21.9 and ps[1]["w_end"] < 15.0 and "sources" not in ps[0]
     st3 = live_state(rows, P, final_w=15.0)
     assert st3.recirc and st3.batch_end and st3.recirc_since == t0 + timedelta(hours=40.2)
     fc3 = live_forecast(P, Conditions(st3.t_proc, 10.0, 70.0), st3, 1000.0, 14.5, 14.0, 6.0, 10.0)
@@ -1824,6 +1824,31 @@ def test_pass_not_declared_over_while_feed_continues():
     assert lt.fc.overrun and lt.t_pass.lbl_value.text() == "подача идёт" and "больше расчётных" in lt.t_pass.lbl_sub.text()
     assert "уже не менять" not in lt.lbl_head.text() and lt.t_batch.lbl_value.text().startswith("≥ ")
     assert "не раньше" in lt.t_batch.lbl_sub.text()
+    win.close()
+
+
+def test_no_silo_feed_row_in_pass_card():
+    """1.4.2: строки «Подача из силосов» (номера силосов из примечаний сменщиков) в карточке «Проход по журналу»
+    нет; остальные строки на месте, примечания «сушим с N с.» по-прежнему делят проходы."""
+    app = _qapp()
+    from app import pages
+    from app.gui import MainWindow
+    rows, _row, t0 = _silo_journal()
+    cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
+    st = live_state(cut, P, final_w=15.0)
+    assert not hasattr(st, "sources") and st.pass_no == 1
+    stg = Storage(_tmp("nosrc.db"))
+    stg.replace_journal(cut)
+    win = MainWindow(stg)
+    win.show()
+    win.tabs.setCurrentIndex(win.tabs.indexOfText(pages.LIVE))
+    for _ in range(3):
+        app.processEvents()
+    lt = win.tab_live
+    caps = [k.text() for k, _v in lt.fact_lbl.values()]
+    assert "src" not in lt.fact_lbl and not any("силос" in c.lower() and "подача" in c.lower() for c in caps)
+    assert caps[:3] == ["Партия", "Начало прохода", "Последняя запись"] and "В силосе" in caps
+    assert all(not k.isHidden() and not v.isHidden() and v.text() != "—" for k, v in lt.fact_lbl.values())
     win.close()
 
 

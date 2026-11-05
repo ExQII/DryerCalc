@@ -56,7 +56,6 @@ class LiveState:
     batch_end: bool = False              # партия высушена: досушка (рециркуляция у цели) или охлаждение
     w_end: Optional[float] = None        # истинная влажность выхода в конце подачи, %
     recirc_since: Optional[datetime] = None   # с какого времени рециркуляция
-    sources: List[str] = field(default_factory=list)   # силосы подачи этого прохода по примечаниям
     unloaded: float = 0.0
     hours: float = 0.0
     corr: float = 0.0
@@ -117,7 +116,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
                                     "n_in": len(wins), "w_end": x["w_end"], "start": x["start"]})
         st.batch, st.pass_no, st.pass_auto = info["batch"], info["pass_no"], info["pass_auto"]
         st.batch_no, st.end_kind, st.w_end = info["batch_no"], info["end_kind"], info["w_end"]
-        st.batch_end, st.sources = bool(info["batch_end"] and info["end_kind"]), list(info["sources"])
+        st.batch_end = bool(info["batch_end"] and info["end_kind"])
     # начало прохода — первая строка, где сушилка работает (проход может начаться строкой «Остановка» после
     # рециркуляции прошлого прохода)
     st.start = next((r["dt"] for r in rs if r.get("d_f") is not None and not r.get("recirc")
