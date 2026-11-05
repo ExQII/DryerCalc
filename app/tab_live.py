@@ -107,7 +107,7 @@ class LiveTab(QWidget):
         self.d_try.setSpecialValueText("подобрать")
         self.cb_corr = QCheckBox("Поправка по последним замерам выхода")
         self.cb_corr.setChecked(True)
-        self.cb_now = QCheckBox("Плитки в реальном времени: выгрузка до текущего момента (раз в 30 с)")
+        self.cb_now = QCheckBox("Плитки в реальном времени")
         self.cb_now.setChecked(True)
         self.cb_now.setToolTip("«Выгружено», «осталось», конец прохода и приёмный силос досчитываются от последней "
                                "записи журнала до текущего момента при последнем D и обновляются каждые 30 с. Если "
