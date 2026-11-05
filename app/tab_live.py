@@ -694,8 +694,9 @@ class LiveTab(QWidget):
             n = len(fc.rest_plan.passes) if fc.rest_plan is not None else 0
             rng = (f"90 %: {fc.batch_end_range[0]:%d.%m %H:%M} … {fc.batch_end_range[1]:%d.%m %H:%M}"
                    if fc.batch_end_range else "")
-            self.t_batch.set(("не раньше " if fc.overrun else "") + f"{fc.batch_end:%d.%m %H:%M}",
-                             (f"ещё {_passes(n)} до {self.wk_final.value():g} %" if n else "это последний проход"),
+            rest = f"ещё {_passes(n)} до {self.wk_final.value():g} %" if n else "это последний проход"
+            self.t_batch.set(("≥ " if fc.overrun else "") + f"{fc.batch_end:%d.%m %H:%M}",
+                             (f"не раньше: подача ещё идёт\n{rest}" if fc.overrun else rest),
                              ("С охлаждением. " + (f"Допуск {rng}." if rng else "")).strip())
         else:
             self.t_batch.set("—")

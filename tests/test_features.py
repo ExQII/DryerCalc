@@ -1822,7 +1822,8 @@ def test_pass_not_declared_over_while_feed_continues():
     for _ in range(5):
         app.processEvents()
     assert lt.fc.overrun and lt.t_pass.lbl_value.text() == "подача идёт" and "больше расчётных" in lt.t_pass.lbl_sub.text()
-    assert "уже не менять" not in lt.lbl_head.text() and lt.t_batch.lbl_value.text().startswith("не раньше")
+    assert "уже не менять" not in lt.lbl_head.text() and lt.t_batch.lbl_value.text().startswith("≥ ")
+    assert "не раньше" in lt.t_batch.lbl_sub.text()
     win.close()
 
 
