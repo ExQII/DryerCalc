@@ -363,6 +363,8 @@ class LiveForecast:
     silo: Optional[Dict] = None            # выравнивание средней влажности приёмного силоса (см. live_forecast)
     t_grain_est: float = 0.0
     transit: Optional[Dict] = None         # что выйдет из шахты в ближайшие часы при выбранном D (transit_profile)
+    overrun: bool = False                  # выгружено больше расчётной массы прохода, а подача идёт («рециркуляции»
+    #                                        в журнале нет): масса на входе занижена, конец прохода неизвестен
     warnings: List[str] = field(default_factory=list)
 
 
@@ -407,17 +409,21 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
         m_rem = max(m_total - m_done, 0.0)
         m_tr = min(p.lag_k * p.m_dryer, m_rem)
         m_new = m_rem - m_tr
+        # Конец подачи прохода знает только журнал («рециркуляция»): масса прохода — оценка (масса на входе и
+        # выгрузка по Q(D)). Если по ней до конца подачи осталось мало нового зерна (short), а подача идёт, — силос не
+        # выравниваем (для малого остатка нужная влажность неустойчива), D подбирается на цель прохода, как без
+        # выравнивания. Совет «D уже не менять» — только при рециркуляции (live_advice).
         fc.silo = {"m_total": m_total, "m_done": m_done, "w_done": st.silo_w, "w_done_read": st.silo_w_read,
                    "m_tr": m_tr, "w_tr": fc.w_out_now, "m_new": m_new, "need": None, "limited": False,
-                   "late": m_new < max(0.05 * m_total, 5.0), "lim": silo_lim}
+                   "short": m_new < max(0.05 * m_total, 5.0), "lim": silo_lim}
         # зерно, которое уже в шахте, выйдет с влажностью по своей истории (все режимы за его путь) и по новому D:
         # при другом D оно пойдёт быстрее или медленнее. Поэтому D и цель для нового зерна уточняются по кругу.
-        d_try_ = d_override if d_override else (fc.d_rec if not fc.silo["late"] else d_now)
+        d_try_ = d_override if d_override else fc.d_rec
         for _ in range(4):
             prof = transit_profile(p, st, c, d_try_, corr, t_now)
             w_tr = _transit_mean(prof, m_tr, fc.w_out_now)
             fc.silo["w_tr"] = w_tr
-            if fc.silo["late"]:
+            if fc.silo["short"]:
                 break
             need = (w_target * m_total - st.silo_w * m_done - w_tr * m_tr) / m_new
             w_goal = min(max(need, w_target - silo_lim), w_target + silo_lim)
@@ -443,32 +449,40 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
     fc.m_out_pass = m_pass * (100.0 - w_in) / (100.0 - w_pass_out) if w_pass_out < 100 else m_pass
     fc.remaining = max(fc.m_out_pass - st.unloaded, 0.0)
     fc.pass_end = t_now + timedelta(hours=fc.remaining / q_new) if q_new > 0 else None
+    if not st.recirc and fc.remaining <= 0.05:
+        # по массе проход выгружен, а «рециркуляции» в журнале нет — подача идёт: масса на входе занижена (или Q по
+        # таблице выше настоящей). Когда закончится подача, неизвестно; остаток партии — не раньше, чем от «сейчас»
+        fc.overrun, fc.pass_end = True, None
+        fc.warnings.append(f"выгружено {st.unloaded:.0f} т — больше расчётной массы прохода ({fc.m_out_pass:.0f} т), "
+                           f"а «рециркуляции» в журнале нет: подача идёт. Масса на входе, похоже, занижена — "
+                           f"проверьте её (масса партии в «План сушки партии»)")
+    pe = fc.pass_end or (t_now if fc.overrun else None)       # с какого момента считать остаток партии
     # остальные проходы до цели партии
-    if fc.pass_end and w_pass_out > wk_final + 0.05:
+    if pe and w_pass_out > wk_final + 0.05:
         n_left = int(round(n_total - st.pass_no)) if n_total and st.pass_no else 0
         if n_total and st.pass_no and n_left < 1:
             fc.warnings.append(f"по заданию в партии {n_total} прох., это последний, но цель прохода выше цели "
                                f"партии — остаток посчитан по лимиту съёма")
         if n_left >= 1:
             fc.rest_plan = mdl.plan_by_passes(p, c, fc.m_out_pass, w_pass_out, wk_final, n_left,
-                                              fc.pass_end + timedelta(hours=p.overhead_h), None, cool)
+                                              pe + timedelta(hours=p.overhead_h), None, cool)
         else:
             plans = mdl.scenarios(p, c, fc.m_out_pass, w_pass_out, wk_final, 6,
-                                  fc.pass_end + timedelta(hours=p.overhead_h), None, cool)
+                                  pe + timedelta(hours=p.overhead_h), None, cool)
             k = mdl.recommend(plans, soft, hard)
             fc.rest_plan = plans[k] if k is not None else plans[-1]
         fc.batch_end = fc.rest_plan.end
         n_rest = len(fc.rest_plan.passes)
-        start_rest = fc.pass_end + timedelta(hours=p.overhead_h)
+        start_rest = pe + timedelta(hours=p.overhead_h)
         # честный допуск остатка партии: проверка на журнале + разброс коэффициентов + расхождение моделей
         from dataclasses import replace as _replace
         sig, fc.sigma_info = mdl.plan_sigma(p, fc.rest_plan, c, mdl.other_model_final(p, fc.rest_plan, c))
         lo, hi = mdl.time_range(lambda pp: mdl.plan_by_passes(pp, c, fc.m_out_pass, w_pass_out, wk_final, n_rest,
                                                               start_rest, None, cool), _replace(p, rate_sigma=sig))
         fc.batch_end_range = (start_rest + timedelta(hours=lo), start_rest + timedelta(hours=hi))
-    elif fc.pass_end:
+    elif pe:
         cool_h = fc.m_out_pass / mdl.q_full(p) if cool and mdl.q_full(p) > 0 else 0.0
-        fc.batch_end = fc.pass_end + timedelta(hours=(p.overhead_h if cool else 0.0) + cool_h)
+        fc.batch_end = pe + timedelta(hours=(p.overhead_h if cool else 0.0) + cool_h)
     fc.t_grain_est = mdl.grain_temp(p, c.t_proc, w_in)
     if p.t_agent_max and c.t_proc > p.t_agent_max:
         fc.warnings.append(f"T блоков {c.t_proc:.0f} °C выше заданного ограничения {p.t_agent_max:.0f} °C")
@@ -532,19 +546,12 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
                             f"партии. В шахте досушивается остаток.",
                             f"Сколько досушивать — раздел «{RECIRC}», затем охлаждение."],
                     "warn": warn, "go": RECIRC, "d_now": st.d, "d_rec": None, "batch_end": True}
-        return {"kind": "info", "head": "Проход закончен — идёт рециркуляция",
-                "sub": [f"Рециркуляция{since}: подача из силосов этого прохода закончилась, выход к концу подачи "
-                        f"{w_txt}. Зерно в шахте ходит по кругу.",
+        return {"kind": "info", "head": "Проход закончен — D для этого прохода уже не менять",
+                "sub": [f"Рециркуляция{since}: подача из силосов этого прохода закончилась, в шахте только его остаток "
+                        f"— он ходит по кругу; выход к концу подачи {w_txt}.",
                         "Следующий проход начнётся, когда пойдёт подача: «сушим с N с.» или «Запуск, сушим с N с.». "
                         f"Сколько досушивать остаток — раздел «{RECIRC}»."],
-                "warn": warn, "go": RECIRC, "d_now": st.d, "d_rec": None}
-    sl = fc.silo
-    if sl and sl["late"]:
-        return {"kind": "info", "head": f"D для этого прохода уже не менять — {st.d:.0f} с",
-                "sub": [("До конца прохода выйдет только зерно, которое уже в шахте" if sl["m_tr"] >= 1 else
-                         "Масса прохода уже выгружена")
-                        + f": среднее по силосу ≈ {sl['avg']:.1f} %.", "Готовьте следующий проход."],
-                "warn": warn, "go": None, "d_now": st.d, "d_rec": None, "late": True}
+                "warn": warn, "go": RECIRC, "d_now": st.d, "d_rec": None, "late": True}
     if d_try:
         return {"kind": "info", "head": f"При D = {d_try:.0f} с на выходе ≈ {fc.w_out_rec:.1f} %",
                 "sub": [f"Влагомер покажет ≈ {read:.1f} %. Подобранное для цели {fc.w_goal:.1f} %: D = {fc.d_rec:.0f} с."],

@@ -249,7 +249,10 @@ def test_live_state_and_forecast():
     assert 1 <= fc.d_rec <= 100
     assert abs(fc.w_out_rec - 24.0) < 0.6          # округление D до целых секунд
     assert abs(fc.tau_h - P.lag_k * P.m_dryer / q_at(P, fc.d_rec)) < 1e-9
-    assert fc.batch_end and fc.pass_end and fc.batch_end > fc.pass_end
+    # 420 т на входе при выгруженных ~398 т — по массе проход выгружен, а подача идёт: конец прохода неизвестен
+    assert fc.overrun and fc.pass_end is None and fc.batch_end and fc.batch_end > st.last
+    fc6 = live_forecast(P, c, st, m_pass=600.0, w_target=24.0, wk_final=14.0, soft=6, hard=10)
+    assert not fc6.overrun and fc6.batch_end and fc6.pass_end and fc6.batch_end > fc6.pass_end > st.last
     st2 = live_state([], P)
     assert not st2.ok
 
@@ -634,7 +637,7 @@ def test_silo_average_targeting():
     free = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0, silo=True, silo_lim=5.0)
     assert abs(free.silo["avg"] - 24.0) < 0.1                      # без ограничения среднее выходит в цель
     late = live_forecast(P, c, st, 120.0, 24.0, 14.0, 6.0, 10.0, silo=True)
-    assert late.silo["late"] and abs(late.w_goal - 24.0) < 1e-9
+    assert late.silo["short"] and abs(late.w_goal - 24.0) < 1e-9    # по массе остаток мал — без выравнивания
 
 
 def test_meter_bias_from_batches():
@@ -870,9 +873,12 @@ def test_live_advice_follows_operating_rules():
     a = live_advice(P, st2, fc2, now=t_ch + timedelta(hours=0.4 * tau))
     assert a["kind"] == "wait" and a["head"].startswith("Подождите до") and "13:30" in a["sub"][0]
     assert live_advice(P, st2, fc2, now=t_ch + timedelta(hours=0.6 * tau))["kind"] == "change"
-    # конец прохода: остаток уже в шахте
+    # по расчётной массе проход выгружен, а «рециркуляции» нет — подача идёт: обычный совет по D, не «уже не менять»
     late = live_forecast(P, c, st, 120.0, 24.0, 14.0, 6.0, 10.0, silo=True)
-    assert late.silo["late"] and live_advice(P, st, late)["head"].startswith("D для этого прохода уже не менять")
+    a = live_advice(P, st, late)
+    assert late.silo["short"] and late.overrun and late.pass_end is None and late.batch_end is not None
+    assert a["kind"] in ("change", "keep", "wait") and "уже не менять" not in a["head"]
+    assert any("подача идёт" in w for w in a["warn"])
     # своё D, рециркуляция, нет данных
     tr = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0, d_override=40)
     assert live_advice(P, st, tr, d_try=40)["head"].startswith("При D = 40 с")
@@ -1317,7 +1323,7 @@ def test_passes_split_by_recirculation_not_by_silo_switch():
     # при другой цели партии (Wк 12 % → порог 13 %) та же рециркуляция — конец прохода, не партии
     st4 = live_state(rows, P, final_w=13.0)
     assert st4.recirc and not st4.batch_end
-    assert live_advice(P, st4, fc3)["head"] == "Проход закончен — идёт рециркуляция"
+    assert live_advice(P, st4, fc3)["head"] == "Проход закончен — D для этого прохода уже не менять"
     # охлаждение после досушки, следующая партия без названия — новая партия, проход 1
     row(41.0, note="Откл. т.б., охлаждение")
     row(42.0, note="Запуск, сушим с 3 с. в 1 с.", pn=None)
@@ -1778,6 +1784,45 @@ def test_live_tab_real_time_tiles_and_auto_mass():
     assert lt.m_pass.value() == 1000.0 and win.storage.get_json("ui_live")["m_auto"] is False
     lt.cb_now.setChecked(False)                      # на момент последней записи
     assert lt.state.end == lt.state.last and "последнюю запись" in lt.t_pass.lbl_sub.text()
+    win.close()
+
+
+def test_pass_not_declared_over_while_feed_continues():
+    """Подача идёт 5 ч дольше, чем по расчётной массе (масса на входе занижена), а «рециркуляции» в журнале нет —
+    совет по D обычный, с предупреждением про массу; «D для этого прохода уже не менять» — только при рециркуляции."""
+    app = _qapp()
+    from app import pages
+    from app.gui import MainWindow
+    from app.live import live_advice
+    rows, _row, t0 = _silo_journal()
+    cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19.6)).strftime("%d.%m.%y %H:%M")]
+    st = live_state(cut, P, final_w=15.0)
+    c = Conditions(st.t_proc, 10.0, 70.0)
+    fc = live_forecast(P, c, st, 200.0, 21.5, 14.0, 6.0, 10.0, silo=True)      # 200 т, выгружено уже ≈ 355 т
+    a = live_advice(P, st, fc)
+    assert not st.recirc and fc.overrun and fc.silo["short"] and fc.pass_end is None
+    assert a["kind"] in ("change", "keep", "wait") and "уже не менять" not in a["head"]
+    assert any("занижена" in w for w in a["warn"])
+    rec = [r for r in rows if r["ts"] <= (t0 + timedelta(hours=20.5)).strftime("%d.%m.%y %H:%M")]
+    st_r = live_state(rec, P, final_w=15.0)
+    a_r = live_advice(P, st_r, live_forecast(P, c, st_r, 200.0, 21.5, 14.0, 6.0, 10.0, silo=True))
+    assert st_r.recirc and a_r["head"] == "Проход закончен — D для этого прохода уже не менять"
+    # в разделе: плитка «Конец прохода» — «подача идёт», совет — не «уже не менять»
+    now = datetime.now().replace(second=0, microsecond=0)
+    shift = now - timedelta(minutes=10) - datetime.strptime(cut[-1]["ts"], "%d.%m.%y %H:%M")
+    moved = [dict(r, ts=(datetime.strptime(r["ts"], "%d.%m.%y %H:%M") + shift).strftime("%d.%m.%y %H:%M")) for r in cut]
+    stg = Storage(_tmp("overrun.db"))
+    stg.replace_journal(moved)
+    stg.set_json("ui", {"mass": 200.0, "w0": 26.0, "wk": 14.0})
+    win = MainWindow(stg)
+    win.show()
+    win.tabs.setCurrentIndex(win.tabs.indexOfText(pages.LIVE))
+    lt = win.tab_live
+    lt.w_target.setValue(21.5)
+    for _ in range(5):
+        app.processEvents()
+    assert lt.fc.overrun and lt.t_pass.lbl_value.text() == "подача идёт" and "больше расчётных" in lt.t_pass.lbl_sub.text()
+    assert "уже не менять" not in lt.lbl_head.text() and lt.t_batch.lbl_value.text().startswith("не раньше")
     win.close()
 
 

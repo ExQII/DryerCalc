@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 4, 0, 0),
-    prodvers=(1, 4, 0, 0),
+    filevers=(1, 4, 1, 0),
+    prodvers=(1, 4, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -15,11 +15,11 @@ VSVersionInfo(
       StringTable('041904B0', [
         StringStruct('CompanyName', ''),
         StringStruct('FileDescription', 'Расчёт времени сушки кукурузы (шахтная сушилка Araj)'),
-        StringStruct('FileVersion', '1.4.0.0'),
+        StringStruct('FileVersion', '1.4.1.0'),
         StringStruct('InternalName', 'DryerCalc'),
         StringStruct('OriginalFilename', 'DryerCalc.exe'),
         StringStruct('ProductName', 'DryerCalc'),
-        StringStruct('ProductVersion', '1.4.0.0')])
+        StringStruct('ProductVersion', '1.4.1.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [1049, 1200])])
   ]

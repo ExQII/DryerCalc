@@ -568,10 +568,12 @@ class LiveTab(QWidget):
                          f"(влагомер {sl['w_done_read']:.1f} %)"
                          + (f"; ещё ≈ {sl['m_tr']:.0f} т уже в шахте — выйдут ≈ {sl['w_tr']:.1f} %." if sl["m_tr"] >= 1
                             else "."))
-            if sl["late"]:
-                lines.append(("До конца прохода осталось только зерно, которое уже в шахте" if sl["m_tr"] >= 1 else
-                              "Масса прохода уже выгружена") +
-                             f": среднее по силосу выйдет ≈ <b>{sl['avg']:.1f} %</b> — менять D ради этого прохода поздно.")
+            if sl["short"] and not st.recirc:
+                left = (f"осталось ≈ {sl['m_new']:.0f} т нового зерна" if sl["m_new"] >= 1 else
+                        "уже выгружено больше, чем по расчёту")
+                lines.append(f"По расчётной массе прохода ({sl['m_total']:.0f} т) до конца подачи {left} — силос не "
+                             f"выравниваю, D — на цель прохода. Конец подачи — «рециркуляция» в журнале; идёт подача "
+                             f"дольше — масса на входе занижена.")
             elif abs(fc.w_goal - self.w_target.value()) >= 0.05:
                 lim_txt = (f" (нужно бы {sl['need']:.1f} %, ограничено ±{sl['lim']:g} п.п.)" if sl["limited"] else "")
                 lines.append(f"Чтобы среднее по силосу вышло {self.w_target.value():g} %, зерну, которое войдёт с этого "
@@ -584,7 +586,7 @@ class LiveTab(QWidget):
             change = "оставить как есть" if abs(fc.d_rec - st.d) < 0.5 else f"было {st.d:.0f}"
             lines.append(f"Для {goal_txt} % на выходе: <b>D = {fc.d_rec:.0f}</b> ({change}); "
                          f"ожидается {fc.w_out_rec:.1f} % (влагомер {mdl.read_from_true(p, fc.w_out_rec, st.t_grain):.1f} %).")
-        if sl and not sl["late"]:
+        if sl and not sl["short"]:
             lines.append(f"Ожидаемая средняя влажность приёмного силоса после прохода: <b>{sl['avg']:.1f} %</b>.")
         if fc.d_note:
             lines.append(f"<span style='color:{th.error}'>{fc.d_note}.</span>")
@@ -594,16 +596,20 @@ class LiveTab(QWidget):
         if soon:
             lines.append(f"На выходе в ближайшие часы (влагомер): {soon}. Это зерно уже в шахте — прогноз учитывает "
                          f"все D и T блоков, при которых оно шло, и новое D до выхода.")
-        if fc.pass_end:
-            rem = "проход фактически закончен (выгружено больше расчётной массы)" if fc.remaining <= 0.05 else \
-                f"осталось выгрузить {fc.remaining:.0f} т"
-            lines.append(f"Проход закончится ≈ <b>{fc.pass_end:%d.%m %H:%M}</b> ({rem}).")
+        if fc.overrun:
+            lines.append(f"Выгружено {st.unloaded:.0f} т — больше расчётной массы прохода ({fc.m_out_pass:.0f} т), а "
+                         f"подача идёт: проход закончится, когда опустеет силос («рециркуляция» в журнале). Конец "
+                         f"партии ниже — не раньше указанного.")
+        elif fc.pass_end:
+            lines.append(f"Проход закончится ≈ <b>{fc.pass_end:%d.%m %H:%M}</b> (осталось выгрузить "
+                         f"{fc.remaining:.0f} т).")
         if fc.rest_plan is not None:
             ds = " / ".join(f"{x.d:.0f}" for x in fc.rest_plan.passes)
             rng = (f" (90 %: {fc.batch_end_range[0]:%d.%m %H:%M} … {fc.batch_end_range[1]:%d.%m %H:%M})"
                    if fc.batch_end_range else "")
             lines.append(f"Дальше до {self.wk_final.value():g} %: ещё {len(fc.rest_plan.passes)} прох. (D {ds}), "
-                         f"партия закончится ≈ <b>{fc.batch_end:%d.%m %H:%M}</b>{rng}.")
+                         f"партия закончится {'не раньше' if fc.overrun else '≈'} "
+                         f"<b>{fc.batch_end:%d.%m %H:%M}</b>{rng}.")
             if fc.sigma_info and (fc.sigma_info["param"] > 0.005 or fc.sigma_info["struct"] > 0.005
                                   or fc.sigma_info["flags"]):
                 lines.append(f"<span style='color:{th.muted}'>{mdl.sigma_text(fc.sigma_info)}.</span>")
@@ -668,9 +674,15 @@ class LiveTab(QWidget):
                             "каждые 30 с; влажность после последней пробы — как в последней пробе.")
         else:
             self.t_silo.set("—", f"выгружено {st.unloaded:.0f} т" + froze)
-        if fc.pass_end:
-            rem = ("масса прохода выгружена" if fc.remaining <= 0.05 else
-                   f"выгружено {st.unloaded:.0f} из {fc.m_out_pass:.0f} т, осталось {fc.remaining:.0f} т")
+        if fc.overrun:
+            self.t_pass.set("подача идёт", f"выгружено {st.unloaded:.0f} т — больше расчётных {fc.m_out_pass:.0f} т; "
+                                           f"проверьте массу на входе\n{when}{froze}",
+                            "По расчётной массе проход уже выгружен, а «рециркуляции» в журнале нет — подача идёт. "
+                            "Проход закончится, когда опустеет силос; запишите «рециркуляция». Масса на входе, похоже, "
+                            "занижена — проверьте её на вкладке «Данные прохода и задание».")
+            self.pass_bar.set_value(1.0)
+        elif fc.pass_end:
+            rem = f"выгружено {st.unloaded:.0f} из {fc.m_out_pass:.0f} т, осталось {fc.remaining:.0f} т"
             self.t_pass.set(f"{fc.pass_end:%d.%m %H:%M}", f"{rem}\n{when}{froze}",
                             "Когда закончится выгрузка массы этого прохода при советуемом D. Полоса — сколько уже "
                             "выгружено (в реальном времени — до текущего момента, обновляется каждые 30 с).")
@@ -682,7 +694,7 @@ class LiveTab(QWidget):
             n = len(fc.rest_plan.passes) if fc.rest_plan is not None else 0
             rng = (f"90 %: {fc.batch_end_range[0]:%d.%m %H:%M} … {fc.batch_end_range[1]:%d.%m %H:%M}"
                    if fc.batch_end_range else "")
-            self.t_batch.set(f"{fc.batch_end:%d.%m %H:%M}",
+            self.t_batch.set(("не раньше " if fc.overrun else "") + f"{fc.batch_end:%d.%m %H:%M}",
                              (f"ещё {_passes(n)} до {self.wk_final.value():g} %" if n else "это последний проход"),
                              ("С охлаждением. " + (f"Допуск {rng}." if rng else "")).strip())
         else:
@@ -704,7 +716,7 @@ class LiveTab(QWidget):
         cands = sorted({max(1, min(100, round(x))) for x in (fc.d_rec - 10, fc.d_rec - 5, fc.d_rec, fc.d_rec + 5,
                                                              fc.d_rec + 10, st.d, d_use)})
         corr = st.corr if self.cb_corr.isChecked() else 0.0
-        t_now = max(now, st.last) if now else st.last
+        t_now = (st.end or max(now, st.last)) if now else st.last
         self.tbl.setRowCount(len(cands))
         for i, d in enumerate(cands):
             ps = mdl.solve_pass(p, c, st.w_in, 1.0, d)
@@ -712,7 +724,7 @@ class LiveTab(QWidget):
             q = mdl.q_at(p, d)
             m_out = self.m_pass.value() * (100 - st.w_in) / (100 - w_out)
             rem = max(m_out - st.unloaded, 0.0)
-            end = t_now + timedelta(hours=rem / q) if q > 0 else None
+            end = t_now + timedelta(hours=rem / q) if q > 0 and not fc.overrun else None   # подача идёт дольше расчёта
             tau = p.lag_k * p.m_dryer / q if q > 0 else 0.0
             if sl:
                 part = w_out * sl["m_new"] if sl["m_new"] > 0 else 0.0

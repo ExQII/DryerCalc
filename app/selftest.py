@@ -406,6 +406,18 @@ def run(out_path: str) -> int:
               f"«Текущий проход» в реальном времени: выгружено {(_s4.unloaded if _s4 else 0):.0f} т на "
               f"{(_s4.end if _s4 and _s4.end else _now):%H:%M}; масса прохода {(_m4 or 0):.0f} т (партия 800 т)")
         _win4.close()
+        # --- v1.4.1: проход закончен только по «рециркуляции» в журнале, а не по расчётной массе ---
+        from .live import live_advice as _la, live_forecast as _lf
+        _cut = [r for r in _rows if datetime.strptime(r["ts"], "%d.%m.%y %H:%M") < _t0 + _td(hours=19.6)]
+        _s5 = live_state(_cut, win.params, final_w=15.0)
+        _c5 = mdl.Conditions(_s5.t_proc, 10.0, 70.0)
+        _f5 = _lf(win.params, _c5, _s5, 200.0, 21.5, 14.0, 6.0, 10.0, silo=True)
+        _a5 = _la(win.params, _s5, _f5)
+        _rec = [r for r in _rows if datetime.strptime(r["ts"], "%d.%m.%y %H:%M") <= _t0 + _td(hours=20.5)]
+        _s6 = live_state(_rec, win.params, final_w=15.0)
+        _a6 = _la(win.params, _s6, _lf(win.params, _c5, _s6, 200.0, 21.5, 14.0, 6.0, 10.0, silo=True))
+        check(_f5.overrun and "уже не менять" not in _a5["head"] and _s6.recirc and "уже не менять" in _a6["head"],
+              f"масса прохода занижена, подача идёт — совет «{_a5['head']}»; при рециркуляции — «{_a6['head']}»")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)
