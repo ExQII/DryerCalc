@@ -12,6 +12,13 @@
   случайный замер прогноз не дёргает.
 * Изменение D проявится на выходе через τ = lag_k · m_сушилки / Q(D_нов): зерно, которое уже в шахте,
   выходит со старой скоростью. Менять D чаще, чем раз в τ/2, бессмысленно — результат ещё не виден.
+* В реальном времени (now): выгрузка досчитывается от последней строки журнала до текущего момента при последнем
+  D — но не дальше live_cap_h после последней записи: дольше без записей — возможно, остановка, которую не
+  записали, и счёт останавливается (frozen). Журнал, который не ведётся больше OLD_JOURNAL_H, считается на момент
+  последней записи — текущее время к нему не относится.
+* Масса на входе прохода — по сухому веществу (pass_mass): m_k = M₀·(100 − W₁)/(100 − W_k), где M₀ — масса партии,
+  W₁ — средняя влажность на входе 1-го прохода партии по журналу (нет в журнале — W₀ партии), W_k — средняя на
+  входе текущего прохода.
 """
 from __future__ import annotations
 
@@ -23,6 +30,8 @@ import numpy as np
 
 from . import model as mdl
 from .pages import JOURNAL, RECIRC
+
+OLD_JOURNAL_H = 12.0      # журнал не ведётся дольше — «текущее время» к нему не относится
 
 
 @dataclass
@@ -60,15 +69,19 @@ class LiveState:
     d_changed_at: Optional[datetime] = None   # когда в этом проходе последний раз меняли D (строка с новым D)
     d_prev: Optional[float] = None            # каким D было до этого
     last_sample: Optional[datetime] = None    # время последней пробы выхода
+    end: Optional[datetime] = None            # до какого момента досчитана выгрузка (последняя запись или «сейчас»)
+    frozen: bool = False                      # «сейчас», но записей давно нет — счёт остановлен на last + live_cap_h
+    batch_passes: List[Dict] = field(default_factory=list)   # проходы этой партии до текущего: № и средняя W входа
     regime: List[Tuple] = field(default_factory=list)   # весь журнал: (время, Q, T, идёт ли выгрузка, D) от строки дальше
     inlet: List[Tuple[datetime, float]] = field(default_factory=list)   # весь журнал: (время, влажность на входе)
     series: List[Tuple[datetime, Optional[float], Optional[float]]] = field(default_factory=list)  # (t, вход, выход)
 
 
 def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = None, weather=None,
-               corr_window: int = 6, final_w: Optional[float] = None) -> LiveState:
+               corr_window: int = 6, final_w: Optional[float] = None, live_cap_h: float = 1.5) -> LiveState:
     """final_w — выше какой влажности выхода (истинной) рециркуляция — конец прохода, а не досушка партии
-    (по умолчанию calibration.FINAL_W = 15 %; раздел «Текущий проход» передаёт Wк + 1 п.п.)."""
+    (по умолчанию calibration.FINAL_W = 15 %; раздел «Текущий проход» передаёт Wк + 1 п.п.).
+    now — считать выгрузку до этого момента (реальное время), но не дальше live_cap_h после последней записи."""
     from .calibration import FINAL_W, STOP_STEMS, _t_proc, journal_passes, observe_all, pass_of_segment, prepare
     st = LiveState()
     if weather is not None:
@@ -92,9 +105,16 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.message = "У последнего прохода нет времени проб."
         return st
     st.seg = pass_of[seg]
-    info = next((x for x in journal_passes(prep, p, FINAL_W if final_w is None else final_w)
-                 if seg in x["segs"]), None)
+    jp = journal_passes(prep, p, FINAL_W if final_w is None else final_w)
+    info = next((x for x in jp if seg in x["segs"]), None)
     if info is not None:
+        # проходы этой партии до текущего: средняя влажность на входе (подача — то, что вышло с прошлого прохода)
+        mine = [x for x in jp if x["batch_no"] == info["batch_no"]]
+        for x in mine[: mine.index(info) + 1]:
+            wins = [r["w_in"] for r in prep if r.get("pass", 0) == x["pass"] and r.get("w_in") is not None
+                    and not r.get("recirc") and not r.get("burner_off")]
+            st.batch_passes.append({"pass_no": x["pass_no"], "w_in": sum(wins) / len(wins) if wins else None,
+                                    "n_in": len(wins), "w_end": x["w_end"], "start": x["start"]})
         st.batch, st.pass_no, st.pass_auto = info["batch"], info["pass_no"], info["pass_auto"]
         st.batch_no, st.end_kind, st.w_end = info["batch_no"], info["end_kind"], info["w_end"]
         st.batch_end, st.sources = bool(info["batch_end"] and info["end_kind"]), list(info["sources"])
@@ -130,7 +150,14 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         if r.get("recirc") and st.recirc_since is None:
             st.recirc_since = r["dt"]
         st.series.append((r["dt"], r.get("w_in"), r.get("w_out")))
-    end = max(now, st.last) if now else st.last
+    end = st.last
+    if now is not None and now > st.last:
+        gap_h = (now - st.last).total_seconds() / 3600.0
+        if gap_h <= live_cap_h:
+            end = now
+        elif gap_h <= OLD_JOURNAL_H:          # записей давно нет: возможно, остановка, которую не записали
+            end, st.frozen = st.last + timedelta(hours=live_cap_h), True
+    st.end = end
     # влажность выхода по времени (истинная — с поправкой влагомера) — для средней влажности приёмного силоса
     rd = [(r["dt"], r["w_out"], mdl.true_from_read(p, r["w_out"], 0.5 * (r["t_a1"] + r["t_a2"])
                                                     if r.get("t_a1") is not None and r.get("t_a2") is not None else None))
@@ -181,6 +208,29 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         return st
     st.ok = True
     return st
+
+
+def pass_mass(m0: float, w0: Optional[float], passes: List[Dict]) -> Tuple[Optional[float], str]:
+    """Масса на входе текущего прохода по сухому веществу: m = M₀·(100 − W₁)/(100 − W_k).
+
+    passes — LiveState.batch_passes (проходы партии до текущего включительно). W₁ — средняя на входе 1-го прохода
+    партии по журналу; если 1-го прохода в журнале нет или на входе нет проб — w0 (W₀ партии). W_k — средняя на входе
+    текущего прохода; проб входа ещё нет — влажность выхода прошлого прохода. Возвращает (масса, как посчитано)."""
+    if m0 <= 0 or not passes:
+        return None, "нет данных о проходах партии"
+    cur = passes[-1]
+    first = passes[0] if passes[0].get("pass_no") == 1 else None
+    if cur is first or (len(passes) == 1 and cur.get("pass_no") == 1):
+        return m0, f"1-й проход — вся партия {m0:.0f} т"
+    w1, w1_src = (first["w_in"], "вход 1-го прохода по журналу") if first and first.get("w_in") is not None else \
+        (w0, "W₀ партии")
+    wk, wk_src = cur.get("w_in"), "вход сейчас"
+    if wk is None and len(passes) >= 2 and passes[-2].get("w_end") is not None:
+        wk, wk_src = passes[-2]["w_end"], "выход прошлого прохода"
+    if w1 is None or wk is None or not (0 < w1 < 100 and 0 < wk < 100):
+        return None, "не хватает влажности на входе"
+    m = m0 * (100.0 - w1) / (100.0 - wk)
+    return m, f"{m0:.0f} т · (100 − {w1:.1f}) / (100 − {wk:.1f}) = {m:.0f} т ({w1_src}; {wk_src})"
 
 
 def _journal_regime(prep: List[Dict], p: mdl.DryerParams) -> Tuple[List[Tuple], List[Tuple[datetime, float]]]:
@@ -337,7 +387,7 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
     corr = st.corr if use_corr else 0.0
     w_in = st.w_in
     d_now = st.d
-    t_now = max(now, st.last) if now else st.last
+    t_now = (st.end or max(now, st.last)) if now else st.last      # «сейчас» — с тем же ограничением, что выгрузка
     fc.w_out_now = mdl.solve_pass(p, c, w_in, 1.0, d_now).w_out + corr
     fc.w_out_now_read = mdl.read_from_true(p, fc.w_out_now, st.t_grain)
 

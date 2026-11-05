@@ -1683,6 +1683,104 @@ def test_pass_count_in_weekend_queue_and_live():
     assert len(f1.rest_plan.passes) == len(fa.rest_plan.passes)
 
 
+# ---------------------------------------------------------------------------
+# v1.4: «Текущий проход» в реальном времени; масса на входе прохода — сама
+# ---------------------------------------------------------------------------
+
+def test_live_state_real_time_unloading_and_cap():
+    """«Сейчас»: выгрузка досчитывается от последней записи при последнем D, но не дальше 1,5 ч без записей (тогда
+    счёт стоит, frozen); журнал, который не ведётся больше 12 ч, — на момент последней записи. Конец прохода — от
+    того же момента."""
+    from app.model import Conditions as Cnd
+    rows, _row, t0 = _silo_journal()
+    cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
+    base = live_state(cut, P, final_w=15.0)
+    q = q_at(P, 35)
+    s20 = live_state(cut, P, now=base.last + timedelta(minutes=20), final_w=15.0)
+    assert s20.end == base.last + timedelta(minutes=20) and not s20.frozen
+    assert abs(s20.unloaded - base.unloaded - q / 3.0) < 1e-6
+    s3 = live_state(cut, P, now=base.last + timedelta(hours=3), final_w=15.0)
+    assert s3.frozen and s3.end == base.last + timedelta(hours=1.5) and abs(s3.unloaded - base.unloaded - 1.5 * q) < 1e-6
+    old = live_state(cut, P, now=base.last + timedelta(hours=20), final_w=15.0)
+    assert old.end == base.last and not old.frozen and abs(old.unloaded - base.unloaded) < 1e-9
+    c = Cnd(base.t_proc, 10.0, 70.0)
+    f0 = live_forecast(P, c, base, 1000.0, 21.0, 14.0, 6.0, 10.0)
+    f20 = live_forecast(P, c, s20, 1000.0, 21.0, 14.0, 6.0, 10.0, now=base.last + timedelta(minutes=20))
+    assert abs(f20.remaining - (f0.remaining - q / 3.0)) < 1e-6
+    assert abs((f20.pass_end - f0.pass_end).total_seconds()) < 1.0        # при том же D конец прохода тот же
+
+
+def test_pass_mass_by_dry_matter():
+    """Масса на входе прохода: M₀ на 1-м проходе, дальше M₀·(100 − W₁)/(100 − W_k) по влажности на входе из журнала;
+    1-го прохода в журнале нет — W₀ партии; на входе ещё нет проб — выход прошлого прохода."""
+    from app.live import pass_mass
+    rows, _row, t0 = _silo_journal()
+    st = live_state(rows, P, final_w=15.0)
+    w1, w2 = st.batch_passes[0]["w_in"], st.batch_passes[1]["w_in"]
+    assert [x["pass_no"] for x in st.batch_passes] == [1, 2] and abs(w2 - 21.0) < 1e-9
+    m, how = pass_mass(800.0, 27.0, st.batch_passes)
+    assert abs(m - 800.0 * (100 - w1) / (100 - w2)) < 1e-9 and "вход 1-го прохода по журналу" in how
+    cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
+    assert pass_mass(800.0, 27.0, live_state(cut, P, final_w=15.0).batch_passes)[0] == 800.0
+    only3 = [{"pass_no": 3, "w_in": 19.0, "w_end": None}]
+    assert abs(pass_mass(800.0, 27.0, only3)[0] - 800.0 * 73.0 / 81.0) < 1e-9          # W₁ = W₀ партии
+    no_in = [{"pass_no": 1, "w_in": 27.0, "w_end": 21.5}, {"pass_no": 2, "w_in": None, "w_end": None}]
+    assert abs(pass_mass(800.0, 27.0, no_in)[0] - 800.0 * 73.0 / 78.5) < 1e-9          # вход = выход прошлого
+    assert pass_mass(0.0, 27.0, no_in)[0] is None and pass_mass(800.0, 27.0, [])[0] is None
+
+
+def test_live_tab_real_time_tiles_and_auto_mass():
+    """Раздел «Текущий проход»: масса на входе — сама из «План сушки партии» (по сухому веществу); плитки «Конец
+    прохода» и «Приёмный силос» — до текущего момента; тик раз в 30 с не трогает график; напоминания считают по той
+    же массе."""
+    app = _qapp()
+    from app import pages
+    from app.gui import MainWindow
+    from app.live import pass_mass
+    from app.reminders import live_numbers
+    now = datetime.now().replace(second=0, microsecond=0)
+    rows, _row, t0 = _silo_journal()
+    shift = now - timedelta(minutes=10) - (t0 + timedelta(hours=39.5))   # последняя запись — 10 мин назад
+    for r in rows:
+        r["ts"] = (datetime.strptime(r["ts"], "%d.%m.%y %H:%M") + shift).strftime("%d.%m.%y %H:%M")
+    st = Storage(_tmp("rt.db"))
+    st.replace_journal(rows)
+    st.set_json("ui", {"mass": 800.0, "w0": 27.0, "wk": 14.0})
+    win = MainWindow(st)
+    win.show()
+    win.tabs.setCurrentIndex(win.tabs.indexOfText(pages.LIVE))
+    for _ in range(5):
+        app.processEvents()
+    lt = win.tab_live
+    lt.w_target.setValue(15.0)                       # задание на проход 2: 21 → 15 %
+    s = lt.state
+    m_exp = pass_mass(800.0, 27.0, s.batch_passes)[0]
+    assert lt.cb_mauto.isChecked() and not lt.m_pass.isEnabled() and abs(lt.m_pass.value() - m_exp) <= 0.5   # до тонны
+    assert "«План сушки партии»" in lt.lbl_mass.text()
+    assert lt.cb_now.isChecked() and s.end > s.last and not s.frozen
+    assert "выгружено" in lt.t_pass.lbl_sub.text() and "осталось" in lt.t_pass.lbl_sub.text()
+    assert f"на {s.end:%H:%M}" in lt.t_pass.lbl_sub.text()
+    n_items = len(lt.plot.plotItem.items)
+    lt._tick()
+    assert len(lt.plot.plotItem.items) == n_items and lt.state.end >= s.end
+    soft, hard = win.limits()
+    pe, _tr = live_numbers(win.journal_rows(), win.params, win.storage.get_json("ui_live"), soft, hard,
+                           win.weather_series(), now=lt.state.end, plan=(800.0, 27.0))
+    assert pe is not None and abs((pe - lt.fc.pass_end).total_seconds()) < 120
+    win.in_mass.setValue(1200.0)                     # план уже под следующую партию — текущая помнит свои 800 т
+    lt.refresh()
+    assert abs(lt.m_pass.value() - m_exp) <= 0.5 and lt.batch_m0w0() == (800.0, 27.0)
+    lt._retake_batch()                               # «Взять заново»
+    assert lt.batch_m0w0() == (1200.0, 27.0) and abs(lt.m_pass.value() - 1.5 * m_exp) <= 1.0
+    lt.cb_mauto.setChecked(False)                    # вручную
+    assert lt.m_pass.isEnabled() and not lt.b_mass.isHidden()
+    lt.m_pass.setValue(1000.0)
+    assert lt.m_pass.value() == 1000.0 and win.storage.get_json("ui_live")["m_auto"] is False
+    lt.cb_now.setChecked(False)                      # на момент последней записи
+    assert lt.state.end == lt.state.last and "последнюю запись" in lt.t_pass.lbl_sub.text()
+    win.close()
+
+
 def _cleanup_windows():
     """Окна прошлых тестов удаляются: каждое новое окно ставит оформление на всё приложение и перерисовывает все
     живые окна — без уборки тесты с окнами замедляются квадратично (в программе окно одно)."""

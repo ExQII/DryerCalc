@@ -11,13 +11,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QCheckBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from . import model as mdl
-from .live import LiveState, live_advice, live_forecast, live_state, outlet_soon
+from .live import LiveState, live_advice, live_forecast, live_state, outlet_soon, pass_mass
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import (Collapsible, Tile, dspin, fmt_hours, fnum, item, mute, set_role, size_by_current, table)
@@ -107,7 +107,12 @@ class LiveTab(QWidget):
         self.d_try.setSpecialValueText("подобрать")
         self.cb_corr = QCheckBox("Поправка по последним замерам выхода")
         self.cb_corr.setChecked(True)
-        self.cb_now = QCheckBox("Считать до текущего времени, а не до последней пробы")
+        self.cb_now = QCheckBox("Плитки в реальном времени: выгрузка до текущего момента (раз в 30 с)")
+        self.cb_now.setChecked(True)
+        self.cb_now.setToolTip("«Выгружено», «осталось», конец прохода и приёмный силос досчитываются от последней "
+                               "записи журнала до текущего момента при последнем D и обновляются каждые 30 с. Если "
+                               "записей нет дольше 1,5 ч (возможно, остановка, которую не записали), счёт "
+                               "останавливается. Выключено — всё на момент последней записи.")
         self.cb_silo = QCheckBox("Выравнивать среднюю по силосу")
         self.cb_silo.setChecked(True)
         self.cb_silo.setToolTip(
@@ -118,6 +123,21 @@ class LiveTab(QWidget):
         b_mass = set_role(QPushButton("Взять массу партии из «План сушки партии»"), "link")
         b_mass.setCursor(Qt.PointingHandCursor)
         b_mass.clicked.connect(lambda: self.m_pass.setValue(self.win.in_mass.value()))
+        self.b_mass = b_mass
+        self.cb_mauto = QCheckBox("авто")
+        self.cb_mauto.setChecked(True)
+        self.cb_mauto.setToolTip("Масса на входе — сама: масса партии из «План сушки партии», а на следующих проходах "
+                                 "— она же за вычетом испарённой воды (по сухому веществу и влажности на входе по "
+                                 "журналу). Снимите галочку, чтобы вписать массу вручную.")
+        self.lbl_mass = mute(QLabel())
+        self.lbl_mass.setWordWrap(True)
+        self.b_retake = set_role(QPushButton("Взять массу партии заново из «План сушки партии»"), "link")
+        self.b_retake.setCursor(Qt.PointingHandCursor)
+        self.b_retake.setToolTip("Масса и W₀ партии запоминаются, когда в журнале начинается новая партия, — дальше "
+                                 "«План сушки партии» можно менять под следующую. Если там исправили массу этой "
+                                 "партии — возьмите заново.")
+        self.b_retake.clicked.connect(self._retake_batch)
+        self._batch_src = {}
         b_w = set_role(QPushButton("Взять из таблицы погоды"), "link")
         b_w.setCursor(Qt.PointingHandCursor)
         b_w.setToolTip("Наружный воздух из таблицы погоды на время последней пробы.")
@@ -125,7 +145,13 @@ class LiveTab(QWidget):
         self.m_pass.setToolTip("Масса зерна на входе этого прохода, т (на первом проходе — масса партии).")
         self.w_target.setToolTip("Желаемая влажность на выходе этого прохода — средняя по приёмному силосу, после "
                                  "охлаждения (как в лаборатории).")
-        f.addRow("Масса на входе", self.m_pass)
+        mrow = QHBoxLayout()
+        mrow.setSpacing(6)
+        mrow.addWidget(self.m_pass, 1)
+        mrow.addWidget(self.cb_mauto, 0)
+        f.addRow("Масса на входе", mrow)
+        f.addRow(self.lbl_mass)
+        f.addRow(self.b_retake)
         f.addRow(b_mass)
         f.addRow("Цель прохода", self.w_target)
         f.addRow(self.lbl_target_read)
@@ -275,7 +301,15 @@ class LiveTab(QWidget):
         self.cb_silo.stateChanged.connect(self.recalc)
         self.npass.valueChanged.connect(self.recalc)
         self.cb_now.stateChanged.connect(self.refresh)
+        self.cb_mauto.stateChanged.connect(self._mauto_changed)
         self._load()
+        self._mauto_changed(refresh=False)
+        # плитки в реальном времени: раз в 30 с, пока раздел открыт (график и таблицы при этом не перерисовываются)
+        self._keep_views = False
+        self._rt_timer = QTimer(self)
+        self._rt_timer.setInterval(30000)
+        self._rt_timer.timeout.connect(self._tick)
+        self._rt_timer.start()
         # от цели партии зависит, досушка ли рециркуляция — пересчитать проход. Подключено после загрузки настроек:
         # раздел строится раньше журнала, и пересчёт во время загрузки читал бы ещё не созданную таблицу журнала
         self.wk_final.valueChanged.connect(self.refresh)
@@ -292,12 +326,18 @@ class LiveTab(QWidget):
         self.npass.setValue(int(d.get("npass", 0) or 0))
         if "silo_lim" in d:
             self.silo_lim.setValue(float(d["silo_lim"]))
+        self.cb_mauto.setChecked(bool(d.get("m_auto", True)))
+        self._batch_src = d.get("batch_src") or {}
+        self.cb_now.blockSignals(True)
+        self.cb_now.setChecked(bool(d.get("now", True)))
+        self.cb_now.blockSignals(False)
 
     def _save(self) -> None:
         self.win.storage.set_json("ui_live", {
             "m_pass": self.m_pass.value(), "w_target": self.w_target.value(), "wk": self.wk_final.value(),
             "t_amb": self.t_amb.value(), "rh": self.rh.value(), "corr": self.cb_corr.isChecked(),
-            "silo": self.cb_silo.isChecked(), "silo_lim": self.silo_lim.value(), "npass": self.npass.value()})
+            "silo": self.cb_silo.isChecked(), "silo_lim": self.silo_lim.value(), "npass": self.npass.value(),
+            "m_auto": self.cb_mauto.isChecked(), "now": self.cb_now.isChecked(), "batch_src": self._batch_src})
 
     def _weather(self) -> None:
         ws = self.win.weather_series()
@@ -319,6 +359,73 @@ class LiveTab(QWidget):
     def on_show(self) -> None:
         self.refresh()
 
+    def _tick(self) -> None:
+        """Раз в 30 с: «выгружено», «осталось», конец прохода и силос — до текущего момента. Только пока раздел на
+        экране; график, таблица «другое D» и полный расчёт не перерисовываются (масштаб графика не сбивается)."""
+        if not self.cb_now.isChecked() or not self.isVisible() or not getattr(self.win, "_ready", False):
+            return
+        self._keep_views = True
+        try:
+            self.refresh()
+        finally:
+            self._keep_views = False
+
+    def live_cap_h(self) -> float:
+        """Сколько часов после последней записи ещё досчитывать выгрузку: три интервала проб, не меньше часа."""
+        try:
+            return max(1.0, 3.0 * self.win.reminder_cfg().sample_min / 60.0)
+        except Exception:  # noqa: BLE001
+            return 1.5
+
+    def _mauto_changed(self, *_a, refresh: bool = True) -> None:
+        auto = self.cb_mauto.isChecked()
+        self.m_pass.setEnabled(not auto)
+        self.b_mass.setVisible(not auto)
+        self.lbl_mass.setVisible(auto)
+        self.b_retake.setVisible(auto)
+        if refresh:
+            self.refresh()
+
+    @staticmethod
+    def _batch_key(st) -> str:
+        first = st.batch_passes[0]["start"] if st.batch_passes and st.batch_passes[0].get("start") else None
+        return f"{st.batch_no}|{st.batch}|{first:%Y-%m-%d %H:%M}" if first else ""
+
+    def batch_m0w0(self, st=None) -> tuple:
+        """Масса и W₀ текущей партии: запомненные в начале партии из «План сушки партии» (иначе — оттуда сейчас)."""
+        st = st or self.state
+        key = self._batch_key(st) if st is not None else ""
+        src = self._batch_src or {}
+        if key and src.get("key") == key:
+            return float(src["m0"]), float(src["w0"])
+        return self.win.in_mass.value(), self.win.in_w0.value()
+
+    def _retake_batch(self) -> None:
+        self._batch_src = {}
+        self.refresh()
+
+    def _auto_mass(self, st) -> None:
+        """Масса на входе — сама: масса партии из «План сушки партии» (запоминается, когда в журнале начинается новая
+        партия), на следующих проходах — по сухому веществу."""
+        if not self.cb_mauto.isChecked():
+            return
+        key = self._batch_key(st)
+        if key and (self._batch_src or {}).get("key") != key:        # новая партия — запомнить массу и W₀ из плана
+            self._batch_src = {"key": key, "m0": self.win.in_mass.value(), "w0": self.win.in_w0.value(),
+                               "at": datetime.now().strftime("%d.%m %H:%M")}
+        m0, w0 = self.batch_m0w0(st)
+        m, how = pass_mass(m0, w0, st.batch_passes)
+        if m is None:
+            self.lbl_mass.setText(f"Масса партии {m0:.0f} т («План сушки партии»); {how} — масса прохода не "
+                                  f"пересчитана.")
+            return
+        self.m_pass.blockSignals(True)
+        self.m_pass.setValue(round(m, 1))
+        self.m_pass.blockSignals(False)
+        at = (self._batch_src or {}).get("at")
+        src = f"из «План сушки партии» ({at})" if at else "из «План сушки партии»"
+        self.lbl_mass.setText(f"Партия {m0:.0f} т, W₀ {w0:g} % — {src}. {how[0].upper() + how[1:]}.")
+
     def refresh(self) -> None:
         if not getattr(self.win, "_ready", False):       # окно ещё строится: журнала пока нет, пересчёт — после
             return
@@ -326,8 +433,9 @@ class LiveTab(QWidget):
         now = datetime.now() if self.cb_now.isChecked() else None
         # рециркуляция, когда выход уже у цели партии (Wк + 1 п.п.), — досушка и конец партии
         self.state = live_state(self.win.journal_rows(), p, now=now, weather=self.win.weather_series(),
-                                final_w=self.wk_final.value() + 1.0)
+                                final_w=self.wk_final.value() + 1.0, live_cap_h=self.live_cap_h())
         st = self.state
+        self._auto_mass(st)
         if st.t_amb is not None:
             self.t_amb.blockSignals(True)
             self.t_amb.setValue(st.t_amb)
@@ -427,8 +535,10 @@ class LiveTab(QWidget):
         target_read = mdl.read_from_true(p, self.w_target.value(), tg_now)
         self.lbl_target_read.setText(f"После охлаждения, как в лаборатории. На выходном влагомере это "
                                      f"≈ {target_read:.1f} % (поправка {target_read - self.w_target.value():+.1f} п.п.)")
-        self.tbl.setRowCount(0)
-        self.plot.clear()
+        keep = getattr(self, "_keep_views", False)
+        if not keep:
+            self.tbl.setRowCount(0)
+            self.plot.clear()
         self._save()
         st = self.state
         if st is None:
@@ -504,8 +614,8 @@ class LiveTab(QWidget):
         self.summary.setText("<br>".join(lines))
         self._show_advice(live_advice(p, st, fc, d_try, now=datetime.now()))
         self._fill_tiles(p, st, fc, target_read)
-
-        self._table(p, st, fc, c, d_use, now, th, target_read)
+        if not keep:
+            self._table(p, st, fc, c, d_use, now, th, target_read)
 
     def _soon(self, p, st, fc, hours=(1.0, 2.0)) -> str:
         return outlet_soon(p, st, fc, hours)
@@ -545,18 +655,25 @@ class LiveTab(QWidget):
         self.t_goal.set(f"{goal_read:.1f} %", sub, "С чем сравнивать выходной влагомер: цель прохода в его показаниях "
                                                  "(поправка на горячее зерно — «Погода и влагомер»).")
         sl = fc.silo
+        at = st.end or st.last
+        live = self.cb_now.isChecked() and st.end is not None and st.end > st.last
+        when = (f"на {at:%H:%M}" if live else f"на последнюю запись {at:%H:%M}") if at else ""
+        froze = (f"\nнет записей с {st.last:%H:%M} — счёт остановлен на {at:%H:%M}" if st.frozen else "")
         if st.silo_w is not None:
             self.t_silo.set(f"{st.silo_w:.1f} %",
                             f"{st.unloaded:.0f} т" + (f", к концу прохода ≈ {sl['avg']:.1f} %"
-                                                     if sl and not st.recirc else ""),
+                                                     if sl and not st.recirc else "") + froze,
                             "Средняя по массе влажность всего, что ушло в приёмный силос с начала прохода (истинная, "
-                            "с поправкой влагомера), и ожидаемая к концу прохода.")
+                            "с поправкой влагомера), и ожидаемая к концу прохода. В реальном времени масса растёт "
+                            "каждые 30 с; влажность после последней пробы — как в последней пробе.")
         else:
-            self.t_silo.set("—", f"выгружено {st.unloaded:.0f} т")
+            self.t_silo.set("—", f"выгружено {st.unloaded:.0f} т" + froze)
         if fc.pass_end:
-            rem = "масса прохода выгружена" if fc.remaining <= 0.05 else f"осталось {fc.remaining:.0f} т"
-            self.t_pass.set(f"{fc.pass_end:%d.%m %H:%M}", rem, "Когда закончится выгрузка массы этого прохода при "
-                                                               "советуемом D. Полоса — сколько уже выгружено.")
+            rem = ("масса прохода выгружена" if fc.remaining <= 0.05 else
+                   f"выгружено {st.unloaded:.0f} из {fc.m_out_pass:.0f} т, осталось {fc.remaining:.0f} т")
+            self.t_pass.set(f"{fc.pass_end:%d.%m %H:%M}", f"{rem}\n{when}{froze}",
+                            "Когда закончится выгрузка массы этого прохода при советуемом D. Полоса — сколько уже "
+                            "выгружено (в реальном времени — до текущего момента, обновляется каждые 30 с).")
             self.pass_bar.set_value(st.unloaded / fc.m_out_pass if fc.m_out_pass > 0 else None)
         else:
             self.t_pass.set("—")

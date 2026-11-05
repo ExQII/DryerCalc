@@ -1454,7 +1454,8 @@ class MainWindow(QMainWindow):
         try:
             soft, hard = self.limits()
             pass_end, target_read = live_numbers(rows, self.params, self.storage.get_json("ui_live", {}) or {},
-                                                 soft, hard, self.weather_series(), now=now)
+                                                 soft, hard, self.weather_series(), now=now,
+                                                 plan=self.tab_live.batch_m0w0())
         except Exception:  # noqa: BLE001
             pass_end, target_read = None, None
         msgs = reminders_check(rows, now, self._rem_state, cfg, pass_end, target_read)

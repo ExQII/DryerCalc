@@ -108,10 +108,12 @@ def check(rows: List[Dict], now: datetime, state: Dict, cfg: ReminderCfg, pass_e
 
 
 def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: float, hard: float, weather=None,
-                 now: Optional[datetime] = None) -> Tuple[Optional[datetime], Optional[float]]:
+                 now: Optional[datetime] = None, plan: Optional[Tuple[float, float]] = None
+                 ) -> Tuple[Optional[datetime], Optional[float]]:
     """(ожидаемый конец текущего прохода, цель прохода в показаниях влагомера) — как в разделе «Текущий проход».
-    Во время рециркуляции подача прохода уже закончилась — «проход скоро закончится» не напоминаем."""
-    from .live import live_forecast, live_state
+    Во время рециркуляции подача прохода уже закончилась — «проход скоро закончится» не напоминаем.
+    plan — (масса партии, W₀) из «План сушки партии»: при «авто» масса на входе прохода считается, как в разделе."""
+    from .live import live_forecast, live_state, pass_mass
     st = live_state(rows, p, now=now, weather=weather, final_w=float(ui_live.get("wk", 14.0)) + 1.0)
     if not st.ok:
         return None, None
@@ -119,7 +121,11 @@ def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: floa
         return None, mdl.read_from_true(p, float(ui_live.get("w_target", 24.0)), st.t_grain)
     w_target = float(ui_live.get("w_target", 24.0))
     c = mdl.Conditions(st.t_proc, float(ui_live.get("t_amb", p.t_amb_ref)), float(ui_live.get("rh", p.rh_ref)))
-    fc = live_forecast(p, c, st, float(ui_live.get("m_pass", 500.0)), w_target, float(ui_live.get("wk", 14.0)),
+    m_pass = float(ui_live.get("m_pass", 500.0))
+    if plan is not None and ui_live.get("m_auto", True):
+        m_auto, _how = pass_mass(plan[0], plan[1], st.batch_passes)
+        m_pass = m_auto if m_auto is not None else m_pass
+    fc = live_forecast(p, c, st, m_pass, w_target, float(ui_live.get("wk", 14.0)),
                        soft, hard, use_corr=bool(ui_live.get("corr", True)), now=now,
                        silo=bool(ui_live.get("silo", True)), silo_lim=float(ui_live.get("silo_lim", 1.0)))
     return fc.pass_end, mdl.read_from_true(p, w_target, st.t_grain)

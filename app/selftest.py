@@ -383,6 +383,29 @@ def run(out_path: str) -> int:
               and not _win3._has_photo_bias(),
               f"поправка влагомера +0,8 с фото убрана, модель перекалибрована: R₀ {_r_old:.2f} → {_p3.r_ref:.2f}")
         _win3.close()
+        # --- v1.4: плитки «Текущего прохода» в реальном времени; масса на входе прохода — сама ---
+        from .live import pass_mass as _pm
+        _now = datetime.now().replace(second=0, microsecond=0)
+        _rows4 = _rows[:-2]                                  # без рециркуляции в конце: проход 2 идёт
+        _sh = _now - _td(minutes=10) - datetime.strptime(_rows4[-1]["ts"], "%d.%m.%y %H:%M")
+        _rows4 = [dict(r, ts=(datetime.strptime(r["ts"], "%d.%m.%y %H:%M") + _sh).strftime("%d.%m.%y %H:%M"))
+                  for r in _rows4]
+        _st4 = Storage(os.path.join(tmp, "realtime.db"))
+        _st4.replace_journal(_rows4)
+        _st4.set_json("ui", {"mass": 800.0, "w0": 27.0, "wk": 14.0})
+        _win4 = MainWindow(_st4)
+        _win4.show()
+        _win4.tabs.setCurrentIndex(_win4.tabs.indexOfText(_pages.LIVE))
+        for _ in range(5):
+            app.processEvents()
+        _lt4 = _win4.tab_live
+        _s4 = _lt4.state
+        _m4 = _pm(800.0, 27.0, _s4.batch_passes)[0] if _s4 is not None else None
+        check(_s4 is not None and _s4.end is not None and _s4.end > _s4.last and _m4 is not None
+              and abs(_lt4.m_pass.value() - _m4) <= 0.5 and "осталось" in _lt4.t_pass.lbl_sub.text(),
+              f"«Текущий проход» в реальном времени: выгружено {(_s4.unloaded if _s4 else 0):.0f} т на "
+              f"{(_s4.end if _s4 and _s4.end else _now):%H:%M}; масса прохода {(_m4 or 0):.0f} т (партия 800 т)")
+        _win4.close()
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)
