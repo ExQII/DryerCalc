@@ -1173,7 +1173,7 @@ def test_live_card_dial_follows_advice():
     base = {"sub": ["строка"], "warn": [], "go": None}
     lt._show_advice(dict(base, kind="change", head="Поставьте D = 47 с", d_now=35.0, d_rec=47.0))
     assert lt.dial.state() == ("change", 35.0, 47.0, "было 35") and lt.card.tint() == "gold"
-    assert lt.lbl_head.text() == "Поставьте D = 47 с" and lt.lbl_warn.isHidden()
+    assert lt.lbl_head.text().replace("\u00a0", " ") == "Поставьте D = 47 с" and lt.lbl_warn.isHidden()
     lt._show_advice(dict(base, kind="keep", head="D не менять — 35 с", d_now=35.0, d_rec=36.0))
     assert lt.dial.state()[:3] == ("keep", 35.0, 35.0) and lt.card.tint() == "green"
     lt._show_advice(dict(base, kind="wait", head="Подождите", d_now=40.0, d_rec=44.0,
@@ -1525,7 +1525,9 @@ def test_weekend_tab_ui_queue_and_settings():
         win.tabs.setCurrentIndex(names.index(pages.WEEKEND))
         wt = win.tab_weekend
         assert "ближайший час" in wt.lbl_start_src.text() and not wt.b_queue.isVisibleTo(win)
-        st = next_weekday_time(datetime.now(), 4, 18)          # ближайшая пятница 18:00
+        # ближайшая пятница 18:00 не раньше чем через час: иначе в пятницу 17:xx она совпадёт с «ближайшим часом»,
+        # и поле не изменится («задано вручную» не появится)
+        st = next_weekday_time(datetime.now() + timedelta(hours=1), 4, 18)
         sun = next_weekday_time(st, 6, 20)                     # человек выбрал воскресенье 20:00
         wt.start.setDateTime(QDateTime(st.year, st.month, st.day, st.hour, 0, 0))
         wt.end.setDateTime(QDateTime(sun.year, sun.month, sun.day, sun.hour, 0, 0))
@@ -1974,20 +1976,25 @@ def test_live_tab_shows_verified_regime():
     # приборы: D и T блоков — ручки на проверенном режиме, зелёные полосы — изученное с запасом
     assert lt.dial.state()[:3] == ("change", 35.0, alt["d"]) and lt.dial.band() == (31.0, 39.0)
     assert lt.tdial.state() == ("change", 60.0, alt["t"], "было 60/60") and lt.tdial.band() == (18.0, 72.0)
-    assert lt.tdial.text() == f"{alt['t_up']:.0f}/{alt['t_low']:.0f}" and "T блоков" in lt.lbl_head.text()
-    assert lt.lbl_head.text().endswith(f"T блоков {alt['t_up']:.0f}/{alt['t_low']:.0f} °C")
-    assert f"T {alt['t_up']:.0f}/{alt['t_low']:.0f} °C" in lt.chips["alt"].text()
-    # варианты под советом; «Записать в журнал…» — с режимом из совета
-    assert lt.chips_box.isVisibleTo(lt) and lt.chips["alt"].isChecked() and "не проверено" in lt.chips["d"].text()
+    head = lt.lbl_head.text()
+    assert "\u00a0°C" in head and "D\u00a0=\u00a0" in head            # число не отрывается от единицы
+    head = head.replace("\u00a0", " ")
+    assert lt.tdial.text() == f"{alt['t_up']:.0f}/{alt['t_low']:.0f}" and "T блоков" in head
+    assert head.endswith(f"T блоков {alt['t_up']:.0f}/{alt['t_low']:.0f} °C")
+    # «Только разгрузка» под приборами — выключено; второй вариант — приглушённой строкой под советом
+    assert lt.sw_d_only.isVisibleTo(lt) and lt.sw_d_only.isEnabled() and not lt.sw_d_only.isChecked()
+    assert f"Только разгрузка: D {lt.fc.d_rec:.0f} с" in lt.lbl_sub.text() and "не проверено" in lt.lbl_sub.text()
     got = []
     win.record_regime = lambda values, comment="": got.append((values, comment)) or False
     assert lt.btn_record.isVisibleTo(lt)
     lt.btn_record.click()
     assert got == [({"d": alt["d"], "t_up": alt["t_up"], "t_low": alt["t_low"]}, "по совету, проверенный режим")]
-    lt.chips["d"].click()                            # инженер выбрал «только D» — запомнено
-    assert lt.prefer == "d" and stg.get_json("ui_live")["prefer"] == "d"
-    assert lt.lbl_head.text() == f"Поставьте D = {lt.fc.d_rec:.0f} с" and lt.tdial.state()[0] == "hold"
-    assert "вне проверенного журналом" in lt.lbl_warn.text() and lt.chips["d"].isChecked()
+    lt.sw_d_only.click()                             # инженер включил «Только разгрузка» — запомнено
+    assert lt.sw_d_only.isChecked() and lt.prefer == "d" and stg.get_json("ui_live")["prefer"] == "d"
+    assert lt.lbl_head.text().replace("\u00a0", " ") == f"Поставьте D = {lt.fc.d_rec:.0f} с"
+    assert lt.tdial.state()[0] == "hold"
+    assert "вне проверенного журналом" in lt.lbl_warn.text()
+    assert f"Проверенный режим: D {alt['d']:.0f} с и T блоков {alt['t_up']:.0f}/{alt['t_low']:.0f} °C" in lt.lbl_sub.text()
     lt.btn_record.click()
     assert got[-1] == ({"d": lt.fc.d_rec}, "по совету")
     # подробный расчёт — с пределами проверенного и обоими вариантами
@@ -1996,6 +2003,38 @@ def test_live_tab_shows_verified_regime():
     # четыре плитки: цель — рядом с последней пробой выхода
     assert len(lt.tiles) == 4 and lt.lbl_goal.text().startswith("цель ")
     win.close()
+    win2 = MainWindow(stg)                            # после перезапуска — так же
+    assert win2.tab_live.sw_d_only.isChecked() and win2.tab_live.prefer == "d"
+    win2.close()
+    win3 = MainWindow(stg)                            # модель считает по T зерна — совета по T нет, переключатель недоступен
+    win3.params = replace(win3.params, temp_source="agent")
+    win3.tab_live.recalc()
+    assert not win3.tab_live.sw_d_only.isEnabled()
+    win3.close()
+
+
+def test_switch_widget():
+    """1.6: ползунок «Только разгрузка» — нажимается мышью и пробелом, подпись — часть кнопки, размер по тексту."""
+    app = _qapp()
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtTest import QTest
+    from app.widgets import Switch
+    sw = Switch("Только разгрузка")
+    sw.show()
+    app.processEvents()
+    assert sw.isCheckable() and not sw.isChecked() and sw.accessibleName() == "Только разгрузка"
+    assert sw.sizeHint().width() > sw.fontMetrics().horizontalAdvance("Только разгрузка")
+    seen = []
+    sw.toggled.connect(seen.append)
+    QTest.mouseClick(sw, _Qt.LeftButton, pos=sw.rect().center())
+    assert sw.isChecked() and seen == [True]
+    sw.setFocus()
+    QTest.keyClick(sw, _Qt.Key_Space)
+    assert not sw.isChecked() and seen == [True, False]
+    sw.setChecked(True)
+    assert sw._pos == 1.0                             # из кода — сразу, без анимации
+    sw.grab()                                          # рисуется без ошибок
+    sw.close()
 
 
 

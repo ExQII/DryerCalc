@@ -293,7 +293,7 @@ def run(out_path: str) -> int:
         app.processEvents()
         win.tab_live.refresh()
         _adv = win.tab_live.advice or {}
-        check(bool(_adv.get("head")) and win.tab_live.lbl_head.text() == _adv["head"]
+        check(bool(_adv.get("head")) and win.tab_live.lbl_head.text().replace("\u00a0", " ") == _adv["head"]
               and win.tab_live.t_pass.lbl_value.text() not in ("", "—") and _nav.lbl_title.text() == _pages.LIVE
               and win.tab_live.dial.state()[0] != "nodata" and win.tab_live.tdial.state()[0] != "nodata"
               and len(win.tab_live.tiles) == 4,
@@ -458,9 +458,9 @@ def run(out_path: str) -> int:
         _s9 = live_state(_rows9[:20], win.params, final_w=15.0)
         check([(x["pass_no"], x["end_kind"]) for x in _jp9] == [(1, "recirc")] and _s9w.warmup
               and _a9w["head"].startswith("Прогрев") and not _s9.recirc and _s9.unloaded > 100
-              and not win.tab_live.cb_corr.isChecked(),
+              and not win.tab_live.cb_corr.isChecked() and not win.tab_live.sw_d_only.isChecked(),
               f"прогрев и «сушим в 1 силос»: проходов {len(_jp9)}, при прогреве — «{_a9w['head']}», в сушке выгружено "
-              f"{_s9.unloaded:.0f} т; поправка по последним замерам — выключена")
+              f"{_s9.unloaded:.0f} т; поправка по последним замерам — выключена, «Только разгрузка» — выключено")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

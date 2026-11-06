@@ -1,22 +1,25 @@
 """Раздел «Текущий проход»: что делать с разгрузкой D прямо сейчас, по свежим пробам журнала.
 
-Сверху — стеклянная карточка с одним действием («Поставьте D = 42 с и T блоков 50 °C», «D не менять», «Подождите до
-09:30») и двумя приборами — разгрузка D и T блоков (точка — сейчас, ручка — что поставить, зелёная полоса — где журнал
-проверил модель); когда совет D вне проверенного, под советом — два варианта: проверенный режим D + T блоков и только
-D. Кнопка «Записать в журнал…» открывает запись смены режима с готовыми значениями. Под карточкой — четыре плитки
+Сверху — стеклянная карточка с одним действием («Поставьте D = 42 с и T блоков 50/45 °C», «D не менять», «Подождите
+до 09:30») и двумя приборами — разгрузка D и T блоков (точка — сейчас, ручка — что поставить, зелёная полоса — где
+журнал проверил модель); под приборами — переключатель «Только разгрузка»: выключен — когда совет D вне проверенного,
+совет — проверенный режим D + T блоков, включён — только D; второй вариант — приглушённой строкой под советом. Кнопка
+«Записать в журнал…» открывает запись смены режима с готовыми значениями. Под карточкой — четыре плитки
 (выход с целью и спарклайном проб, приёмный силос, конец прохода с полосой выгрузки, конец партии); пояснения — во
 всплывающих подсказках и во вкладке «Расчёт подробно». Ниже вкладками — график проб, данные прохода и задание, «что
 будет при другом D» и полный расчёт. Логика совета — live.live_advice (правила работы, 7.3).
 """
 from __future__ import annotations
 
+import re
+
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QBrush, QColor
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
-                               QLabel, QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from . import model as mdl
 from .live import (LiveState, fmt_t, live_advice, live_forecast, live_state, outlet_soon, pass_mass, t_pair,
@@ -24,7 +27,7 @@ from .live import (LiveState, fmt_t, live_advice, live_forecast, live_state, out
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import (Collapsible, Tile, dspin, fmt_hours, fnum, item, mute, set_role, size_by_current, table)
-from .widgets import DDial, Glass, Legend, ProgressLine, Sparkline, TDial
+from .widgets import DDial, Glass, Legend, ProgressLine, Sparkline, Switch, TDial
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -38,6 +41,14 @@ def _passes(n: int) -> str:
     if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
         return f"{n} прохода"
     return f"{n} проходов"
+
+
+def nbsp_head(head: str) -> str:
+    """Крупная строка совета без «висящих» единиц: число не отрывается от «с» / «°C», «D =» — от числа, «T блоков» —
+    от значения; переносится только между частями («Поставьте D = 40 с» | «и T блоков 50/45 °C»)."""
+    nb = "\u00a0"
+    head = re.sub(r"(\d) (с|°C)(?=$|[ ,.;])", lambda m: m.group(1) + nb + m.group(2), head)
+    return head.replace("D = ", f"D{nb}={nb}").replace("T блоков ", f"T{nb}блоков{nb}").replace(" и T", f" и{nb}T")
 
 
 class LiveTab(QWidget):
@@ -192,8 +203,9 @@ class LiveTab(QWidget):
             "1. Внесите пробу в «Журнал проб».<br>2. Посмотрите сюда: крупная строка сверху — что поставить.<br>"
             "3. «Поставьте …» — поставьте на сушилке и нажмите «Записать в журнал…». «D не менять» или «Подождите» "
             "— ничего не трогайте.<br><br>Приборы слева — разгрузка D и T блоков: точка — сейчас, ручка — что "
-            "поставить, золотая дуга — насколько крутить, зелёная полоса — где журнал проверил модель. Совет D "
-            "вышел за полосу — под советом два варианта: проверенный режим (D и T блоков в полосах) и только D."
+            "поставить, золотая дуга — насколько крутить, зелёная полоса — где журнал проверил модель. Под "
+            "приборами — «Только разгрузка»: выключено — когда совет D выходит за полосу, программа предлагает "
+            "проверенный режим D + T блоков; включено — совет только по D."
             "<br><br>Почему не чаще: зерно, уже находящееся в шахте, "
             "выходит со старой скоростью — смена D видна на выходе только через время «Заметно через …». Разница "
             "меньше 3 с — это ≈ 0,5 п.п. на выходе, на уровне точности влагомера. Подробно — «Справка» → «Правила "
@@ -214,7 +226,9 @@ class LiveTab(QWidget):
         ch = QHBoxLayout(self.card)
         ch.setContentsMargins(gl + 10, gt + 8, gr + 16, gbm + 8)
         ch.setSpacing(14)
-        # приборы: разгрузка D и T блоков рядом, как на приборной панели
+        # приборы: разгрузка D и T блоков рядом, как на приборной панели; под ними — «Только разгрузка»
+        panel = QVBoxLayout()
+        panel.setSpacing(6)
         gauges = QHBoxLayout()
         gauges.setSpacing(0)
         self.dial = DDial()
@@ -227,7 +241,16 @@ class LiveTab(QWidget):
             lb.setAlignment(Qt.AlignHCenter)
             gv.addWidget(lb)
             gauges.addLayout(gv)
-        ch.addLayout(gauges, 0)
+        panel.addLayout(gauges)
+        self.sw_d_only = Switch("Только разгрузка")
+        self.sw_d_only.setToolTip(
+            "Включено — совет только по разгрузке D, T блоков не трогать.\nВыключено — когда совет D выходит за "
+            "проверенное журналом (зелёная полоса), программа предлагает режим D + T блоков (обе ступени) в проверенной "
+            "зоне с той же целью.\nВыбор запоминается.")
+        self.sw_d_only.toggled.connect(self._toggle_d_only)
+        panel.addWidget(self.sw_d_only, 0, Qt.AlignHCenter)
+        panel.addStretch(1)
+        ch.addLayout(panel, 0)
         cv = QVBoxLayout()
         cv.setSpacing(6)
         head = QHBoxLayout()
@@ -250,28 +273,6 @@ class LiveTab(QWidget):
         self.lbl_sub.setWordWrap(True)
         self.lbl_sub.setTextFormat(Qt.RichText)
         cv.addWidget(self.lbl_sub)
-        # варианты, когда совет D вне проверенного журналом: проверенный режим D + T блоков или только D
-        self.chips_box = QWidget()
-        chl = QVBoxLayout(self.chips_box)          # друг под другом: выбор из двух и окно не шире
-        chl.setContentsMargins(0, 0, 0, 0)
-        chl.setSpacing(4)
-        self.chip_grp = QButtonGroup(self)
-        self.chip_grp.setExclusive(True)
-        self.chips = {}
-        for key, tip in (("alt", "Проверенный режим: и D, и T блоков там, где журнал проверил модель (зелёные полосы "
-                                 "на приборах). Та же цель."),
-                         ("d", "Только D по совету: больше т/ч, но такого D журнал ещё не видел — точность совета не "
-                               "проверена, смотрите пробы чаще.")):
-            b = set_role(QPushButton(), "chip")
-            b.setCheckable(True)
-            b.setCursor(Qt.PointingHandCursor)
-            b.setToolTip(tip)
-            b.clicked.connect(lambda _c=False, k=key: self._pick(k))
-            self.chip_grp.addButton(b)
-            chl.addWidget(b, 0, Qt.AlignLeft)
-            self.chips[key] = b
-        self.chips_box.setVisible(False)
-        cv.addWidget(self.chips_box)
         self.lbl_warn = set_role(QLabel(), "warn")
         self.lbl_warn.setWordWrap(True)
         self.lbl_warn.setVisible(False)
@@ -386,6 +387,9 @@ class LiveTab(QWidget):
         self.cb_now.setChecked(bool(d.get("now", True)))
         self.cb_now.blockSignals(False)
         self.prefer = "d" if d.get("prefer") == "d" else "alt"
+        self.sw_d_only.blockSignals(True)
+        self.sw_d_only.setChecked(self.prefer == "d")
+        self.sw_d_only.blockSignals(False)
 
     def _save(self) -> None:
         self.win.storage.set_json("ui_live", {
@@ -551,8 +555,10 @@ class LiveTab(QWidget):
         self.lbl_state.setText(msg)
         self.lbl_state.setVisible(bool(msg))
 
-    def _pick(self, key: str) -> None:
-        """Вариант режима выбран кнопкой под советом: запоминается (решение инженера держится и после перезапуска)."""
+    def _toggle_d_only(self, on: bool) -> None:
+        """«Только разгрузка»: совет только по D (вкл.) или D + T блоков, когда D вне проверенного (выкл.). Выбор
+        запоминается — решение инженера держится и после перезапуска."""
+        key = "d" if on else "alt"
         if key != self.prefer:
             self.prefer = key
             self._save()
@@ -574,8 +580,7 @@ class LiveTab(QWidget):
         self.advice = adv
         kind = adv["kind"]
         self.card.set_tint(self.TINT.get(kind))
-        self.lbl_head.setText(adv["head"])
-        self.lbl_sub.setText("<br>".join(adv["sub"]))
+        self.lbl_head.setText(nbsp_head(adv["head"]))
         self.lbl_warn.setText("<br>".join(f"⚠ {w}" for w in adv["warn"]))
         self.lbl_warn.setVisible(bool(adv["warn"]))
         go = adv.get("go")
@@ -583,14 +588,19 @@ class LiveTab(QWidget):
         if go:
             self.btn_go.setText(f"Открыть «{go}»")
         self.btn_record.setVisible(kind == "change" and bool(adv.get("record")))
+        # второй вариант (когда совет D вне проверенного и проверенный режим нашёлся) — приглушённой строкой
         opts = {o["key"]: o for o in adv.get("options") or []}
-        both = "alt" in opts and "d" in opts
-        self.chips_box.setVisible(both)
-        if both:
+        other = ""
+        if "alt" in opts and "d" in opts and kind in ("change", "keep", "wait"):
             a, d = opts["alt"], opts["d"]
-            self.chips["alt"].setText(f"Проверенный: D {a['d']:.0f} с, T {fmt_t(a['t'])} °C · {a['q']:.1f} т/ч")
-            self.chips["d"].setText(f"Только D {d['d']:.0f} с · {d['q']:.1f} т/ч · не проверено")
-            self.chips[adv.get("option") or "alt"].setChecked(True)
+            if adv.get("option") == "alt":
+                other = f"Только разгрузка: D {d['d']:.0f} с · {d['q']:.1f} т/ч вместо {a['q']:.1f} — не проверено"
+            else:
+                other = (f"Проверенный режим: D {a['d']:.0f} с и T блоков {fmt_t(a['t'])} °C · {a['q']:.1f} т/ч — "
+                         f"выключите «Только разгрузка»")
+        th = theme_for(self)
+        self.lbl_sub.setText("<br>".join(adv["sub"] + ([f"<span style='color:{th.muted}'>{other}</span>"]
+                                                       if other else [])))
         self._show_t(kind, adv)
         d_now, d_rec = adv.get("d_now"), adv.get("d_rec")
         if kind == "change":
@@ -640,6 +650,7 @@ class LiveTab(QWidget):
     def recalc(self) -> None:
         p = self.win.params
         th = theme_for(self)
+        self.sw_d_only.setEnabled(p.temp_source == "block")   # совет по T — только когда модель считает по T блоков
         zone = mdl.explored_zone(p)                 # зелёные полосы приборов — где журнал проверил модель
         self.dial.set_band(zone["d"] if zone else None)
         self.tdial.set_band(zone["t"] if zone and p.temp_source == "block" else None)

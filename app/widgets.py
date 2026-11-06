@@ -7,6 +7,7 @@
 * Gauge — прибор дугой 270°: точка — сейчас, ручка — что поставить, золотая дуга между ними — насколько и в какую
   сторону крутить, тонкая зелёная полоса внутри — где модель проверена журналом. DDial — разгрузка D (0…100 с),
   TDial — T блоков (30…90 °C): пара приборов раздела «Текущий проход».
+* Switch — ползунок-переключатель с подписью («Только разгрузка» под приборами).
 * Sparkline — маленький график в плитке (последние пробы выхода, цель, прогноз).
 * ProgressLine — тонкая полоса «сколько уже сделано» (выгрузка прохода).
 """
@@ -16,10 +17,10 @@ import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
                            QRadialGradient)
-from PySide6.QtWidgets import QFrame, QSizePolicy, QWidget
+from PySide6.QtWidgets import QAbstractButton, QFrame, QSizePolicy, QWidget
 
 from . import design
 
@@ -347,6 +348,97 @@ class Gauge(QWidget):
             cw = fm.horizontalAdvance(self._caption)
             p.drawText(QRectF(c.x() - cw / 2 - 4, base_y + fm.height() * 0.35, cw + 8, fm.height()), Qt.AlignCenter,
                        self._caption)
+        p.end()
+
+
+class Switch(QAbstractButton):
+    """Ползунок-переключатель с подписью справа: дорожка-«таблетка» и бегунок. Включено — бегунок справа, дорожка
+    золотая; выключено — слева, дорожка серая. Нажимается вся ширина (и подпись), пробелом — с клавиатуры; при
+    переключении бегунок едет (120 мс)."""
+
+    def __init__(self, text: str = "", parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setAccessibleName(text)
+        self._pos = 0.0                       # 0 — выключено, 1 — включено (бегунок едет между ними)
+        self._quiet = False                   # setChecked из кода — без анимации
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(120)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(self._moved)
+        self.toggled.connect(self._go)
+
+    def _moved(self, v) -> None:
+        self._pos = float(v)
+        self.update()
+
+    def _go(self, on: bool) -> None:
+        if self._quiet or not self.isVisible():
+            self._pos = 1.0 if on else 0.0
+            self.update()
+            return
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(1.0 if on else 0.0)
+        self._anim.start()
+
+    def setChecked(self, on: bool) -> None:  # noqa: N802 — из кода (загрузка настроек): сразу, без анимации
+        self._quiet = True
+        try:
+            super().setChecked(on)
+        finally:
+            self._quiet = False
+        self._anim.stop()
+        self._pos = 1.0 if on else 0.0
+        self.update()
+
+    def _track(self) -> QSize:
+        h = int(round(self.fontMetrics().height() * 1.15))
+        return QSize(int(h * 1.85), h)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        tr = self._track()
+        w = tr.width() + int(self.fontMetrics().height() * 0.5) + self.fontMetrics().horizontalAdvance(self.text()) + 4
+        return QSize(w, tr.height() + 6)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self.sizeHint()
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        t = design.tokens_for(self)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        tr = self._track()
+        y0 = (self.height() - tr.height()) / 2.0
+        rect = QRectF(2.0, y0, tr.width(), tr.height())
+        r = tr.height() / 2.0
+        off, on = QColor(t.line_strong), QColor(t.accent)
+        f = self._pos
+        col = QColor(int(off.red() + (on.red() - off.red()) * f), int(off.green() + (on.green() - off.green()) * f),
+                     int(off.blue() + (on.blue() - off.blue()) * f))
+        if not self.isEnabled():
+            col.setAlphaF(0.45)
+        p.setPen(Qt.NoPen)
+        p.setBrush(col)
+        p.drawRoundedRect(rect, r, r)
+        if self.hasFocus():
+            ring = QPen(QColor(t.accent_edge), 1.5)
+            p.setPen(ring)
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(rect.adjusted(-2.0, -2.0, 2.0, 2.0), r + 2.0, r + 2.0)
+        kr = r - 2.5
+        cx = rect.left() + r + (rect.width() - 2 * r) * f
+        p.setPen(QPen(QColor(0, 0, 0, 40), 1.0))
+        p.setBrush(QColor(t.surface))
+        p.drawEllipse(QPointF(cx, rect.center().y()), kr, kr)
+        p.setPen(QColor(t.ink if self.isEnabled() else t.muted))
+        p.setFont(self.font())
+        tx = rect.right() + self.fontMetrics().height() * 0.5
+        p.drawText(QRectF(tx, 0, self.width() - tx, self.height()), Qt.AlignVCenter | Qt.AlignLeft, self.text())
         p.end()
 
 
