@@ -74,7 +74,7 @@ class LiveTab(QWidget):
         self.fact_lbl = {}
         for i, (key, cap) in enumerate((("batch", "Партия"), ("start", "Начало прохода"), ("last", "Последняя запись"),
                                         ("w_in", "Вход сейчас"), ("w_out", "Выход, влагомер"), ("d", "Разгрузка D"),
-                                        ("t", "T блоков / зерна"), ("unl", "Выгружено"), ("silo", "В силосе"),
+                                        ("t", "T блоков 1/2"), ("unl", "Выгружено"), ("silo", "В силосе"),
                                         ("corr", "Поправка модели"))):
             k = set_role(QLabel(cap), "factKey")
             v = set_role(QLabel("—"), "factVal")
@@ -214,7 +214,7 @@ class LiveTab(QWidget):
         gauges.setSpacing(0)
         self.dial = DDial()
         self.tdial = TDial()
-        for g, cap in ((self.dial, "разгрузка D"), (self.tdial, "T блоков")):
+        for g, cap in ((self.dial, "разгрузка D"), (self.tdial, "T блоков 1/2")):
             gv = QVBoxLayout()
             gv.setSpacing(0)
             gv.addWidget(g, 0, Qt.AlignHCenter)
@@ -510,7 +510,7 @@ class LiveTab(QWidget):
         """Карточка «Проход по журналу»: что программа взяла из журнала — сверить перед тем, как крутить D."""
         ok = st.start is not None
         tg = f"{st.t_grain:.0f}" if st.t_grain is not None else "—"
-        tp = f"{st.t_proc:.0f}" if st.t_proc is not None else "—"
+        tp = fmt_t(t_pair(st)) if st.t_proc is not None else "—"      # 1-я / 2-я ступень, как на пульте
         q = mdl.q_at(p, st.d) if st.d else None
         auto = " (по рециркуляциям)" if st.pass_auto else ""
         vals = {
@@ -520,7 +520,7 @@ class LiveTab(QWidget):
             "last": (f"{st.last:%d.%m %H:%M}, через {fmt_hours(st.hours)}" if ok and st.last else "—"),
             "w_in": f"{fnum(st.w_in)} %", "w_out": f"{fnum(st.w_out_read)} %",
             "d": (f"{fnum(st.d, 0)} с, Q = {fnum(q)} т/ч" if st.d else "—"),
-            "t": f"{tp} / {tg} °C", "unl": f"{fnum(st.unloaded, 0)} т",
+            "t": f"{tp} °C, зерно {tg} °C", "unl": f"{fnum(st.unloaded, 0)} т",
             "silo": (f"{st.silo_w:.1f} % (влагомер {st.silo_w_read:.1f} %)" if st.silo_w is not None else "—"),
             "corr": f"{st.corr:+.2f} п.п. по {st.corr_n} замерам" if ok else "—",
         }

@@ -458,8 +458,9 @@ def verified_regime(p: mdl.DryerParams, st: LiveState, c: mdl.Conditions, fc: "L
                 sl_k["m_done"] + sl_k["m_tr"] + max(sl_k["m_new"], 0.0), 1e-9)
         fc.alt = alt
         return
-    fc.alt_reason = reason or (f"даже при T блоков {st.t_proc + sign * T_STEP * T_STEPS_MAX:.0f} °C нужен D = "
-                               f"{d_k:.0f} с — вне проверенного")
+    dt_max = sign * T_STEP * T_STEPS_MAX
+    fc.alt_reason = reason or (f"даже при T блоков {up + dt_max:.0f}/{low + dt_max:.0f} °C нужен D = {d_k:.0f} с — "
+                               f"вне проверенного")
 
 
 def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: float, w_target: float,
@@ -654,10 +655,10 @@ def t_pair(st: LiveState) -> Optional[Tuple[float, float]]:
 
 
 def fmt_t(t: Optional[Tuple[float, float]]) -> str:
-    """«50» — оба блока одинаково, «50/55» — по-разному."""
+    """Уставки T блоков так, как их ставят: 1-я ступень / 2-я ступень — «50/45», «60/55», «50/50»."""
     if t is None:
         return "—"
-    return f"{t[0]:.0f}" if abs(t[0] - t[1]) < 0.5 else f"{t[0]:.0f}/{t[1]:.0f}"
+    return f"{t[0]:.0f}/{t[1]:.0f}"
 
 
 def regime_options(p: mdl.DryerParams, fc: LiveForecast) -> Dict[str, Dict]:

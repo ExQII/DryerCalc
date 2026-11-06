@@ -1899,6 +1899,7 @@ def test_verified_regime_when_d_advice_leaves_zone():
     # совет (по правилам 7.3.8 — проверенный режим, если инженер не выбрал иначе): D и T блоков, варианты, запись
     from app.live import fmt_t, live_advice
     t_alt = (alt["t_up"], alt["t_low"])
+    assert fmt_t((50.0, 45.0)) == "50/45" and fmt_t((50.0, 50.0)) == "50/50" and fmt_t(None) == "—"
     assert a["kind"] == "change" and a["option"] == "alt" and a["alt"] is alt
     assert a["head"] == f"Поставьте D = {alt['d']:.0f} с и T блоков {fmt_t(t_alt)} °C"
     assert a["d_rec"] == alt["d"] and a["t_rec"] == t_alt and a["t_now"] == (60, 60)
@@ -1972,8 +1973,10 @@ def test_live_tab_shows_verified_regime():
     assert lt.fc is not None and alt is not None and lt.prefer == "alt"
     # приборы: D и T блоков — ручки на проверенном режиме, зелёные полосы — изученное с запасом
     assert lt.dial.state()[:3] == ("change", 35.0, alt["d"]) and lt.dial.band() == (31.0, 39.0)
-    assert lt.tdial.state() == ("change", 60.0, alt["t"], "было 60") and lt.tdial.band() == (18.0, 72.0)
-    assert lt.tdial.text() == f"{alt['t_up']:.0f}" and "T блоков" in lt.lbl_head.text()
+    assert lt.tdial.state() == ("change", 60.0, alt["t"], "было 60/60") and lt.tdial.band() == (18.0, 72.0)
+    assert lt.tdial.text() == f"{alt['t_up']:.0f}/{alt['t_low']:.0f}" and "T блоков" in lt.lbl_head.text()
+    assert lt.lbl_head.text().endswith(f"T блоков {alt['t_up']:.0f}/{alt['t_low']:.0f} °C")
+    assert f"T {alt['t_up']:.0f}/{alt['t_low']:.0f} °C" in lt.chips["alt"].text()
     # варианты под советом; «Записать в журнал…» — с режимом из совета
     assert lt.chips_box.isVisibleTo(lt) and lt.chips["alt"].isChecked() and "не проверено" in lt.chips["d"].text()
     got = []
