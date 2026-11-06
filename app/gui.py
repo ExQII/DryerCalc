@@ -1264,6 +1264,26 @@ class MainWindow(QMainWindow):
             return
         self._apply_regime(dlg.plan, dlg.fix_following())
 
+    def record_regime(self, values: Dict[str, float], comment: str = "") -> bool:
+        """«Записать в журнал…» из «Текущего прохода»: окно «Изменение режима сушки» с режимом из совета (D, T блоков).
+        Человек проверяет время и значения и записывает; меняющиеся поля — только те, что отличаются от текущего
+        режима. True — записано."""
+        rows = self._table_to_rows()
+        cur = regime_at(rows, len(rows))
+        changes = {k: float(v) for k, v in values.items()
+                   if k in REGIME_FIELDS and v is not None and (cur.get(k) is None or abs(float(v) - cur[k]) > 1e-9)}
+        dlg = regime_dialog_class()(self, rows, changes, default_change_time(rows, datetime.now()),
+                                    intro="Поставили режим на сушилке — проверьте время и значения и запишите: пробы до "
+                                          "этого времени останутся со старым режимом, после — с новым.")
+        if comment:
+            dlg.comment.setText(comment)
+        if dlg.exec() != QDialog.Accepted or dlg.plan is None:
+            return False
+        if not self._confirm_note(dlg.plan["row"]["note"]):
+            return False
+        self._apply_regime(dlg.plan, dlg.fix_following())
+        return True
+
     def _apply_regime(self, plan: Dict, fix_following: bool) -> None:
         """Вставить строку смены режима на её место по времени; при fix_following — исправить старый режим в строках
         после неё. Затем быстрый ввод берёт новый режим, время следующей пробы — по последней пробе."""

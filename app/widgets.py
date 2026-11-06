@@ -4,8 +4,9 @@
   части и мягкая тень (настоящее гауссово размытие, посчитанное один раз на размер и растянутое по 9 частям).
   Размытия того, что под стеклом, нет — в Qt Widgets его не сделать дёшево; стекло читается по кромке, блику и тени
   на тёплом фоне окна (paint_backdrop).
-* DDial — шкала разгрузки D (0…100 с) дугой 270°: точка — D сейчас, ручка — советуемое D, золотая дуга между ними —
-  насколько и в какую сторону крутить. Главный «прибор» раздела «Текущий проход».
+* Gauge — прибор дугой 270°: точка — сейчас, ручка — что поставить, золотая дуга между ними — насколько и в какую
+  сторону крутить, тонкая зелёная полоса внутри — где модель проверена журналом. DDial — разгрузка D (0…100 с),
+  TDial — T блоков (30…90 °C): пара приборов раздела «Текущий проход».
 * Sparkline — маленький график в плитке (последние пробы выхода, цель, прогноз).
 * ProgressLine — тонкая полоса «сколько уже сделано» (выгрузка прохода).
 """
@@ -191,14 +192,17 @@ class Glass(QFrame):
 # Шкала D
 # ----------------------------------------------------------------------------------------------------------------
 
-class DDial(QWidget):
-    """Шкала разгрузки D: 0…100 с по дуге 270° (0 — слева внизу, 100 — справа внизу).
+class Gauge(QWidget):
+    """Прибор-шкала дугой 270° (как на приборной панели): lo — слева внизу, hi — справа внизу.
 
-    kind: change — сталь-точка «сейчас», золотая дуга до золотой ручки «поставить», в центре — новое D;
-          keep — зелёная ручка на текущем D; wait — стальная ручка на текущем D; info — стальная ручка на D,
-          которое проверяют; nodata — пустая шкала."""
+    kind: change — стальная точка «сейчас», золотая дуга до золотой ручки «поставить», в центре — новое значение;
+          keep — зелёная ручка на текущем; hold — стальная ручка на текущем (эту величину совет не трогает);
+          wait — стальная ручка на текущем; info — стальная ручка на проверяемом; nodata — пустая шкала.
+    Полоса (set_band) — тонкая зелёная дуга внутри шкалы: где модель проверена журналом. text — что написать в центре
+    вместо числа (например, «50/55» для двух блоков)."""
 
     START, SPAN = 225.0, 270.0
+    LO, HI, UNIT, STEP, TIP = 0.0, 100.0, " с", 10, ""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -206,25 +210,40 @@ class DDial(QWidget):
         self._cur: Optional[float] = None
         self._knob: Optional[float] = None
         self._caption = ""
+        self._text: Optional[str] = None
+        self._band: Optional[Tuple[float, float]] = None
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.setToolTip("Разгрузка D, с: точка — сейчас, ручка — что поставить. Шкала 0…100 с.")
+        self.setToolTip(self.TIP)
 
-    def set_state(self, kind: str, cur: Optional[float], knob: Optional[float], caption: str = "") -> None:
-        self._kind, self._cur, self._knob, self._caption = kind, cur, knob, caption
+    def set_state(self, kind: str, cur: Optional[float], knob: Optional[float], caption: str = "",
+                  text: Optional[str] = None) -> None:
+        self._kind, self._cur, self._knob, self._caption, self._text = kind, cur, knob, caption, text
         self.update()
 
     def state(self) -> Tuple[str, Optional[float], Optional[float], str]:
         return self._kind, self._cur, self._knob, self._caption
 
+    def text(self) -> Optional[str]:
+        return self._text
+
+    def set_band(self, band: Optional[Tuple[float, float]]) -> None:
+        """Проверенный журналом диапазон (мин, макс) или None — полосы нет."""
+        self._band = (float(band[0]), float(band[1])) if band else None
+        self.update()
+
+    def band(self) -> Optional[Tuple[float, float]]:
+        return self._band
+
     def sizeHint(self) -> QSize:  # noqa: N802
-        s = int(self.fontMetrics().height() * 7.6)
+        s = int(self.fontMetrics().height() * 7.8)
         return QSize(s, s)
 
     def minimumSizeHint(self) -> QSize:  # noqa: N802
         return self.sizeHint()
 
-    def _ang(self, d: float) -> float:
-        return self.START - self.SPAN * max(0.0, min(100.0, d)) / 100.0
+    def _ang(self, v: float) -> float:
+        f = (max(self.LO, min(self.HI, v)) - self.LO) / (self.HI - self.LO)
+        return self.START - self.SPAN * f
 
     def paintEvent(self, _e) -> None:  # noqa: N802
         t = design.tokens_for(self)
@@ -239,21 +258,36 @@ class DDial(QWidget):
         c = r.center()
         rad = r.width() / 2
 
-        def at(d: float, rr: float) -> QPointF:
-            a = math.radians(self._ang(d))
+        def at(v: float, rr: float) -> QPointF:
+            a = math.radians(self._ang(v))
             return QPointF(c.x() + rr * math.cos(a), c.y() - rr * math.sin(a))
 
         pen = QPen(QColor(t.line), stroke)
         pen.setCapStyle(Qt.RoundCap)
         p.setPen(pen)
         p.drawArc(r, int(self.START * 16), int(-self.SPAN * 16))
+        # проверенная журналом зона — тонкая зелёная дуга по внутреннему краю шкалы
+        if self._band is not None:
+            b0, b1 = max(self._band[0], self.LO), min(self._band[1], self.HI)
+            if b1 > b0:
+                rb = rad - stroke * 0.5 - stroke * 0.42
+                rr = QRectF(c.x() - rb, c.y() - rb, 2 * rb, 2 * rb)
+                band = QColor(t.good)
+                band.setAlphaF(0.85)
+                bp = QPen(band, max(2.0, stroke * 0.34))
+                bp.setCapStyle(Qt.FlatCap)
+                p.setPen(bp)
+                a0, a1 = self._ang(b0), self._ang(b1)
+                p.drawArc(rr, int(round(a0 * 16)), int(round((a1 - a0) * 16)))
         tick = QPen(QColor(t.line_strong), 1.2)
         tick.setCapStyle(Qt.RoundCap)
         p.setPen(tick)
-        for d in range(0, 101, 10):
-            r1 = rad - stroke * 0.5 - stroke * 0.45
-            r2 = r1 - (stroke * 0.85 if d % 50 == 0 else stroke * 0.45)
-            p.drawLine(at(d, r1), at(d, r2))
+        n_steps = int(round((self.HI - self.LO) / self.STEP))
+        for k in range(n_steps + 1):
+            v = self.LO + k * self.STEP
+            r1 = rad - stroke * 0.5 - stroke * 0.95
+            r2 = r1 - (stroke * 0.85 if k in (0, n_steps) or k * 2 == n_steps else stroke * 0.45)
+            p.drawLine(at(v, r1), at(v, r2))
         kind, cur, knob = self._kind, self._cur, self._knob
         if kind == "change" and cur is not None and knob is not None:
             gold = QPen(QColor(t.accent), stroke)
@@ -262,12 +296,12 @@ class DDial(QWidget):
             a0, a1 = self._ang(cur), self._ang(knob)
             p.drawArc(r, int(round(a0 * 16)), int(round((a1 - a0) * 16)))
         ring = QPen(QColor(t.surface), max(1.5, stroke * 0.22))
-        if cur is not None and not (kind in ("keep", "wait") and knob is not None and abs(knob - cur) < 0.5):
+        if cur is not None and not (kind in ("keep", "wait", "hold") and knob is not None and abs(knob - cur) < 0.5):
             p.setPen(ring)
             p.setBrush(QColor(t.steel))
             p.drawEllipse(at(cur, rad), stroke * 0.45, stroke * 0.45)
         if knob is not None:
-            col = {"change": t.accent, "keep": t.good, "wait": t.steel, "info": t.steel}.get(kind, t.muted)
+            col = {"change": t.accent, "keep": t.good, "wait": t.steel, "info": t.steel, "hold": t.steel}.get(kind, t.muted)
             p.setPen(ring)
             p.setBrush(QColor(col))
             p.drawEllipse(at(knob, rad), stroke * 0.80, stroke * 0.80)
@@ -277,22 +311,27 @@ class DDial(QWidget):
         p.setFont(small)
         p.setPen(QColor(t.muted))
         fm = QFontMetricsF(small)
-        for d, txt in ((0, "0"), (100, "100")):
-            pt = at(d, rad)
+        for v in (self.LO, self.HI):
+            txt = f"{v:g}"
+            pt = at(v, rad)
             w = fm.horizontalAdvance(txt)
             p.drawText(QRectF(pt.x() - w / 2 - 2, pt.y() + stroke * 0.65, w + 4, fm.height()), Qt.AlignCenter, txt)
         # число в центре
         val = knob if knob is not None else cur
-        num = "—" if val is None or kind == "nodata" else f"{val:.0f}"
+        num = "—" if val is None or kind == "nodata" else (self._text or f"{val:.0f}")
         big = design.num_font(1.0)
-        big.setPixelSize(max(int(side * 0.27), 12))
-        fmb = QFontMetricsF(big)
         unit = QFont(self.font())
-        unit.setPixelSize(max(int(side * 0.11), 9))
-        fmu = QFontMetricsF(unit)
         show_unit = num != "—"
-        wn = fmb.horizontalAdvance(num)
-        wu = fmu.horizontalAdvance(" с") if show_unit else 0.0
+        px = side * 0.27
+        while True:                       # число с единицей — по ширине круга внутри делений («60/65 °C» мельче)
+            big.setPixelSize(max(int(px), 10))
+            unit.setPixelSize(max(int(px * 0.41), 8))
+            fmb, fmu = QFontMetricsF(big), QFontMetricsF(unit)
+            wn = fmb.horizontalAdvance(num)
+            wu = fmu.horizontalAdvance(self.UNIT) if show_unit else 0.0
+            if wn + wu <= side * 0.56 or px <= 10:
+                break
+            px *= 0.92
         base_y = c.y() + fmb.capHeight() / 2 - (fm.height() * 0.35 if self._caption else 0)
         xn = c.x() - (wn + wu) / 2
         p.setFont(big)
@@ -301,7 +340,7 @@ class DDial(QWidget):
         if show_unit:
             p.setFont(unit)
             p.setPen(QColor(t.ink2))
-            p.drawText(QPointF(xn + wn, base_y), " с")
+            p.drawText(QPointF(xn + wn, base_y), self.UNIT)
         if self._caption:
             p.setFont(small)
             p.setPen(QColor(t.ink2))
@@ -309,6 +348,20 @@ class DDial(QWidget):
             p.drawText(QRectF(c.x() - cw / 2 - 4, base_y + fm.height() * 0.35, cw + 8, fm.height()), Qt.AlignCenter,
                        self._caption)
         p.end()
+
+
+class DDial(Gauge):
+    """Шкала разгрузки D: 0…100 с."""
+    LO, HI, UNIT, STEP = 0.0, 100.0, " с", 10
+    TIP = ("Разгрузка D, с: точка — сейчас, ручка — что поставить, золотая дуга — насколько крутить. Зелёная полоса "
+           "внутри — D, при которых журнал проверил модель.")
+
+
+class TDial(Gauge):
+    """Шкала T блоков: 30…90 °C (два блока — в центре «50/55», ручка — по средней)."""
+    LO, HI, UNIT, STEP = 30.0, 90.0, " °C", 10
+    TIP = ("T блоков, °C: точка — сейчас, ручка — что поставить (оба блока), золотая дуга — насколько. Стальная ручка "
+           "без дуги — T не менять. Зелёная полоса внутри — T, при которых журнал проверил модель.")
 
 
 # ----------------------------------------------------------------------------------------------------------------

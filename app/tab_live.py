@@ -1,10 +1,12 @@
 """Раздел «Текущий проход»: что делать с разгрузкой D прямо сейчас, по свежим пробам журнала.
 
-Сверху — стеклянная карточка с одним действием («Поставьте D = 42 с», «D не менять», «Подождите до 09:30») и шкалой
-D (точка — сейчас, ручка — что поставить), под ней пять плиток с главными цифрами (выход со спарклайном проб, цель,
-приёмный силос, конец прохода с полосой выгрузки, конец партии), ниже вкладками — график проб, «что будет при
-другом D» и полный расчёт; что программа взяла из журнала и задание на проход — на вкладке «Данные прохода и
-задание». Логика совета — live.live_advice (правила работы, 7.3).
+Сверху — стеклянная карточка с одним действием («Поставьте D = 42 с и T блоков 50 °C», «D не менять», «Подождите до
+09:30») и двумя приборами — разгрузка D и T блоков (точка — сейчас, ручка — что поставить, зелёная полоса — где журнал
+проверил модель); когда совет D вне проверенного, под советом — два варианта: проверенный режим D + T блоков и только
+D. Кнопка «Записать в журнал…» открывает запись смены режима с готовыми значениями. Под карточкой — четыре плитки
+(выход с целью и спарклайном проб, приёмный силос, конец прохода с полосой выгрузки, конец партии); пояснения — во
+всплывающих подсказках и во вкладке «Расчёт подробно». Ниже вкладками — график проб, данные прохода и задание, «что
+будет при другом D» и полный расчёт. Логика совета — live.live_advice (правила работы, 7.3).
 """
 from __future__ import annotations
 
@@ -13,15 +15,16 @@ from typing import TYPE_CHECKING, Optional
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QBrush, QColor
-from PySide6.QtWidgets import (QCheckBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+                               QLabel, QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from . import model as mdl
-from .live import LiveState, live_advice, live_forecast, live_state, outlet_soon, pass_mass, zone_lines
+from .live import (LiveState, fmt_t, live_advice, live_forecast, live_state, outlet_soon, pass_mass, t_pair,
+                   zone_lines)
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import (Collapsible, Tile, dspin, fmt_hours, fnum, item, mute, set_role, size_by_current, table)
-from .widgets import DDial, Glass, Legend, ProgressLine, Sparkline
+from .widgets import DDial, Glass, Legend, ProgressLine, Sparkline, TDial
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -50,6 +53,7 @@ class LiveTab(QWidget):
 
         self.fc = None
         self.advice = None
+        self.prefer = "alt"        # совет D вне проверенного: показывать проверенный режим D + T ("alt") или только D
         # ---- вкладка «Данные прохода и задание»: что известно по журналу, задание на проход, условия ----
         setup = QWidget()
         sg = QGridLayout(setup)
@@ -180,10 +184,12 @@ class LiveTab(QWidget):
         cols[0].addWidget(b, 0, Qt.AlignLeft)
         self.hint = Collapsible(
             "Как пользоваться",
-            "1. Внесите пробу в «Журнал проб».<br>2. Посмотрите сюда: крупная строка сверху — что сделать с D.<br>"
-            "3. «Поставьте D = …» — поставьте и запишите изменение («Изменить режим…» в журнале). «D не менять» "
-            "или «Подождите» — ничего не трогайте.<br><br>Шкала слева от совета: точка — D сейчас, ручка — что "
-            "поставить, золотая дуга — насколько крутить.<br><br>Почему не чаще: зерно, уже находящееся в шахте, "
+            "1. Внесите пробу в «Журнал проб».<br>2. Посмотрите сюда: крупная строка сверху — что поставить.<br>"
+            "3. «Поставьте …» — поставьте на сушилке и нажмите «Записать в журнал…». «D не менять» или «Подождите» "
+            "— ничего не трогайте.<br><br>Приборы слева — разгрузка D и T блоков: точка — сейчас, ручка — что "
+            "поставить, золотая дуга — насколько крутить, зелёная полоса — где журнал проверил модель. Совет D "
+            "вышел за полосу — под советом два варианта: проверенный режим (D и T блоков в полосах) и только D."
+            "<br><br>Почему не чаще: зерно, уже находящееся в шахте, "
             "выходит со старой скоростью — смена D видна на выходе только через время «Заметно через …». Разница "
             "меньше 3 с — это ≈ 0,5 п.п. на выходе, на уровне точности влагомера. Подробно — «Справка» → «Правила "
             "работы», раздел 7.")
@@ -203,14 +209,33 @@ class LiveTab(QWidget):
         ch = QHBoxLayout(self.card)
         ch.setContentsMargins(gl + 10, gt + 8, gr + 16, gbm + 8)
         ch.setSpacing(14)
+        # приборы: разгрузка D и T блоков рядом, как на приборной панели
+        gauges = QHBoxLayout()
+        gauges.setSpacing(0)
         self.dial = DDial()
-        ch.addWidget(self.dial, 0, Qt.AlignVCenter)
+        self.tdial = TDial()
+        for g, cap in ((self.dial, "разгрузка D"), (self.tdial, "T блоков")):
+            gv = QVBoxLayout()
+            gv.setSpacing(0)
+            gv.addWidget(g, 0, Qt.AlignHCenter)
+            lb = set_role(QLabel(cap), "gaugeCap")
+            lb.setAlignment(Qt.AlignHCenter)
+            gv.addWidget(lb)
+            gauges.addLayout(gv)
+        ch.addLayout(gauges, 0)
         cv = QVBoxLayout()
-        cv.setSpacing(4)
+        cv.setSpacing(6)
         head = QHBoxLayout()
+        head.setSpacing(8)
         self.lbl_head = set_role(QLabel("—"), "adviceHead")
         self.lbl_head.setWordWrap(True)
         head.addWidget(self.lbl_head, 1, Qt.AlignVCenter)
+        self.btn_record = QPushButton("Записать в журнал…")
+        self.btn_record.setToolTip("Поставили этот режим на сушилке — запишите смену в журнал: время, D и T блоков, "
+                                   "комментарий «по совету». Окно покажет всё перед записью.")
+        self.btn_record.setVisible(False)
+        self.btn_record.clicked.connect(self._record)
+        head.addWidget(self.btn_record, 0, Qt.AlignVCenter)
         self.btn_go = set_role(QPushButton(), "primary")
         self.btn_go.setVisible(False)
         self.btn_go.clicked.connect(self._go)
@@ -220,6 +245,28 @@ class LiveTab(QWidget):
         self.lbl_sub.setWordWrap(True)
         self.lbl_sub.setTextFormat(Qt.RichText)
         cv.addWidget(self.lbl_sub)
+        # варианты, когда совет D вне проверенного журналом: проверенный режим D + T блоков или только D
+        self.chips_box = QWidget()
+        chl = QVBoxLayout(self.chips_box)          # друг под другом: выбор из двух и окно не шире
+        chl.setContentsMargins(0, 0, 0, 0)
+        chl.setSpacing(4)
+        self.chip_grp = QButtonGroup(self)
+        self.chip_grp.setExclusive(True)
+        self.chips = {}
+        for key, tip in (("alt", "Проверенный режим: и D, и T блоков там, где журнал проверил модель (зелёные полосы "
+                                 "на приборах). Та же цель."),
+                         ("d", "Только D по совету: больше т/ч, но такого D журнал ещё не видел — точность совета не "
+                               "проверена, смотрите пробы чаще.")):
+            b = set_role(QPushButton(), "chip")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _c=False, k=key: self._pick(k))
+            self.chip_grp.addButton(b)
+            chl.addWidget(b, 0, Qt.AlignLeft)
+            self.chips[key] = b
+        self.chips_box.setVisible(False)
+        cv.addWidget(self.chips_box)
         self.lbl_warn = set_role(QLabel(), "warn")
         self.lbl_warn.setWordWrap(True)
         self.lbl_warn.setVisible(False)
@@ -232,18 +279,19 @@ class LiveTab(QWidget):
         tiles.setContentsMargins(gl, 0, gr, 0)
         tiles.setSpacing(8)
         self.t_out = Tile("Выход, влагомер")
+        self.lbl_goal = set_role(QLabel(""), "tileAside")         # цель на влагомере — рядом с последней пробой
+        self.t_out.value_row.insertWidget(1, self.lbl_goal, 0, Qt.AlignBottom)
         self.spark = Sparkline()
         self.spark.setToolTip("Пробы выхода этого прохода, цель на влагомере (пунктир) и прогноз по зерну, которое уже "
                               "в шахте (бледный пунктир).")
         self.t_out.set_below(self.spark)
-        self.t_goal = Tile("Цель на влагомере")
         self.t_silo = Tile("Приёмный силос")
         self.t_pass = Tile("Конец прохода")
         self.pass_bar = ProgressLine()
         self.pass_bar.setToolTip("Сколько массы прохода уже выгружено.")
         self.t_pass.set_below(self.pass_bar)
         self.t_batch = Tile("Конец партии")
-        self.tiles = (self.t_out, self.t_goal, self.t_silo, self.t_pass, self.t_batch)
+        self.tiles = (self.t_out, self.t_silo, self.t_pass, self.t_batch)
         for t in self.tiles:
             tiles.addWidget(t, 1)
         rv.addLayout(tiles)
@@ -330,13 +378,15 @@ class LiveTab(QWidget):
         self.cb_now.blockSignals(True)
         self.cb_now.setChecked(bool(d.get("now", True)))
         self.cb_now.blockSignals(False)
+        self.prefer = "d" if d.get("prefer") == "d" else "alt"
 
     def _save(self) -> None:
         self.win.storage.set_json("ui_live", {
             "m_pass": self.m_pass.value(), "w_target": self.w_target.value(), "wk": self.wk_final.value(),
             "t_amb": self.t_amb.value(), "rh": self.rh.value(), "corr": self.cb_corr.isChecked(),
             "silo": self.cb_silo.isChecked(), "silo_lim": self.silo_lim.value(), "npass": self.npass.value(),
-            "m_auto": self.cb_mauto.isChecked(), "now": self.cb_now.isChecked(), "batch_src": self._batch_src})
+            "m_auto": self.cb_mauto.isChecked(), "now": self.cb_now.isChecked(), "batch_src": self._batch_src,
+            "prefer": self.prefer})
 
     def _weather(self) -> None:
         ws = self.win.weather_series()
@@ -490,21 +540,47 @@ class LiveTab(QWidget):
         self.lbl_state.setText(msg)
         self.lbl_state.setVisible(bool(msg))
 
+    def _pick(self, key: str) -> None:
+        """Вариант режима выбран кнопкой под советом: запоминается (решение инженера держится и после перезапуска)."""
+        if key != self.prefer:
+            self.prefer = key
+            self._save()
+            self.recalc()
+
+    def _record(self) -> None:
+        """«Записать в журнал…»: окно смены режима с D и T блоков из совета."""
+        adv = self.advice or {}
+        rec = adv.get("record")
+        if not rec:
+            return
+        comment = "по совету, проверенный режим" if adv.get("option") == "alt" else "по совету"
+        if self.win.record_regime(rec, comment):
+            self.refresh()
+
     def _show_advice(self, adv: dict) -> None:
-        """Стеклянная карточка с одним действием: оттенок по смыслу (золото — поставить D, зелень — не менять,
-        сталь — подождать или сведения), шкала D слева, предупреждения — отдельной строкой."""
+        """Стеклянная карточка с одним действием: оттенок по смыслу (золото — поставить, зелень — не менять, сталь —
+        подождать или сведения), приборы D и T блоков слева, варианты режима и предупреждения — под советом."""
         self.advice = adv
         kind = adv["kind"]
         self.card.set_tint(self.TINT.get(kind))
         self.lbl_head.setText(adv["head"])
-        # режим D + T в проверенной зоне — отдельной жирной строкой (v1.5)
-        self.lbl_sub.setText("<br>".join(f"<b>{x}</b>" if x.startswith("Проверенный режим") else x for x in adv["sub"]))
+        self.lbl_sub.setText("<br>".join(adv["sub"]))
         self.lbl_warn.setText("<br>".join(f"⚠ {w}" for w in adv["warn"]))
         self.lbl_warn.setVisible(bool(adv["warn"]))
         go = adv.get("go")
         self.btn_go.setVisible(bool(go))
         if go:
             self.btn_go.setText(f"Открыть «{go}»")
+        self.btn_record.setVisible(kind == "change" and bool(adv.get("record")))
+        opts = {o["key"]: o for o in adv.get("options") or []}
+        both = "alt" in opts and "d" in opts
+        self.chips_box.setVisible(both)
+        if both:
+            a, d = opts["alt"], opts["d"]
+            self.chips["alt"].setText(f"Проверенный: D {a['d']:.0f} с, T {fmt_t(a['t'])} °C · {a['q']:.1f} т/ч")
+            self.chips["d"].setText(f"Только D {d['d']:.0f} с · {d['q']:.1f} т/ч · не проверено")
+            self.chips[adv.get("option") or "alt"].setChecked(True)
+        self._show_t(kind, adv)
         d_now, d_rec = adv.get("d_now"), adv.get("d_rec")
         if kind == "change":
             self.dial.set_state("change", d_now, d_rec, f"было {d_now:.0f}" if d_now is not None else "")
@@ -520,7 +596,30 @@ class LiveTab(QWidget):
         else:
             self.dial.set_state("nodata", d_now, None, "нет данных")
 
+    def _show_t(self, kind: str, adv: dict) -> None:
+        """Прибор T блоков: ручка — что поставить (оба блока, «50/55»), без дуги — T не менять."""
+        t_now, t_rec = adv.get("t_now"), adv.get("t_rec")
+        if t_now is None or kind == "nodata":
+            self.tdial.set_state("nodata", None, None, "нет данных")
+            return
+
+        def mid(t):
+            return 0.5 * (t[0] + t[1])
+        if kind == "change" and t_rec:
+            self.tdial.set_state("change", mid(t_now), mid(t_rec), f"было {fmt_t(t_now)}", text=fmt_t(t_rec))
+        elif kind == "keep":
+            self.tdial.set_state("keep", mid(t_now), mid(t_now), "не менять", text=fmt_t(t_now))
+        elif kind == "wait":
+            until = adv.get("until")
+            self.tdial.set_state("wait", mid(t_now), mid(t_now), f"до {until:%H:%M}" if until else "подождать",
+                                 text=fmt_t(t_now))
+        elif kind == "change":
+            self.tdial.set_state("hold", mid(t_now), mid(t_now), "не менять", text=fmt_t(t_now))
+        else:
+            self.tdial.set_state("info", mid(t_now), mid(t_now), "", text=fmt_t(t_now))
+
     def _clear_tiles(self) -> None:
+        self.lbl_goal.setText("")
         for t in self.tiles:
             t.set("—")
         self.spark.set_data([], [])
@@ -530,6 +629,9 @@ class LiveTab(QWidget):
     def recalc(self) -> None:
         p = self.win.params
         th = theme_for(self)
+        zone = mdl.explored_zone(p)                 # зелёные полосы приборов — где журнал проверил модель
+        self.dial.set_band(zone["d"] if zone else None)
+        self.tdial.set_band(zone["t"] if zone and p.temp_source == "block" else None)
         tg_now = self.state.t_grain if self.state is not None else None
         target_read = mdl.read_from_true(p, self.w_target.value(), tg_now)
         self.lbl_target_read.setText(f"После охлаждения, как в лаборатории. На выходном влагомере это "
@@ -625,7 +727,7 @@ class LiveTab(QWidget):
         for wtxt in fc.warnings:
             lines.append(f"<span style='color:{th.error}'>⚠ {wtxt}.</span>")
         self.summary.setText("<br>".join(lines))
-        self._show_advice(live_advice(p, st, fc, d_try, now=datetime.now()))
+        self._show_advice(live_advice(p, st, fc, d_try, now=datetime.now(), prefer=self.prefer))
         self._fill_tiles(p, st, fc, target_read)
         if not keep:
             self._table(p, st, fc, c, d_use, now, th, target_read)
@@ -635,16 +737,23 @@ class LiveTab(QWidget):
 
     def _fill_tiles(self, p, st, fc, target_read: float) -> None:
         goal_read = mdl.read_from_true(p, fc.w_goal, st.t_grain)
+        self.lbl_goal.setText(f"цель {goal_read:.1f} %")
+        silo_txt = ""
+        if abs(fc.w_goal - self.w_target.value()) >= 0.05:
+            silo_txt = (f" Чтобы средняя по приёмному силосу вышла {self.w_target.value():g} %, зерну, которое входит "
+                        f"сейчас, нужно {fc.w_goal:.1f} % после охлаждения — цель поправлена.")
+        tip = ("Последняя проба выходного влагомера (как показал прибор) и цель прохода в его показаниях (поправка на "
+               f"горячее зерно — «Погода и влагомер»).{silo_txt} «Через 1 ч» — прогноз по зерну, которое уже в шахте "
+               "(со всеми режимами, при которых оно шло). График — пробы выхода этого прохода, цель (пунктир) и "
+               "прогноз (бледный пунктир).")
         if st.w_out_read is not None:
             dev = st.w_out_read - goal_read
             soon = "" if st.recirc else self._soon(p, st, fc, (1.0,))   # при рециркуляции прогноз подачи ни к чему
-            when = f", проба {st.last_sample:%H:%M}" if st.last_sample else ""
+            when = f" · проба {st.last_sample:%H:%M}" if st.last_sample else ""
             self.t_out.set(f"{st.w_out_read:.1f} %", f"{dev:+.1f} п.п. к цели{when}" + (f"\n{soon}" if soon else ""),
-                           "Последняя проба выходного влагомера (как показал прибор) и её отличие от цели прохода на "
-                           "влагомере; «через 1 ч» — прогноз по зерну, которое уже в шахте (со всеми режимами, при "
-                           "которых оно шло). График — пробы выхода этого прохода, цель и прогноз.")
+                           tip)
         else:
-            self.t_out.set("—", "проб выхода ещё нет")
+            self.t_out.set("—", "проб выхода ещё нет", tip)
         # спарклайн: последние 12 проб выхода этого прохода, цель, прогноз на 2 ч
         pts = [(t, wo) for t, _wi, wo in st.series if wo is not None][-12:]
         if len(pts) >= 2:
@@ -662,11 +771,6 @@ class LiveTab(QWidget):
             self.spark.set_data(xs, ys, goal_read, fx, fy)
         else:
             self.spark.set_data([], [])
-        sub = f"после охлаждения {self.w_target.value():g} %"
-        if abs(fc.w_goal - self.w_target.value()) >= 0.05:
-            sub = f"чтобы в силосе вышло {self.w_target.value():g} %, сейчас нужно {fc.w_goal:.1f} %"
-        self.t_goal.set(f"{goal_read:.1f} %", sub, "С чем сравнивать выходной влагомер: цель прохода в его показаниях "
-                                                 "(поправка на горячее зерно — «Погода и влагомер»).")
         sl = fc.silo
         at = st.end or st.last
         live = self.cb_now.isChecked() and st.end is not None and st.end > st.last
@@ -674,7 +778,7 @@ class LiveTab(QWidget):
         froze = (f"\nнет записей с {st.last:%H:%M} — счёт остановлен на {at:%H:%M}" if st.frozen else "")
         if st.silo_w is not None:
             self.t_silo.set(f"{st.silo_w:.1f} %",
-                            f"{st.unloaded:.0f} т" + (f", к концу прохода ≈ {sl['avg']:.1f} %"
+                            f"{st.unloaded:.0f} т" + (f" · к концу ≈ {sl['avg']:.1f} %"
                                                      if sl and not st.recirc else "") + froze,
                             "Средняя по массе влажность всего, что ушло в приёмный силос с начала прохода (истинная, "
                             "с поправкой влагомера), и ожидаемая к концу прохода. В реальном времени масса растёт "
@@ -689,10 +793,11 @@ class LiveTab(QWidget):
                             "занижена — проверьте её на вкладке «Данные прохода и задание».")
             self.pass_bar.set_value(1.0)
         elif fc.pass_end:
-            rem = f"выгружено {st.unloaded:.0f} из {fc.m_out_pass:.0f} т, осталось {fc.remaining:.0f} т"
+            rem = f"осталось {fc.remaining:.0f} из {fc.m_out_pass:.0f} т"
             self.t_pass.set(f"{fc.pass_end:%d.%m %H:%M}", f"{rem}\n{when}{froze}",
-                            "Когда закончится выгрузка массы этого прохода при советуемом D. Полоса — сколько уже "
-                            "выгружено (в реальном времени — до текущего момента, обновляется каждые 30 с).")
+                            f"Когда закончится выгрузка массы этого прохода при советуемом D. Выгружено "
+                            f"{st.unloaded:.0f} т. Полоса — сколько уже выгружено (в реальном времени — до текущего "
+                            f"момента, обновляется каждые 30 с).")
             self.pass_bar.set_value(st.unloaded / fc.m_out_pass if fc.m_out_pass > 0 else None)
         else:
             self.t_pass.set("—")

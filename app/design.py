@@ -419,6 +419,12 @@ QFrame#tile {{ background: {t.surface}; border: 1px solid {t.line}; border-radiu
 QLabel[role="tileTitle"] {{ color: {t.ink2}; }}
 QLabel[role="tileValue"] {{ {num} font-size: {base_pt + 7:.1f}pt; color: {t.ink}; }}
 QLabel[role="tileSub"] {{ color: {t.muted}; }}
+QLabel[role="tileAside"] {{ color: {t.ink2}; padding-bottom: 3px; }}
+QLabel[role="gaugeCap"] {{ color: {t.ink2}; }}
+QPushButton[role="chip"] {{ background: {t.surface}; color: {t.ink2}; border: 1px solid {t.line}; border-radius: 13px;
+                           padding: 4px 12px; text-align: left; }}
+QPushButton[role="chip"]:hover {{ border-color: {t.line_strong}; color: {t.ink}; }}
+QPushButton[role="chip"]:checked {{ background: {t.accent_tint}; color: {t.ink}; border-color: {t.accent_edge}; }}
 QLabel[role="adviceHead"] {{ {num} font-size: {base_pt + 10:.1f}pt; color: {t.ink}; }}
 QLabel[role="adviceSub"] {{ color: {t.ink2}; font-size: {base_pt + 0.5:.1f}pt; }}
 QLabel[role="warn"] {{ color: {t.rust_ink if not t.dark else t.rust}; font-weight: 600; }}

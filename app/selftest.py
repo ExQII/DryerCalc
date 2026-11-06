@@ -294,8 +294,11 @@ def run(out_path: str) -> int:
         win.tab_live.refresh()
         _adv = win.tab_live.advice or {}
         check(bool(_adv.get("head")) and win.tab_live.lbl_head.text() == _adv["head"]
-              and win.tab_live.t_pass.lbl_value.text() not in ("", "—") and _nav.lbl_title.text() == _pages.LIVE,
-              f"«{_pages.LIVE}»: «{_adv.get('head', '?')}», конец прохода {win.tab_live.t_pass.lbl_value.text()}")
+              and win.tab_live.t_pass.lbl_value.text() not in ("", "—") and _nav.lbl_title.text() == _pages.LIVE
+              and win.tab_live.dial.state()[0] != "nodata" and win.tab_live.tdial.state()[0] != "nodata"
+              and len(win.tab_live.tiles) == 4,
+              f"«{_pages.LIVE}»: «{_adv.get('head', '?')}», приборы D {win.tab_live.dial.state()[2]} с и T блоков "
+              f"{win.tab_live.tdial.text()} °C, конец прохода {win.tab_live.t_pass.lbl_value.text()}")
         from .live import outlet_soon as _soon
         _fc = win.tab_live.fc
         _txt = _soon(win.params, win.tab_live.state, _fc) if _fc is not None else ""
@@ -433,7 +436,8 @@ def run(out_path: str) -> int:
         _f8 = _lf(_p8, _c7, _s7, 300.0, 23.5, 14.0, 6.0, 10.0)
         check(_f7.d_out_of_zone and bool(_alt) and 31.0 <= _alt["d"] <= 39.0 and _alt["dt"] < 0
               and abs(_alt["w_out"] - _alt["w_goal"]) <= _tol + 1e-9
-              and any(x.startswith("Проверенный режим") for x in _a7["sub"]) and _f8.alt is None and "ниже" in _f8.alt_reason,
+              and _a7["option"] == "alt" and "T блоков" in _a7["head"] and _a7["t_rec"] == (_alt["t_up"], _alt["t_low"])
+              and _f8.alt is None and "ниже" in _f8.alt_reason,
               f"совет D = {_f7.d_rec:.0f} с вне проверенного (D 33–37 с): проверенный режим D = {_alt.get('d', 0):.0f} с и "
               f"T блоков {_alt.get('t_up', 0):.0f}/{_alt.get('t_low', 0):.0f} °C; журнал знает только T 55–62 °C — "
               f"режима нет ({_f8.alt_reason})")

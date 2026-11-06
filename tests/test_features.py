@@ -863,7 +863,8 @@ def test_live_advice_follows_operating_rules():
     assert abs(keep.d_rec - st.d) < D_STEP_MIN and a["kind"] == "keep" and a["head"] == "D не менять — 35 с"
     far = live_forecast(P, c, st, 400.0, base.w_out_now + 3.0, 14.0, 6.0, 10.0)
     a = live_advice(P, st, far)
-    assert a["kind"] == "change" and a["head"] == f"Поставьте D = {far.d_rec:.0f} с" and "Изменить режим" in " ".join(a["sub"])
+    assert a["kind"] == "change" and a["head"] == f"Поставьте D = {far.d_rec:.0f} с" and a["record"] == {"d": far.d_rec}
+    assert "видно к" in a["sub"][0] and a["t_rec"] is None and a["options"] == [] and a["option"] is None
     # D поменяли в 13:30 (35 → 45): до 13:30 + τ(45)/2 — «подождите», потом — обычный совет
     st2 = live_state(_live_rows(d_late=45, change_at="13:30"), P)
     t_ch = datetime(2026, 10, 25, 13, 30)
@@ -1764,7 +1765,7 @@ def test_live_tab_real_time_tiles_and_auto_mass():
     assert lt.cb_mauto.isChecked() and not lt.m_pass.isEnabled() and abs(lt.m_pass.value() - m_exp) <= 0.5   # до тонны
     assert "«План сушки партии»" in lt.lbl_mass.text()
     assert lt.cb_now.isChecked() and s.end > s.last and not s.frozen
-    assert "выгружено" in lt.t_pass.lbl_sub.text() and "осталось" in lt.t_pass.lbl_sub.text()
+    assert "осталось" in lt.t_pass.lbl_sub.text() and " из " in lt.t_pass.lbl_sub.text()
     assert f"на {s.end:%H:%M}" in lt.t_pass.lbl_sub.text()
     n_items = len(lt.plot.plotItem.items)
     lt._tick()
@@ -1895,12 +1896,20 @@ def test_verified_regime_when_d_advice_leaves_zone():
     if abs(t_prev - st.t_proc) > 1e-9:
         d_prev = d_for_target(p, Conditions(t_prev, c.t_amb, c.rh), st.w_in, alt["w_goal"] - st.corr)
         assert d_prev > hi
-    # совет: D прежний, ниже — проверенный режим; предупреждение — совет D вне проверенного
-    assert a["kind"] == "change" and a["head"] == f"Поставьте D = {fc.d_rec:.0f} с" and a["alt"] is alt
-    assert any(x.startswith("Проверенный режим: D = ") and f"{alt['t_up']:.0f}/{alt['t_low']:.0f} °C" in x
-               for x in a["sub"])
-    assert any("дальше, чем журнал проверил модель (D 33–37 с" in w for w in a["warn"])
-    # «Подождите»: тот же режим — на после окончания ожидания
+    # совет (по правилам 7.3.8 — проверенный режим, если инженер не выбрал иначе): D и T блоков, варианты, запись
+    from app.live import fmt_t, live_advice
+    t_alt = (alt["t_up"], alt["t_low"])
+    assert a["kind"] == "change" and a["option"] == "alt" and a["alt"] is alt
+    assert a["head"] == f"Поставьте D = {alt['d']:.0f} с и T блоков {fmt_t(t_alt)} °C"
+    assert a["d_rec"] == alt["d"] and a["t_rec"] == t_alt and a["t_now"] == (60, 60)
+    assert a["record"] == {"d": alt["d"], "t_up": alt["t_up"], "t_low": alt["t_low"]}
+    assert [o["key"] for o in a["options"]] == ["alt", "d"] and a["options"][1]["d"] == fc.d_rec
+    assert not any("вне проверенного" in w for w in a["warn"]) and len(a["sub"]) == 1
+    # выбран «только D»: совет D и предупреждение
+    a_d = live_advice(p, st, fc, prefer="d")
+    assert a_d["option"] == "d" and a_d["head"] == f"Поставьте D = {fc.d_rec:.0f} с" and a_d["t_rec"] is None
+    assert any(w.startswith(f"D {fc.d_rec:.0f} с — вне проверенного журналом") for w in a_d["warn"])
+    # подробный расчёт: строки про зону («Подождите» — режим на после окончания ожидания)
     from datetime import datetime as _dt
     sub, _w = zone_lines(fc, _dt(2026, 11, 3, 12, 5))
     assert sub[0].startswith("Проверенный режим после 12:05: D = ")
@@ -1914,14 +1923,14 @@ def test_verified_regime_more_drying_and_limits():
     # T зерна (замер 32 °C + наклон по журналу) упирается в ограничение
     p2, st2, c2, fc2, a2 = _zone_case(target=19.0, t_grain_max=34.5)
     assert fc2.alt is None and "T зерна" in fc2.alt_reason and "34.5" in fc2.alt_reason
-    assert any(w.startswith("Проверенного режима D + T блоков с той же целью нет: T зерна") for w in a2["warn"])
+    assert a2["option"] == "d" and any("Проверенного D + T нет: T зерна" in w for w in a2["warn"])
     p3, st3, c3, fc3, a3 = _zone_case(target=19.0, t_agent_max=62.0)
     assert fc3.alt is None and "ограничения 62 °C" in fc3.alt_reason
     # журнал проверил только T 55–62 °C: снижать T дальше 53 °C нельзя
     p4, st4, c4, fc4, a4 = _zone_case(explored_t=(55.0, 62.0))
     assert fc4.d_out_of_zone and fc4.alt is None and "ниже 53 °C" in fc4.alt_reason
-    assert any("Такого режима сушилка ещё не видела" in w for w in a4["warn"])
-    assert not any(x.startswith("Проверенный режим") for x in a4["sub"])
+    assert any("Проверенного D + T нет: T блоков пришлось бы ниже 53 °C" in w for w in a4["warn"])
+    assert a4["option"] == "d" and a4["head"] == f"Поставьте D = {fc4.d_rec:.0f} с" and a4["t_rec"] is None
 
 
 def test_verified_regime_not_shown_inside_zone_or_without_block_temps():
@@ -1931,7 +1940,7 @@ def test_verified_regime_not_shown_inside_zone_or_without_block_temps():
     assert fc.d_out_of_zone            # 40 с при изученных 33–37 (запас 2 с) — вне
     p, st, c, fc, a = _zone_case(target=21.7, explored={"d": [33.0, 40.0], "t": [40.0, 70.0], "w": [20.0, 30.0]})
     assert fc.zone and not fc.d_out_of_zone and fc.alt is None and zone_lines(fc) == ([], [])
-    assert not any("журнал проверил" in w for w in a["warn"]) and not any("Проверенный" in x for x in a["sub"])
+    assert not any("проверенного" in w for w in a["warn"]) and a["options"] == [] and a["option"] is None
     p, st, c, fc, a = _zone_case(temp_source="grain")
     assert not fc.d_out_of_zone and fc.alt is None
     p, st, c, fc, a = _zone_case()
@@ -1959,11 +1968,30 @@ def test_live_tab_shows_verified_regime():
     for _ in range(5):
         app.processEvents()
     lt = win.tab_live
-    assert lt.fc is not None and lt.fc.alt is not None
-    assert "<b>Проверенный режим: D = " in lt.lbl_sub.text()
-    assert "дальше, чем журнал проверил модель" in lt.lbl_warn.text() and lt.lbl_head.text().startswith("Поставьте D")
+    alt = lt.fc.alt
+    assert lt.fc is not None and alt is not None and lt.prefer == "alt"
+    # приборы: D и T блоков — ручки на проверенном режиме, зелёные полосы — изученное с запасом
+    assert lt.dial.state()[:3] == ("change", 35.0, alt["d"]) and lt.dial.band() == (31.0, 39.0)
+    assert lt.tdial.state() == ("change", 60.0, alt["t"], "было 60") and lt.tdial.band() == (18.0, 72.0)
+    assert lt.tdial.text() == f"{alt['t_up']:.0f}" and "T блоков" in lt.lbl_head.text()
+    # варианты под советом; «Записать в журнал…» — с режимом из совета
+    assert lt.chips_box.isVisibleTo(lt) and lt.chips["alt"].isChecked() and "не проверено" in lt.chips["d"].text()
+    got = []
+    win.record_regime = lambda values, comment="": got.append((values, comment)) or False
+    assert lt.btn_record.isVisibleTo(lt)
+    lt.btn_record.click()
+    assert got == [({"d": alt["d"], "t_up": alt["t_up"], "t_low": alt["t_low"]}, "по совету, проверенный режим")]
+    lt.chips["d"].click()                            # инженер выбрал «только D» — запомнено
+    assert lt.prefer == "d" and stg.get_json("ui_live")["prefer"] == "d"
+    assert lt.lbl_head.text() == f"Поставьте D = {lt.fc.d_rec:.0f} с" and lt.tdial.state()[0] == "hold"
+    assert "вне проверенного журналом" in lt.lbl_warn.text() and lt.chips["d"].isChecked()
+    lt.btn_record.click()
+    assert got[-1] == ({"d": lt.fc.d_rec}, "по совету")
+    # подробный расчёт — с пределами проверенного и обоими вариантами
     assert "Журнал проверил модель при D 33–37 с и T блоков 20–70 °C" in lt.summary.text()
     assert "<b>Проверенный режим: D = " in lt.summary.text()
+    # четыре плитки: цель — рядом с последней пробой выхода
+    assert len(lt.tiles) == 4 and lt.lbl_goal.text().startswith("цель ")
     win.close()
 
 
