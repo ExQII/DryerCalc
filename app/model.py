@@ -645,12 +645,30 @@ def struct_sigma(p: DryerParams, dw_main: float, dw_other: float) -> float:
     return 0.5 * max(delta - p.struct_base, 0.0)
 
 
+EXPLORED_MARGIN = {"d": 2.0, "t": 2.0, "w": 1.0}   # запас к изученным диапазонам: D, с; T, °C; W, п.п.
+
+
+def explored_zone(p: DryerParams) -> Optional[Dict[str, Tuple[float, float]]]:
+    """Проверенная журналом зона режима: {"d": (мин, макс), "t": (мин, макс)} — изученные калибровкой диапазоны D и
+    T блоков с запасом EXPLORED_MARGIN. Внутри неё прогноз модели проверен журналом (вне обучения ±0,4–0,5 п.п. на
+    ноябрьском журнале), за её пределами точность не проверена. None — модель не калибровалась по журналу."""
+    ex = p.explored or {}
+    try:
+        d = (float(ex["d"][0]) - EXPLORED_MARGIN["d"], float(ex["d"][1]) + EXPLORED_MARGIN["d"])
+        t = (float(ex["t"][0]) - EXPLORED_MARGIN["t"], float(ex["t"][1]) + EXPLORED_MARGIN["t"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return {"d": d, "t": t, "d_ex": (float(ex["d"][0]), float(ex["d"][1])),
+            "t_ex": (float(ex["t"][0]), float(ex["t"][1]))}
+
+
 def explored_flags(p: DryerParams, d_vals: Sequence[float], t_vals: Sequence[float], w_vals: Sequence[float]) -> List[str]:
     """Что выходит за изученные журналом диапазоны (с небольшим запасом)."""
     ex = p.explored or {}
     out: List[str] = []
-    for key, vals, unit, margin, name in (("d", d_vals, " с", 2.0, "D"), ("t", t_vals, " °C", 2.0, "T блоков"),
-                                          ("w", w_vals, " %", 1.0, "W вх")):
+    for key, vals, unit, margin, name in (("d", d_vals, " с", EXPLORED_MARGIN["d"], "D"),
+                                          ("t", t_vals, " °C", EXPLORED_MARGIN["t"], "T блоков"),
+                                          ("w", w_vals, " %", EXPLORED_MARGIN["w"], "W вх")):
         rng = ex.get(key)
         if not rng or not vals:
             continue

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QCheckBox, QFormLayout, QFrame, QGridLayout, QGro
                                QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from . import model as mdl
-from .live import LiveState, live_advice, live_forecast, live_state, outlet_soon, pass_mass
+from .live import LiveState, live_advice, live_forecast, live_state, outlet_soon, pass_mass, zone_lines
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import (Collapsible, Tile, dspin, fmt_hours, fnum, item, mute, set_role, size_by_current, table)
@@ -497,7 +497,8 @@ class LiveTab(QWidget):
         kind = adv["kind"]
         self.card.set_tint(self.TINT.get(kind))
         self.lbl_head.setText(adv["head"])
-        self.lbl_sub.setText("<br>".join(adv["sub"]))
+        # режим D + T в проверенной зоне — отдельной жирной строкой (v1.5)
+        self.lbl_sub.setText("<br>".join(f"<b>{x}</b>" if x.startswith("Проверенный режим") else x for x in adv["sub"]))
         self.lbl_warn.setText("<br>".join(f"⚠ {w}" for w in adv["warn"]))
         self.lbl_warn.setVisible(bool(adv["warn"]))
         go = adv.get("go")
@@ -584,6 +585,14 @@ class LiveTab(QWidget):
             change = "оставить как есть" if abs(fc.d_rec - st.d) < 0.5 else f"было {st.d:.0f}"
             lines.append(f"Для {goal_txt} % на выходе: <b>D = {fc.d_rec:.0f}</b> ({change}); "
                          f"ожидается {fc.w_out_rec:.1f} % (влагомер {mdl.read_from_true(p, fc.w_out_rec, st.t_grain):.1f} %).")
+        if fc.zone and not d_try and p.temp_source == "block":
+            dlo, dhi = fc.zone["d_ex"]
+            tlo, thi = fc.zone["t_ex"]
+            z_sub, z_warn = zone_lines(fc)
+            lines.extend(f"<span style='color:{th.error}'>⚠ {x}</span>" for x in z_warn)
+            lines.extend(f"<b>{x}</b>" for x in z_sub)
+            lines.append(f"<span style='color:{th.muted}'>Журнал проверил модель при D {dlo:.0f}–{dhi:.0f} с и T блоков "
+                         f"{tlo:.0f}–{thi:.0f} °C: внутри этих пределов прогноз проверен, за ними — нет.</span>")
         if sl and not sl["short"]:
             lines.append(f"Ожидаемая средняя влажность приёмного силоса после прохода: <b>{sl['avg']:.1f} %</b>.")
         if fc.d_note:

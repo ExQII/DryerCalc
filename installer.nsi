@@ -16,7 +16,7 @@ RequestExecutionLevel user
 !define APPNAME "DryerCalc"
 !define APPTITLE "DryerCalc — расчёт сушки кукурузы"
 !ifndef VERSION
-  !define VERSION "1.4.2"
+  !define VERSION "1.5.0"
 !endif
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
 

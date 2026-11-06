@@ -22,9 +22,10 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -45,6 +46,8 @@ class LiveState:
     w_out_read: Optional[float] = None
     d: Optional[float] = None
     t_proc: Optional[float] = None
+    t_up: Optional[float] = None         # уставки T блоков (верх / низ), последние записанные, °C
+    t_low: Optional[float] = None
     t_grain: Optional[float] = None
     t_amb: Optional[float] = None
     rh: Optional[float] = None
@@ -140,6 +143,10 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         tp = _t_proc(r, p.temp_source)
         if tp is not None:
             st.t_proc = tp
+        if r.get("t_up_f") is not None:
+            st.t_up = r["t_up_f"]
+        if r.get("t_low_f") is not None:
+            st.t_low = r["t_low_f"]
         if r.get("t_a1") is not None and r.get("t_a2") is not None:
             st.t_grain = 0.5 * (r["t_a1"] + r["t_a2"])
         if r.get("t_amb") is not None:
@@ -364,7 +371,96 @@ class LiveForecast:
     transit: Optional[Dict] = None         # что выйдет из шахты в ближайшие часы при выбранном D (transit_profile)
     overrun: bool = False                  # выгружено больше расчётной массы прохода, а подача идёт («рециркуляции»
     #                                        в журнале нет): масса на входе занижена, конец прохода неизвестен
+    zone: Optional[Dict] = None            # проверенная журналом зона D и T блоков (model.explored_zone)
+    d_out_of_zone: bool = False            # совет D — за пределами проверенного журналом D
+    alt: Optional[Dict] = None             # режим D + T блоков в проверенной зоне, дающий ту же цель (verified_regime)
+    alt_reason: str = ""                   # почему такого режима нет (если совет D вне зоны, а alt не найден)
     warnings: List[str] = field(default_factory=list)
+
+
+T_STEP = 5.0          # шаг уставки T блоков, °C: так их ставят на пульте и пишут в журнал
+T_STEPS_MAX = 8       # дальше ±40 °C от текущей T режим D + T не ищется
+ALT_TOL = 0.3         # D на краю зоны годится, если выход отличается от цели не больше чем на 0,3 п.п.
+
+
+def verified_regime(p: mdl.DryerParams, st: LiveState, c: mdl.Conditions, fc: "LiveForecast",
+                    settle: Callable[[mdl.Conditions, Optional[float]], Tuple[float, float, str, float, Optional[Dict]]],
+                    corr: float) -> None:
+    """Режим D + T блоков в проверенной журналом зоне (v1.5). Заполняет fc.zone, fc.d_out_of_zone, fc.alt,
+    fc.alt_reason.
+
+    Совет D выходит за изученный калибровкой диапазон D (с запасом model.EXPLORED_MARGIN) — прогноз при таком D
+    журналом не проверен. Тогда ищется режим, который даёт ту же цель прохода (с тем же выравниванием силоса), но оба
+    параметра которого внутри проверенной зоны: уставки ОБОИХ блоков сдвигаются на одинаковый шаг T_STEP в ту
+    сторону, что приближает D к зоне (совет D выше зоны — сушки слишком много, T ниже; ниже зоны — T выше), и D
+    подбирается заново (settle — та же функция, что для совета D). Берётся самый малый сдвиг T, при котором D попадает
+    в зону; T блоков при этом — в изученном диапазоне, не выше ограничения T блоков, T зерна — не выше ограничения.
+    Если при этой T нужный D чуть за краем зоны, а D на краю даёт выход в пределах ALT_TOL от цели, — D на краю
+    (меньший сдвиг T и больше т/ч); если между соседними уставками нужный D перескакивает зону — тоже край. Выход в
+    таких случаях показывается честно, с отличием от цели (approx). Не нашлось — причина в fc.alt_reason.
+
+    Почему так: на журнале ноября 2026 влияние T блоков модель предсказывает вне обучения так же точно, как влияние D
+    (±0,4–0,5 п.п.; модель без T — ±0,9), поэтому режим D + T внутри зоны — проверенный, а совет D вне зоны — нет.
+    Основной совет D остаётся: режим D + T — проверенный вариант рядом с ним."""
+    zone = mdl.explored_zone(p)
+    fc.zone = zone
+    if zone is None or p.temp_source != "block" or st.t_proc is None or st.w_in is None:
+        return
+    d_lo, d_hi = zone["d"]
+    t_lo, t_hi = zone["t"]
+    if d_lo <= fc.d_rec <= d_hi:
+        return
+    fc.d_out_of_zone = True
+    sign = -1.0 if fc.d_rec > d_hi else 1.0
+    up = st.t_up if st.t_up is not None else st.t_proc
+    low = st.t_low if st.t_low is not None else st.t_proc
+    tg_now = st.t_grain if st.t_grain is not None else mdl.grain_temp(p, st.t_proc, st.w_in)
+    reason = ""
+    d_k = fc.d_rec
+    for k in range(1, T_STEPS_MAX + 1):
+        dt = sign * T_STEP * k
+        t_k = st.t_proc + dt
+        if (sign < 0 and t_k < t_lo - 1e-9) or (sign > 0 and t_k > t_hi + 1e-9):
+            reason = (f"для этого T блоков пришлось бы {'опустить ниже' if sign < 0 else 'поднять выше'} "
+                      f"{t_lo if sign < 0 else t_hi:.0f} °C, а такой T журнал не проверял")
+            break
+        if not (t_lo - 1e-9 <= t_k <= t_hi + 1e-9):
+            continue                      # текущая T сама вне зоны: идём дальше в ту же сторону, к зоне
+        if p.t_agent_max and t_k > p.t_agent_max + 1e-9:
+            reason = f"T блоков пришлось бы поднять выше ограничения {p.t_agent_max:g} °C"
+            break
+        tg_k = tg_now + p.tg_b * dt
+        if p.t_grain_max and tg_k > p.t_grain_max + 1e-9:
+            reason = f"T зерна стала бы ≈ {tg_k:.1f} °C — выше ограничения {p.t_grain_max:g} °C"
+            break
+        c_k = mdl.Conditions(t_k, c.t_amb, c.rh)
+        d_k, _raw, note_k, goal_k, sl_k = settle(c_k, None)
+        approx = False
+        if not note_k and d_lo <= d_k <= d_hi:
+            pass
+        elif (sign < 0 and d_k < d_lo) or (sign > 0 and d_k > d_hi):
+            # шаг T в 5 °C перескочил зону D: D — на ближний к нужному край зоны, выход — каким он будет при нём
+            d_k, approx = (float(math.ceil(d_lo)) if sign < 0 else float(math.floor(d_hi))), True
+        else:
+            # нужный D ещё за зоной: годится D на её краю, если выход при нём почти в цели
+            d_edge = float(math.floor(d_hi)) if sign < 0 else float(math.ceil(d_lo))
+            w_edge = mdl.solve_pass(p, c_k, st.w_in, 1.0, d_edge).w_out + corr
+            if abs(w_edge - goal_k) > ALT_TOL:
+                continue
+            d_k, approx = d_edge, True
+        w_out_k = mdl.solve_pass(p, c_k, st.w_in, 1.0, d_k).w_out + corr
+        alt = {"d": d_k, "t": t_k, "dt": dt, "t_up": up + dt, "t_low": low + dt, "t_up_now": up, "t_low_now": low,
+               "w_goal": goal_k, "w_out": w_out_k, "w_read": mdl.read_from_true(p, w_out_k, tg_k),
+               "q": mdl.q_at(p, d_k), "q_main": mdl.q_at(p, fc.d_rec), "tg": tg_k, "silo": sl_k, "approx": approx,
+               "miss": w_out_k - goal_k}
+        if sl_k:
+            alt["avg"] = (sl_k["w_done"] * sl_k["m_done"] + sl_k["w_tr"] * sl_k["m_tr"]
+                          + (w_out_k * sl_k["m_new"] if sl_k["m_new"] > 0 else 0.0)) / max(
+                sl_k["m_done"] + sl_k["m_tr"] + max(sl_k["m_new"], 0.0), 1e-9)
+        fc.alt = alt
+        return
+    fc.alt_reason = reason or (f"даже при T блоков {st.t_proc + sign * T_STEP * T_STEPS_MAX:.0f} °C нужен D = "
+                               f"{d_k:.0f} с — вне проверенного")
 
 
 def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: float, w_target: float,
@@ -392,46 +488,57 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
     fc.w_out_now = mdl.solve_pass(p, c, w_in, 1.0, d_now).w_out + corr
     fc.w_out_now_read = mdl.read_from_true(p, fc.w_out_now, st.t_grain)
 
-    def choose_d(w_goal_: float) -> Tuple[float, float, str]:
-        raw_ = mdl.d_for_target(p, c, w_in, w_goal_ - corr)
+    def choose_d(w_goal_: float, c_: mdl.Conditions) -> Tuple[float, float, str]:
+        raw_ = mdl.d_for_target(p, c_, w_in, w_goal_ - corr)
         if raw_ > 100.5:
             return 100.0, raw_, "даже при D = 100 снимется больше, чем нужно — цель прохода можно поставить ниже"
         if raw_ < 1.0:
             return 1.0, raw_, "сушилка не успевает: даже при D = 1 цель прохода не достигается"
         return float(round(raw_)), raw_, ""
 
-    w_goal = w_target
-    fc.d_rec, fc.d_rec_raw, fc.d_note = choose_d(w_goal)
-    if silo and st.silo_w is not None and st.unloaded > 1.0:
-        m_total = m_pass * (100.0 - w_in) / (100.0 - w_target)
-        m_done = st.unloaded
-        m_rem = max(m_total - m_done, 0.0)
-        m_tr = min(p.lag_k * p.m_dryer, m_rem)
-        m_new = m_rem - m_tr
-        # Конец подачи прохода знает только журнал («рециркуляция»): масса прохода — оценка (масса на входе и
-        # выгрузка по Q(D)). Если по ней до конца подачи осталось мало нового зерна (short), а подача идёт, — силос не
-        # выравниваем (для малого остатка нужная влажность неустойчива), D подбирается на цель прохода, как без
-        # выравнивания. Совет «D уже не менять» — только при рециркуляции (live_advice).
-        fc.silo = {"m_total": m_total, "m_done": m_done, "w_done": st.silo_w, "w_done_read": st.silo_w_read,
-                   "m_tr": m_tr, "w_tr": fc.w_out_now, "m_new": m_new, "need": None, "limited": False,
-                   "short": m_new < max(0.05 * m_total, 5.0), "lim": silo_lim}
-        # зерно, которое уже в шахте, выйдет с влажностью по своей истории (все режимы за его путь) и по новому D:
-        # при другом D оно пойдёт быстрее или медленнее. Поэтому D и цель для нового зерна уточняются по кругу.
-        d_try_ = d_override if d_override else fc.d_rec
-        for _ in range(4):
-            prof = transit_profile(p, st, c, d_try_, corr, t_now)
-            w_tr = _transit_mean(prof, m_tr, fc.w_out_now)
-            fc.silo["w_tr"] = w_tr
-            if fc.silo["short"]:
-                break
-            need = (w_target * m_total - st.silo_w * m_done - w_tr * m_tr) / m_new
-            w_goal = min(max(need, w_target - silo_lim), w_target + silo_lim)
-            fc.silo.update(need=need, limited=abs(need - w_goal) > 0.05)
-            fc.d_rec, fc.d_rec_raw, fc.d_note = choose_d(w_goal)
-            if d_override or abs(fc.d_rec - d_try_) < 0.5:
-                break
-            d_try_ = fc.d_rec
+    def settle(c_: mdl.Conditions, override: Optional[float]) -> Tuple[float, float, str, float, Optional[Dict]]:
+        """D и цель для нового зерна при условиях c_ (T блоков c_.t_proc): (D, D без округления, пометка, цель,
+        выравнивание силоса или None). Одна функция и для совета D, и для режима D + T в проверенной зоне."""
+        w_goal_ = w_target
+        d_, raw_, note_ = choose_d(w_goal_, c_)
+        sl = None
+        if silo and st.silo_w is not None and st.unloaded > 1.0:
+            w_now_ = mdl.solve_pass(p, c_, w_in, 1.0, d_now).w_out + corr
+            m_total = m_pass * (100.0 - w_in) / (100.0 - w_target)
+            m_done = st.unloaded
+            m_rem = max(m_total - m_done, 0.0)
+            m_tr = min(p.lag_k * p.m_dryer, m_rem)
+            m_new = m_rem - m_tr
+            # Конец подачи прохода знает только журнал («рециркуляция»): масса прохода — оценка (масса на входе и
+            # выгрузка по Q(D)). Если по ней до конца подачи осталось мало нового зерна (short), а подача идёт, — силос
+            # не выравниваем (для малого остатка нужная влажность неустойчива), D подбирается на цель прохода, как без
+            # выравнивания. Совет «D уже не менять» — только при рециркуляции (live_advice).
+            sl = {"m_total": m_total, "m_done": m_done, "w_done": st.silo_w, "w_done_read": st.silo_w_read,
+                  "m_tr": m_tr, "w_tr": w_now_, "m_new": m_new, "need": None, "limited": False,
+                  "short": m_new < max(0.05 * m_total, 5.0), "lim": silo_lim}
+            # зерно, которое уже в шахте, выйдет с влажностью по своей истории (все режимы за его путь) и по новому
+            # режиму: при другом D оно пойдёт быстрее или медленнее, при другой T блоков досохнет иначе. Поэтому D и
+            # цель для нового зерна уточняются по кругу.
+            d_try_ = override if override else d_
+            for _ in range(4):
+                prof = transit_profile(p, st, c_, d_try_, corr, t_now)
+                w_tr = _transit_mean(prof, m_tr, w_now_)
+                sl["w_tr"] = w_tr
+                if sl["short"]:
+                    break
+                need = (w_target * m_total - st.silo_w * m_done - w_tr * m_tr) / m_new
+                w_goal_ = min(max(need, w_target - silo_lim), w_target + silo_lim)
+                sl.update(need=need, limited=abs(need - w_goal_) > 0.05)
+                d_, raw_, note_ = choose_d(w_goal_, c_)
+                if override or abs(d_ - d_try_) < 0.5:
+                    break
+                d_try_ = d_
+        return d_, raw_, note_, w_goal_, sl
+
+    fc.d_rec, fc.d_rec_raw, fc.d_note, w_goal, fc.silo = settle(c, d_override)
     fc.w_goal = w_goal
+    if d_override is None:
+        verified_regime(p, st, c, fc, settle, corr)
     d_use = d_override if d_override else fc.d_rec
     fc.transit = transit_profile(p, st, c, d_use, corr, t_now)
     fc.w_out_rec = mdl.solve_pass(p, c, w_in, 1.0, d_use).w_out + corr
@@ -515,6 +622,29 @@ D_STEP_MIN = 3.0      # разница с советом меньше 3 с (≈ 
 D_STEP_BIG = 10.0     # больше 10 с — сначала проверить пробу входа, D и T блоков в журнале и задание
 
 
+def zone_lines(fc: "LiveForecast", ready: Optional[datetime] = None) -> Tuple[List[str], List[str]]:
+    """Строки совета про проверенную зону (v1.5): ([строки под советом], [предупреждения]). Пусто, если совет D внутри
+    проверенного журналом D. ready — совет «подождите»: режим D + T — на после этого времени."""
+    if not fc.d_out_of_zone or not fc.zone:
+        return [], []
+    dlo, dhi = fc.zone["d_ex"]
+    tlo, thi = fc.zone["t_ex"]
+    warn = [f"D = {fc.d_rec:.0f} с — дальше, чем журнал проверил модель (D {dlo:.0f}–{dhi:.0f} с, T блоков "
+            f"{tlo:.0f}–{thi:.0f} °C): насколько точен такой совет, не проверено."]
+    a = fc.alt
+    if a is None:
+        warn.append(f"Проверенного режима D + T блоков с той же целью нет: {fc.alt_reason}. Такого режима сушилка ещё "
+                    f"не видела.")
+        return [], warn
+    when = f" после {ready:%H:%M}" if ready else ""
+    line = (f"Проверенный режим{when}: D = {a['d']:.0f} с и T блоков {a['t_up']:.0f}/{a['t_low']:.0f} °C "
+            f"(сейчас {a['t_up_now']:.0f}/{a['t_low_now']:.0f}) — на выходе ≈ {a['w_out']:.1f} % (влагомер ≈ "
+            f"{a['w_read']:.1f} %), {a['q']:.1f} т/ч вместо {a['q_main']:.1f} т/ч при D = {fc.d_rec:.0f} с.")
+    if a["approx"] and abs(a["miss"]) >= 0.15:
+        line += f" От цели {a['miss']:+.1f} п.п.: T блоков ставится шагом {T_STEP:.0f} °C."
+    return [line], warn
+
+
 def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d_try: Optional[float] = None,
                 now: Optional[datetime] = None) -> Dict:
     """{"kind": "change" | "keep" | "wait" | "info" | "nodata", "head": крупная строка, "sub": [строки],
@@ -563,21 +693,24 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
     soon_line = [f"Влагомер на выходе: {soon} (зерно уже в шахте, со всеми режимами за его путь)."] if soon else []
     if abs(diff) < D_STEP_MIN:
         w_now_read = fc.w_out_now_read
+        z_sub, z_warn = zone_lines(fc)
         return {"kind": "keep", "head": f"D не менять — {st.d:.0f} с",
                 "sub": [f"Зерно, которое входит сейчас, выйдет ≈ {fc.w_out_now:.1f} % (влагомер ≈ {w_now_read:.1f} %), "
                         f"цель {fc.w_goal:.1f} %."] + soon_line +
                        [f"Совет {fc.d_rec:.0f} с отличается меньше чем на {D_STEP_MIN:.0f} с — это ≈ 0,5 п.п. на "
-                        f"выходе, на уровне точности влагомера."],
-                "warn": warn, "go": None, "d_now": st.d, "d_rec": fc.d_rec}
+                        f"выходе, на уровне точности влагомера."] + z_sub,
+                "warn": z_warn + warn, "go": None, "d_now": st.d, "d_rec": fc.d_rec, "alt": fc.alt}
     if st.d_changed_at is not None and t_now is not None:
         ready = st.d_changed_at + timedelta(hours=tau_cur / 2.0)
         if t_now < ready:
             seen = st.d_changed_at + timedelta(hours=tau_cur)
+            z_sub, z_warn = zone_lines(fc, ready)
             return {"kind": "wait", "head": f"Подождите до {ready:%H:%M} — D не трогать",
                     "sub": [f"D меняли в {st.d_changed_at:%H:%M} ({st.d_prev:.0f} → {st.d:.0f} с); на выходе это станет "
                             f"видно к {seen:%H:%M}, а пока выходит зерно, которое сушилось при старом D."] + soon_line +
-                           [f"Совет сейчас: D = {fc.d_rec:.0f} с — проверьте его после {ready:%H:%M}."],
-                    "warn": warn, "go": None, "d_now": st.d, "d_rec": fc.d_rec, "until": ready}
+                           [f"Совет сейчас: D = {fc.d_rec:.0f} с — проверьте его после {ready:%H:%M}."] + z_sub,
+                    "warn": z_warn + warn, "go": None, "d_now": st.d, "d_rec": fc.d_rec, "until": ready,
+                    "alt": fc.alt}
     sub = [f"Сейчас {st.d:.0f} с. На выходе станет ≈ {fc.w_out_rec:.1f} % (влагомер ≈ {read:.1f} %), "
            f"цель {fc.w_goal:.1f} %."]
     if fc.visible_at:
@@ -585,8 +718,11 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
                    f"«Изменить режим…» в журнале.")
     if soon:
         sub.append(f"При D = {fc.d_rec:.0f} влагомер на выходе: {soon}.")
+    z_sub, z_warn = zone_lines(fc)
+    sub += z_sub
+    warn = z_warn + warn
     if abs(diff) > D_STEP_BIG:
         warn = ["Большое изменение: сначала проверьте последнюю пробу входа, D и T блоков в журнале и задание "
                 "прохода; всё верно — меняйте, сомневаетесь — позвоните инженеру."] + warn
     return {"kind": "change", "head": f"Поставьте D = {fc.d_rec:.0f} с", "sub": sub, "warn": warn, "go": None,
-            "d_now": st.d, "d_rec": fc.d_rec}
+            "d_now": st.d, "d_rec": fc.d_rec, "alt": fc.alt}

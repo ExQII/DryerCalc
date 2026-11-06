@@ -1852,6 +1852,121 @@ def test_no_silo_feed_row_in_pass_card():
     win.close()
 
 
+def _zone_case(explored_t=(40.0, 70.0), target=23.5, **extra):
+    """Проход 1 журнала с силосами (D 35, T блоков 60/60, вход 26 %) и модель, которая «изучила» D 33–37 с."""
+    from app.live import live_advice
+    rows, _row, t0 = _silo_journal()
+    cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
+    extra.setdefault("explored", {"d": [33.0, 37.0], "t": list(explored_t), "w": [20.0, 30.0]})
+    p = replace(P, **extra)
+    st = live_state(cut, p, final_w=15.0)
+    c = Conditions(st.t_proc, 10.0, 70.0)
+    fc = live_forecast(p, c, st, 300.0, target, 14.0, 6.0, 10.0)
+    return p, st, c, fc, live_advice(p, st, fc)
+
+
+def test_explored_zone():
+    """1.5: проверенная зона — изученные калибровкой D и T блоков с тем же запасом, что у пометок «вне изученного»."""
+    from app.model import EXPLORED_MARGIN, explored_flags, explored_zone
+    assert explored_zone(P) is None and explored_zone(replace(P, explored={"d": [33.0]})) is None
+    p = replace(P, explored={"d": [33.0, 40.5], "t": [40.0, 68.4], "w": [17.6, 32.9]})
+    z = explored_zone(p)
+    assert z["d"] == (31.0, 42.5) and z["t"] == (38.0, 70.4) and z["d_ex"] == (33.0, 40.5)
+    assert EXPLORED_MARGIN == {"d": 2.0, "t": 2.0, "w": 1.0}
+    assert explored_flags(p, [42.0], [70.0], [33.5]) == []
+    assert [f.split()[0] for f in explored_flags(p, [43.0], [71.0], [34.0])] == ["D", "T", "W"]
+
+
+def test_verified_regime_when_d_advice_leaves_zone():
+    """1.5: совет D вне проверенного журналом D — рядом режим D + T блоков в проверенной зоне с той же целью."""
+    from app.live import ALT_TOL, T_STEP, zone_lines
+    p, st, c, fc, a = _zone_case()
+    lo, hi = fc.zone["d"]
+    assert fc.d_rec > hi and fc.d_out_of_zone and fc.alt is not None and not fc.alt_reason
+    alt = fc.alt
+    # сушки слишком много — T обоих блоков ниже, шагом 5 °C; D в зоне; выход — в цель
+    assert alt["dt"] < 0 and abs(alt["dt"] / T_STEP - round(alt["dt"] / T_STEP)) < 1e-9
+    assert alt["t_up"] == st.t_up + alt["dt"] and alt["t_low"] == st.t_low + alt["dt"]
+    assert lo <= alt["d"] <= hi and fc.zone["t"][0] <= alt["t"] <= fc.zone["t"][1]
+    assert abs(alt["w_out"] - alt["w_goal"]) <= ALT_TOL + 1e-9 and abs(alt["w_goal"] - fc.w_goal) < 0.5
+    assert alt["q"] < alt["q_main"]
+    # самый малый сдвиг T: на шаг ближе к текущей T ни один D зоны цель не даёт
+    t_prev = alt["t"] - alt["dt"] / abs(alt["dt"]) * T_STEP
+    if abs(t_prev - st.t_proc) > 1e-9:
+        d_prev = d_for_target(p, Conditions(t_prev, c.t_amb, c.rh), st.w_in, alt["w_goal"] - st.corr)
+        assert d_prev > hi
+    # совет: D прежний, ниже — проверенный режим; предупреждение — совет D вне проверенного
+    assert a["kind"] == "change" and a["head"] == f"Поставьте D = {fc.d_rec:.0f} с" and a["alt"] is alt
+    assert any(x.startswith("Проверенный режим: D = ") and f"{alt['t_up']:.0f}/{alt['t_low']:.0f} °C" in x
+               for x in a["sub"])
+    assert any("дальше, чем журнал проверил модель (D 33–37 с" in w for w in a["warn"])
+    # «Подождите»: тот же режим — на после окончания ожидания
+    from datetime import datetime as _dt
+    sub, _w = zone_lines(fc, _dt(2026, 11, 3, 12, 5))
+    assert sub[0].startswith("Проверенный режим после 12:05: D = ")
+
+
+def test_verified_regime_more_drying_and_limits():
+    """1.5: совет D ниже зоны — T блоков выше; ограничения T зерна и T блоков; T за изученным — режима нет."""
+    p, st, c, fc, a = _zone_case(target=19.0)
+    assert fc.d_rec < fc.zone["d"][0] and fc.alt is not None and fc.alt["dt"] > 0
+    assert fc.zone["d"][0] <= fc.alt["d"] <= fc.zone["d"][1] and fc.alt["t"] <= fc.zone["t"][1]
+    # T зерна (замер 32 °C + наклон по журналу) упирается в ограничение
+    p2, st2, c2, fc2, a2 = _zone_case(target=19.0, t_grain_max=34.5)
+    assert fc2.alt is None and "T зерна" in fc2.alt_reason and "34.5" in fc2.alt_reason
+    assert any(w.startswith("Проверенного режима D + T блоков с той же целью нет: T зерна") for w in a2["warn"])
+    p3, st3, c3, fc3, a3 = _zone_case(target=19.0, t_agent_max=62.0)
+    assert fc3.alt is None and "ограничения 62 °C" in fc3.alt_reason
+    # журнал проверил только T 55–62 °C: снижать T дальше 53 °C нельзя
+    p4, st4, c4, fc4, a4 = _zone_case(explored_t=(55.0, 62.0))
+    assert fc4.d_out_of_zone and fc4.alt is None and "ниже 53 °C" in fc4.alt_reason
+    assert any("Такого режима сушилка ещё не видела" in w for w in a4["warn"])
+    assert not any(x.startswith("Проверенный режим") for x in a4["sub"])
+
+
+def test_verified_regime_not_shown_inside_zone_or_without_block_temps():
+    """1.5: совет D в проверенной зоне, «что будет при D», температура не с блоков, модель без журнала — без строк."""
+    from app.live import live_advice, zone_lines
+    p, st, c, fc, a = _zone_case(target=21.7)
+    assert fc.d_out_of_zone            # 40 с при изученных 33–37 (запас 2 с) — вне
+    p, st, c, fc, a = _zone_case(target=21.7, explored={"d": [33.0, 40.0], "t": [40.0, 70.0], "w": [20.0, 30.0]})
+    assert fc.zone and not fc.d_out_of_zone and fc.alt is None and zone_lines(fc) == ([], [])
+    assert not any("журнал проверил" in w for w in a["warn"]) and not any("Проверенный" in x for x in a["sub"])
+    p, st, c, fc, a = _zone_case(temp_source="grain")
+    assert not fc.d_out_of_zone and fc.alt is None
+    p, st, c, fc, a = _zone_case()
+    fc_try = live_forecast(p, c, st, 300.0, 23.5, 14.0, 6.0, 10.0, d_override=50.0)
+    assert fc_try.zone is None and fc_try.alt is None
+    assert live_advice(p, st, fc_try, d_try=50.0)["kind"] == "info"
+    p0, st0, c0, fc0, a0 = _zone_case(explored=None)
+    assert fc0.zone is None and not fc0.d_out_of_zone and zone_lines(fc0) == ([], [])
+
+
+def test_live_tab_shows_verified_regime():
+    """1.5: в «Текущем проходе» проверенный режим — жирной строкой в совете и в «Расчёт подробно»."""
+    app = _qapp()
+    from app import pages
+    from app.gui import MainWindow
+    rows, _row, t0 = _silo_journal()
+    cut = [r for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
+    stg = Storage(_tmp("zone.db"))
+    stg.replace_journal(cut)
+    stg.save_params(replace(P, explored={"d": [33.0, 37.0], "t": [20.0, 70.0], "w": [20.0, 30.0]}))
+    stg.set_json("ui_live", {"w_target": 23.5, "m_pass": 300.0, "corr": False, "silo": False, "now": False})
+    win = MainWindow(stg)
+    win.show()
+    win.tabs.setCurrentIndex(win.tabs.indexOfText(pages.LIVE))
+    for _ in range(5):
+        app.processEvents()
+    lt = win.tab_live
+    assert lt.fc is not None and lt.fc.alt is not None
+    assert "<b>Проверенный режим: D = " in lt.lbl_sub.text()
+    assert "дальше, чем журнал проверил модель" in lt.lbl_warn.text() and lt.lbl_head.text().startswith("Поставьте D")
+    assert "Журнал проверил модель при D 33–37 с и T блоков 20–70 °C" in lt.summary.text()
+    assert "<b>Проверенный режим: D = " in lt.summary.text()
+    win.close()
+
+
 def _cleanup_windows():
     """Окна прошлых тестов удаляются: каждое новое окно ставит оформление на всё приложение и перерисовывает все
     живые окна — без уборки тесты с окнами замедляются квадратично (в программе окно одно)."""

@@ -418,6 +418,25 @@ def run(out_path: str) -> int:
         _a6 = _la(win.params, _s6, _lf(win.params, _c5, _s6, 200.0, 21.5, 14.0, 6.0, 10.0, silo=True))
         check(_f5.overrun and "уже не менять" not in _a5["head"] and _s6.recirc and "уже не менять" in _a6["head"],
               f"масса прохода занижена, подача идёт — совет «{_a5['head']}»; при рециркуляции — «{_a6['head']}»")
+        # --- v1.5: совет D вне проверенного журналом D — рядом режим D + T блоков в проверенной зоне ---
+        from dataclasses import replace as _rp5
+        from .live import ALT_TOL as _tol
+        _cut7 = [r for r in _rows if datetime.strptime(r["ts"], "%d.%m.%y %H:%M") < _t0 + _td(hours=19.0)]
+        _p7 = _rp5(win.params, explored={"d": [33.0, 37.0], "t": [40.0, 70.0], "w": [20.0, 30.0]},
+                   temp_source="block", t_grain_max=0.0, t_agent_max=0.0)
+        _s7 = live_state(_cut7, _p7, final_w=15.0)
+        _c7 = mdl.Conditions(_s7.t_proc, 10.0, 70.0)
+        _f7 = _lf(_p7, _c7, _s7, 300.0, 23.5, 14.0, 6.0, 10.0)
+        _a7 = _la(_p7, _s7, _f7)
+        _alt = _f7.alt or {}
+        _p8 = _rp5(_p7, explored={"d": [33.0, 37.0], "t": [55.0, 62.0], "w": [20.0, 30.0]})
+        _f8 = _lf(_p8, _c7, _s7, 300.0, 23.5, 14.0, 6.0, 10.0)
+        check(_f7.d_out_of_zone and bool(_alt) and 31.0 <= _alt["d"] <= 39.0 and _alt["dt"] < 0
+              and abs(_alt["w_out"] - _alt["w_goal"]) <= _tol + 1e-9
+              and any(x.startswith("Проверенный режим") for x in _a7["sub"]) and _f8.alt is None and "ниже" in _f8.alt_reason,
+              f"совет D = {_f7.d_rec:.0f} с вне проверенного (D 33–37 с): проверенный режим D = {_alt.get('d', 0):.0f} с и "
+              f"T блоков {_alt.get('t_up', 0):.0f}/{_alt.get('t_low', 0):.0f} °C; журнал знает только T 55–62 °C — "
+              f"режима нет ({_f8.alt_reason})")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)
