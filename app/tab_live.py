@@ -109,7 +109,12 @@ class LiveTab(QWidget):
         self.d_try = dspin(0, 100, 0, 0, 1, " с")
         self.d_try.setSpecialValueText("подобрать")
         self.cb_corr = QCheckBox("Поправка по последним замерам выхода")
-        self.cb_corr.setChecked(True)
+        self.cb_corr.setChecked(False)
+        self.cb_corr.setToolTip(
+            "Средняя ошибка модели по 6 последним пробам прохода (ослабленная) прибавляется к прогнозу. С 1.5.3 "
+            "выключена: на журналах октября и ноября 2026 прогноз без неё точнее (±0,82 против ±0,87 и ±0,41 "
+            "против ±0,47 п.п.). Включайте, если модель явно «уехала» — например, пришла партия с другими "
+            "свойствами, а перекалибровать ещё не по чему.")
         self.cb_now = QCheckBox("Плитки в реальном времени")
         self.cb_now.setChecked(True)
         self.cb_now.setToolTip("«Выгружено», «осталось», конец прохода и приёмный силос досчитываются от последней "
@@ -344,7 +349,7 @@ class LiveTab(QWidget):
 
         for w in (self.m_pass, self.w_target, self.t_amb, self.rh, self.d_try, self.silo_lim):
             w.valueChanged.connect(self.recalc)
-        self.cb_corr.stateChanged.connect(self.recalc)
+        self.cb_corr.stateChanged.connect(self.refresh)          # и строка «Поправка модели» в карточке прохода
         self.cb_silo.stateChanged.connect(self.recalc)
         self.npass.valueChanged.connect(self.recalc)
         self.cb_now.stateChanged.connect(self.refresh)
@@ -368,7 +373,9 @@ class LiveTab(QWidget):
                      ("t_amb", self.t_amb), ("rh", self.rh)):
             if k in d:
                 w.setValue(float(d[k]))
-        self.cb_corr.setChecked(bool(d.get("corr", True)))
+        # 1.5.3: поправка по последним замерам выключена по умолчанию; сохранённое «включено» из прошлых версий — это
+        # умолчание, а не выбор: переводится один раз (corr_v = 2), дальше — как выбрал инженер
+        self.cb_corr.setChecked(bool(d.get("corr", False)) if d.get("corr_v") == 2 else False)
         self.cb_silo.setChecked(bool(d.get("silo", True)))
         self.npass.setValue(int(d.get("npass", 0) or 0))
         if "silo_lim" in d:
@@ -383,7 +390,7 @@ class LiveTab(QWidget):
     def _save(self) -> None:
         self.win.storage.set_json("ui_live", {
             "m_pass": self.m_pass.value(), "w_target": self.w_target.value(), "wk": self.wk_final.value(),
-            "t_amb": self.t_amb.value(), "rh": self.rh.value(), "corr": self.cb_corr.isChecked(),
+            "t_amb": self.t_amb.value(), "rh": self.rh.value(), "corr": self.cb_corr.isChecked(), "corr_v": 2,
             "silo": self.cb_silo.isChecked(), "silo_lim": self.silo_lim.value(), "npass": self.npass.value(),
             "m_auto": self.cb_mauto.isChecked(), "now": self.cb_now.isChecked(), "batch_src": self._batch_src,
             "prefer": self.prefer})
@@ -522,7 +529,8 @@ class LiveTab(QWidget):
             "d": (f"{fnum(st.d, 0)} с, Q = {fnum(q)} т/ч" if st.d else "—"),
             "t": f"{tp} °C, зерно {tg} °C", "unl": f"{fnum(st.unloaded, 0)} т",
             "silo": (f"{st.silo_w:.1f} % (влагомер {st.silo_w_read:.1f} %)" if st.silo_w is not None else "—"),
-            "corr": f"{st.corr:+.2f} п.п. по {st.corr_n} замерам" if ok else "—",
+            "corr": (f"{st.corr:+.2f} п.п. по {st.corr_n} замерам"
+                     + ("" if self.cb_corr.isChecked() else " — не применяется") if ok else "—"),
         }
         for key, (k, v) in self.fact_lbl.items():
             v.setText(vals[key] if ok else "—")
@@ -532,6 +540,9 @@ class LiveTab(QWidget):
         msg = ""
         if not ok:
             msg = st.message or "—"
+        elif st.recirc and st.warmup:
+            msg = ("Прогрев: сушилку заполнили и греют по кругу. Проход начнётся с подачи («сушим с N с.» или «сушим в "
+                   "N с.»).")
         elif st.recirc and st.batch_end:
             msg = "Рециркуляция у цели партии — досушка остатка в шахте и конец партии (раздел «Досушка»)."
         elif st.recirc:
@@ -812,7 +823,12 @@ class LiveTab(QWidget):
                              ("С охлаждением. " + (f"Допуск {rng}." if rng else "")).strip())
         else:
             self.t_batch.set("—")
-        if st.recirc:
+        if st.recirc and st.warmup:
+            since = f"рециркуляция с {st.warmup_since:%H:%M}" if st.warmup_since else "рециркуляция"
+            self.t_pass.set("прогрев", since, "Сушилку заполнили и греют по кругу — подачи из силоса ещё не было. "
+                                              "Проход начнётся с подачи («сушим с N с.» или «сушим в N с.»).")
+            self.pass_bar.set_value(0.0)
+        elif st.recirc:
             # подача прохода закончилась: выгрузки в силос нет, зерно в шахте ходит по кругу
             since = f"рециркуляция с {st.recirc_since:%H:%M}" if st.recirc_since else "рециркуляция"
             self.t_pass.set("закончен", since, "Подача из силосов этого прохода закончилась (в журнале "

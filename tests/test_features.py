@@ -1998,6 +1998,105 @@ def test_live_tab_shows_verified_regime():
     win.close()
 
 
+
+def _warmup_journal():
+    """Начало партии как в журнале ноября: заполнили сушилку, запуск, рециркуляция-прогрев, «Сушим в 1 силос» (сушка),
+    переключение силоса внутри прохода, рециркуляция — конец подачи, «Сушим в 4 силос» — следующий проход."""
+    t0 = datetime(2026, 11, 1, 22, 30)
+    rows = []
+
+    def row(h, wi=None, wo=None, note="", d=None, t=None, pn=1):
+        rows.append({"ts": (t0 + timedelta(hours=h)).strftime("%d.%m.%y %H:%M"), "w_in": wi, "w_out": wo,
+                     "t_a1": 27 if wo else None, "t_a2": 25 if wo else None, "t_up": t, "t_low": t, "d": d,
+                     "note": note, "batch": "1", "pass_no": pn, "t_amb": None, "rh": None})
+    row(0.0, 31.4, note="Набираем сушилку с 3 силоса")
+    row(0.5, 31.2)
+    row(1.0, 32.4)
+    row(2.0, note="Запуск топочных блоков", t=60)
+    row(2.5, None, 29.1, note="Рециркуляция", d=35, t=60)
+    for k in range(6, 11):
+        row(0.5 * k, None, 27.0 - 0.3 * k, d=35, t=60)
+    row(5.5, 33.0, 23.5, note="Сушим в 1 силос", d=35, t=60)
+    for k in range(12, 40):
+        row(0.5 * k, 32.0, 23.8, d=35, t=60)
+    row(20.0, 33.0, 23.6, note="Закончился 3 силос, открыли с 4 силоса", d=35, t=60)
+    for k in range(41, 60):
+        row(0.5 * k, 32.5, 23.9, d=35, t=60)
+    row(30.0, 24.3, 24.8, note="Закончился 4 силос, рециркуляция через 3 силос", d=35, t=60)
+    row(30.5, 24.2, 23.7, d=35, t=60)
+    row(31.0, 21.6, 17.9, note="Сушим в 4 силос", d=40, t=60)
+    for k in range(63, 80):
+        row(0.5 * k, 23.0, 17.5, d=40, t=60)
+    return rows, t0
+
+
+def test_feed_into_silo_and_warmup_recirculation():
+    """1.5.3: «Сушим в N силос» — подача (выгрузка в силос, а не по кругу); рециркуляция до первой сушки прохода —
+    прогрев: проход не заканчивает, «Текущий проход» пишет «Прогрев», а не «Проход закончен»."""
+    from app.calibration import is_feed_note, journal_passes, observe_all, prepare
+    from app.live import live_advice
+    for note in ("Сушим в 1 силос", "сушим в силос 3", "Сушим в 2 с.", "Набрался 1 силос, сушим в 3 силос",
+                 "сушим с 3 в 1 силос", "открыли с 4 силоса"):
+        assert is_feed_note(note), note
+    assert not is_feed_note("Сушим влажное") and not is_feed_note("рециркуляция через 3 силос")
+    rows, t0 = _warmup_journal()
+    prep, _ = prepare(rows)
+    jp = journal_passes(prep, P, 15.0)
+    assert [(x["pass_no"], x["pass_auto"], x["end_kind"]) for x in jp] == [(1, False, "recirc"), (2, True, None)]
+    warm = [r for r in prep if r.get("warmup")]
+    assert warm and warm[0]["note"] == "Рециркуляция" and all(r["pass"] == 0 for r in warm)
+    assert all(not r["recirc"] for r in prep if t0 + timedelta(hours=5.5) <= r["dt"] < t0 + timedelta(hours=30))
+    # прогрев: совет — «Прогрев», выгрузки нет, плитка «Конец прохода» — не «закончен»
+    cut = [r for r in rows if r["ts"] <= (t0 + timedelta(hours=5.0)).strftime("%d.%m.%y %H:%M")]
+    st = live_state(cut, P, final_w=15.0)
+    a = live_advice(P, st, live_forecast(P, Conditions(st.t_proc, 10.0, 70.0), st, 1000.0, 24.0, 14.0, 6.0, 10.0))
+    assert st.recirc and st.warmup and st.warmup_since == t0 + timedelta(hours=2.5) and st.unloaded == 0.0
+    assert a["kind"] == "info" and a["head"] == "Прогрев — подачи ещё не было" and a.get("warmup") and a["go"] is None
+    # сушка с «Сушим в 1 силос»: тот же проход 1, выгрузка — с этого момента, переключение силоса не делит проход
+    cut = [r for r in rows if r["ts"] <= (t0 + timedelta(hours=25.0)).strftime("%d.%m.%y %H:%M")]
+    st = live_state(cut, P, final_w=15.0)
+    assert not st.recirc and not st.warmup and st.pass_no == 1 and not st.pass_auto
+    assert st.start == t0 + timedelta(hours=5.5) and abs(st.unloaded - q_at(P, 35) * 19.5) < 1e-6
+    # конец подачи — настоящая рециркуляция, время — её, а не прогрева
+    cut = [r for r in rows if r["ts"] <= (t0 + timedelta(hours=30.5)).strftime("%d.%m.%y %H:%M")]
+    st = live_state(cut, P, final_w=15.0)
+    assert st.recirc and not st.warmup and st.recirc_since == t0 + timedelta(hours=30.0)
+    assert live_advice(P, st, live_forecast(P, Conditions(st.t_proc, 10.0, 70.0), st, 1000.0, 24.0, 14.0, 6.0,
+                                            10.0))["head"] == "Проход закончен — D для этого прохода уже не менять"
+    # калибровка: строки прогрева не берёт, строки сушки — берёт
+    obs, skipped, _ = observe_all(rows, P)
+    assert all(not (t0 + timedelta(hours=2.5) <= o["dt"] < t0 + timedelta(hours=5.5)) for o in obs)
+    assert sum(1 for o in obs if o["dt"] < t0 + timedelta(hours=30)) >= 40
+
+
+def test_live_correction_off_by_default_and_migrated():
+    """1.5.3: поправка по последним замерам выключена по умолчанию (на журналах октября и ноября прогноз без неё
+    точнее). Сохранённое «включено» прошлых версий — умолчание, а не выбор: переводится один раз; выбор после — как
+    выбрал инженер. Напоминания считают так же."""
+    _qapp()
+    from app.gui import MainWindow
+    from app.reminders import live_numbers
+    stg = Storage(_tmp("corr_old.db"))
+    stg.set_json("ui_live", {"corr": True, "w_target": 24.0})            # настройки 1.5.2: включено по умолчанию
+    win = MainWindow(stg)
+    lt = win.tab_live
+    assert not lt.cb_corr.isChecked() and "выключена" in lt.cb_corr.toolTip()
+    lt._save()
+    assert stg.get_json("ui_live")["corr"] is False and stg.get_json("ui_live")["corr_v"] == 2
+    lt.cb_corr.setChecked(True)                                          # инженер включил — держится
+    win.close()
+    win2 = MainWindow(stg)
+    assert win2.tab_live.cb_corr.isChecked()
+    win2.close()
+    fresh = MainWindow(Storage(_tmp("corr_new.db")))
+    assert not fresh.tab_live.cb_corr.isChecked()
+    fresh.close()
+    # напоминания: без отметки corr_v (старые настройки) поправка не применяется
+    rows = _live_rows()
+    a = live_numbers(rows, P, {"corr": True, "w_target": 24.0}, 6.0, 10.0)
+    b = live_numbers(rows, P, {"corr": False, "w_target": 24.0}, 6.0, 10.0)
+    assert a == b
+
 def _cleanup_windows():
     """Окна прошлых тестов удаляются: каждое новое окно ставит оформление на всё приложение и перерисовывает все
     живые окна — без уборки тесты с окнами замедляются квадратично (в программе окно одно)."""

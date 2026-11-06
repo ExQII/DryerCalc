@@ -56,9 +56,11 @@ BREAK_WORDS = ("остановк", "запуск", "загрузка", "зачи
 RECIRC_WORDS = ("рецирк",)
 BURNER_OFF_WORDS = ("охлажд",)          # плюс «откл…» вместе с «т.б.» / «блок» / «горел» / «топ»
 BURNER_ON_WORDS = ("запуск", "вкл. т", "вкл т", "включ")
-# подача из силоса: «сушим с 1 с.», «открыли с 3 с.», «переключили на 2 с.», «набираем из 4», «подача с 1 с.».
-# Внутри прохода — переключение силоса (проход продолжается); после рециркуляции — подача следующего прохода
-FEED_RE = re.compile(r"(сушим\s+(с|со|из|\d)|открыл\w*\s+(с\b|с\.|со\b|из\b|силос|\d)|"
+# подача из силоса: «сушим с 1 с.», «открыли с 3 с.», «переключили на 2 с.», «набираем из 4», «подача с 1 с.»,
+# «сушим в 1 силос» (выгрузка в приёмный силос — значит, зерно идёт через сушилку, а не по кругу).
+# Внутри прохода — переключение силоса (проход продолжается); после рециркуляции — подача следующего прохода;
+# после прогрева (рециркуляция до первой сушки прохода) — начало сушки того же прохода
+FEED_RE = re.compile(r"(сушим\s+(с|со|из|\d|в\s+(\d|силос|с\.))|открыл\w*\s+(с\b|с\.|со\b|из\b|силос|\d)|"
                      r"переключ\w*\s+(на\s+)?(с\b|с\.|со\b|силос|подач|\d)|"
                      r"(набираем|снимаем|берём|берем)\s+(с\b|с\.|со\b|из\b|силос|\d)|подач\w*\s+(с|со|из)\b)", re.I)
 # конец рециркуляции словами: «закончили рециркуляцию», «рециркуляция окончена», «стоп рециркуляция»
@@ -380,6 +382,9 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
       перерыв больше 1,5 ч (после остановки связь «вход τ назад — выход сейчас» начинается заново).
     recirc — от «рециркуляция» до конца рециркуляции («закончили рециркуляцию», подача следующего прохода, новый
       участок): зерно ходит по кругу, из силоса не берётся;
+    warmup — рециркуляция-прогрев: в проходе ещё не сушили (не было пробы выхода вне рециркуляции) — сушилку
+      заполнили и греют по кругу. Проход она НЕ заканчивает: подача («сушим с N с.», «сушим в N с.») начинает сушку
+      того же прохода (новый участок, рециркуляция снята), номер прохода не растёт;
     burner_off — после «охлаждение» / «откл. т.б.» до «запуск» / «вкл.» (горелки выключены, сушки нет);
     cool — охлаждение (конец сушки: после него следующая подача — новый проход)."""
     times, reliable = assign_times(rows)
@@ -390,6 +395,8 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
     last_up = last_low = last_d = None
     recirc = burner_off = cool = False
     ended = False                       # проход закончен (рециркуляция / охлаждение): следующая подача — новый проход
+    dried = False                       # в проходе уже сушили: была проба выхода вне рециркуляции и охлаждения
+    warmup = False                      # идёт рециркуляция-прогрев (до первой сушки прохода)
     last_batch, last_pass = "", None
     prev_key = None
     prev_dt: Optional[datetime] = None
@@ -408,17 +415,22 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
                    and (dt - prev_dt).total_seconds() > 1.5 * 3600)
         feed = is_feed_note(note) or ("запуск" in note and not any(w in note for w in RECIRC_WORDS + BURNER_OFF_WORDS))
         new_pass = i > 0 and (key != prev_key or (ended and (feed or gap)))
-        brk = i > 0 and (new_pass or gap or any(w in note for w in BREAK_WORDS))
+        warm_end = recirc and warmup and feed and not new_pass       # прогрев кончился: пошла подача — сушка
+        brk = i > 0 and (new_pass or gap or warm_end or any(w in note for w in BREAK_WORDS))
         if brk:
             seg += 1
-            recirc = burner_off = cool = False
+            recirc = burner_off = cool = warmup = False
         if new_pass:
             pass_idx += 1
-            ended = False
+            ended = dried = False
         if RECIRC_END_RE.search(note):
-            recirc = False                                  # конец рециркуляции; проход при этом уже закончен
+            recirc = warmup = False                         # конец рециркуляции (после сушки проход уже закончен)
         elif any(w in note for w in RECIRC_WORDS):
-            recirc = ended = True
+            recirc = True
+            if dried:
+                ended = True                                # рециркуляция после сушки — подача прохода закончилась
+            else:
+                warmup = True                               # до первой сушки — прогрев, проход продолжается
         if _burner_off_note(note):
             burner_off = True
             if any(w in note for w in BURNER_OFF_WORDS):
@@ -426,6 +438,9 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
         elif _burner_on_note(note):
             burner_off = cool = False
         p["recirc"], p["burner_off"], p["cool"] = recirc, burner_off, cool
+        p["warmup"] = recirc and warmup
+        if r.get("w_out") is not None and not recirc and not burner_off:
+            dried = True
         p["batch_f"], p["pass_f"] = batch, pass_no
         last_batch, last_pass = batch, pass_no
         prev_key = key
@@ -498,7 +513,7 @@ def journal_passes(prep: List[Dict], p: Optional[DryerParams] = None, final_w: f
         dts = [r["dt"] for r in lst if r.get("dt") is not None]
         last = lst[-1]
         end_kind = "cool" if last.get("cool") or any(r.get("cool") for r in lst) else (
-            "recirc" if any(r.get("recirc") for r in lst) else None)
+            "recirc" if any(r.get("recirc") and not r.get("warmup") for r in lst) else None)   # прогрев — не конец
         drying = [r for r in lst if r.get("w_out") is not None and not r.get("recirc") and not r.get("burner_off")]
         w_end = None
         if drying:

@@ -126,6 +126,6 @@ def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: floa
         m_auto, _how = pass_mass(plan[0], plan[1], st.batch_passes)
         m_pass = m_auto if m_auto is not None else m_pass
     fc = live_forecast(p, c, st, m_pass, w_target, float(ui_live.get("wk", 14.0)),
-                       soft, hard, use_corr=bool(ui_live.get("corr", True)), now=now,
+                       soft, hard, use_corr=bool(ui_live.get("corr", False)) and ui_live.get("corr_v") == 2, now=now,
                        silo=bool(ui_live.get("silo", True)), silo_lim=float(ui_live.get("silo_lim", 1.0)))
     return fc.pass_end, mdl.read_from_true(p, w_target, st.t_grain)

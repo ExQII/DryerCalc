@@ -58,7 +58,9 @@ class LiveState:
     end_kind: Optional[str] = None       # подача прохода закончена: "recirc" / "cool"; None — подача идёт
     batch_end: bool = False              # партия высушена: досушка (рециркуляция у цели) или охлаждение
     w_end: Optional[float] = None        # истинная влажность выхода в конце подачи, %
-    recirc_since: Optional[datetime] = None   # с какого времени рециркуляция
+    recirc_since: Optional[datetime] = None   # с какого времени рециркуляция (текущая, не прогрев)
+    warmup: bool = False                      # сейчас рециркуляция-прогрев: сушилку заполнили, подачи ещё не было
+    warmup_since: Optional[datetime] = None   # с какого времени прогрев
     unloaded: float = 0.0
     hours: float = 0.0
     corr: float = 0.0
@@ -153,8 +155,14 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
             st.t_amb = r["t_amb"]
         if r.get("rh") is not None:
             st.rh = r["rh"]
-        if r.get("recirc") and st.recirc_since is None:
+        if not r.get("recirc") or r.get("warmup"):
+            st.recirc_since = None                          # время — у последней рециркуляции, не у прогрева
+        elif st.recirc_since is None:
             st.recirc_since = r["dt"]
+        if not r.get("warmup"):
+            st.warmup_since = None
+        elif st.warmup_since is None:
+            st.warmup_since = r["dt"]
         st.series.append((r["dt"], r.get("w_in"), r.get("w_out")))
     end = st.last
     if now is not None and now > st.last:
@@ -191,6 +199,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.silo_w, st.silo_w_read, st.silo_n = silo_sum / unloaded, silo_sum_read / unloaded, len(rd)
     st.regime, st.inlet = _journal_regime(prep, p)
     st.recirc = bool(rs[-1].get("recirc"))
+    st.warmup = bool(rs[-1].get("warmup"))
     st.burner_off = bool(rs[-1].get("burner_off"))
     st.hours = (end - st.start).total_seconds() / 3600.0
     # поправка по последним наблюдениям этого прохода
@@ -709,6 +718,14 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
         warn = [x for x in warn if x.startswith("T ")]
         since = f" с {st.recirc_since:%H:%M}" if st.recirc_since else ""
         w_txt = f"≈ {st.w_end:.1f} %" if st.w_end is not None else "у цели"
+        if st.warmup:
+            # рециркуляция до первой сушки прохода: сушилку заполнили и греют по кругу — проход ещё не начался
+            w_since = f" с {st.warmup_since:%H:%M}" if st.warmup_since else ""
+            return dict(base, kind="info", head="Прогрев — подачи ещё не было",
+                        sub=[f"Рециркуляция{w_since} до первой сушки прохода: зерно в шахте греется по кругу.",
+                             "Сушка начнётся с подачи — «сушим с N с.» или «сушим в N с.» в журнале; тогда здесь будет "
+                             "совет по D."],
+                        warn=warn, go=None, d_now=st.d, d_rec=None, warmup=True)
         if st.batch_end:
             return dict(base, kind="info", head="Партия высушена — идёт досушка",
                         sub=[f"Рециркуляция{since}: подача закончилась, выход к концу подачи {w_txt} — цель партии.",

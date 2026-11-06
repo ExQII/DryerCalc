@@ -441,6 +441,26 @@ def run(out_path: str) -> int:
               f"совет D = {_f7.d_rec:.0f} с вне проверенного (D 33–37 с): проверенный режим D = {_alt.get('d', 0):.0f} с и "
               f"T блоков {_alt.get('t_up', 0):.0f}/{_alt.get('t_low', 0):.0f} °C; журнал знает только T 55–62 °C — "
               f"режима нет ({_f8.alt_reason})")
+        # --- v1.5.3: «сушим в N силос» — подача; рециркуляция до первой сушки — прогрев; поправка выключена ---
+        _t9 = datetime(2026, 11, 1, 22, 30)
+
+        def _r9(h, wi=None, wo=None, note="", d=None, pn=1):
+            return {"ts": (_t9 + _td(hours=h)).strftime("%d.%m.%y %H:%M"), "w_in": wi, "w_out": wo, "t_a1": None,
+                    "t_a2": None, "t_up": 60, "t_low": 60, "d": d, "note": note, "batch": "1", "pass_no": pn}
+        _rows9 = ([_r9(0, 31.4, note="Набираем сушилку с 3 силоса"), _r9(2, note="Запуск топочных блоков"),
+                   _r9(2.5, None, 29.1, "Рециркуляция", 35), _r9(4, None, 25.0, d=35),
+                   _r9(5.5, 33.0, 23.5, "Сушим в 1 силос", 35)] + [_r9(6 + 0.5 * k, 32.0, 23.8, d=35) for k in range(30)]
+                  + [_r9(21.5, 24.3, 24.8, "Закончился 4 силос, рециркуляция", 35)])
+        _jp9 = _jp(_prep(_rows9)[0], win.params, 15.0)
+        _s9w = live_state(_rows9[:4], win.params, final_w=15.0)
+        _a9w = _la(win.params, _s9w, _lf(win.params, mdl.Conditions(60.0, 10.0, 70.0), _s9w, 1000.0, 24.0, 14.0, 6.0,
+                                         10.0))
+        _s9 = live_state(_rows9[:20], win.params, final_w=15.0)
+        check([(x["pass_no"], x["end_kind"]) for x in _jp9] == [(1, "recirc")] and _s9w.warmup
+              and _a9w["head"].startswith("Прогрев") and not _s9.recirc and _s9.unloaded > 100
+              and not win.tab_live.cb_corr.isChecked(),
+              f"прогрев и «сушим в 1 силос»: проходов {len(_jp9)}, при прогреве — «{_a9w['head']}», в сушке выгружено "
+              f"{_s9.unloaded:.0f} т; поправка по последним замерам — выключена")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)
