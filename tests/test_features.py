@@ -942,12 +942,11 @@ def test_quick_entry_follows_journal_edits_in_window():
     win.close()
 
 
-def test_quick_entry_outside_temperature_in_window(monkeypatch):
+def test_quick_entry_outside_temperature_in_window():
     """1.6.2: T наружная пишется быстрым вводом вместе с пробой и переносится на следующую; правка в таблице —
     в быстрый ввод; вне −40…45 °C — переспросить, строку не добавлять."""
     _qapp()
     from PySide6.QtWidgets import QMessageBox
-    from app.calibration import FIELDS
     from app.gui import MainWindow
     st = Storage(_tmp("amb162.db"))
     st.replace_journal([{"ts": "05.11.26 08:30", "w_in": 23.0, "w_out": 20.0, "t_a1": None, "t_a2": None,
@@ -955,7 +954,17 @@ def test_quick_entry_outside_temperature_in_window(monkeypatch):
                          "t_amb": None, "rh": None}])
     win = MainWindow(st)
     warned = []
-    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[2]))
+    orig_warning = QMessageBox.warning              # без фикстур pytest: CI запускает тесты своим раннером
+    QMessageBox.warning = staticmethod(lambda *a, **k: warned.append(a[2]))
+    try:
+        _check_quick_entry_amb(win, warned)
+    finally:
+        QMessageBox.warning = orig_warning
+        win.close()
+
+
+def _check_quick_entry_amb(win, warned):
+    from app.calibration import FIELDS
     assert win.qe["t_amb"].text() == ""                                  # в журнале T наружной нет — пусто
     win.qe["w_in"].setText("22,9")
     win.qe["w_out"].setText("19,8")
@@ -982,7 +991,6 @@ def test_quick_entry_outside_temperature_in_window(monkeypatch):
     win.qe["t_amb"].setText("холодно")
     win._qe_add()
     assert win.tbl_j.rowCount() == n and warned[-1] == "Не число: T наружная"
-    win.close()
 
 
 # ---------------------------------------------------------------------------
