@@ -914,9 +914,10 @@ class MainWindow(QMainWindow):
             "N с.») — новый проход. Переключение силоса внутри прохода («Закончился 2 с., сушим с 1 с.»), остановки "
             "и перерывы проход не делят. Рециркуляция, когда выход уже у цели партии (13–14 %), — досушка и конец "
             "партии.<br>"
-            "Быстрый ввод: время — последняя проба + 30 мин; T блоков, D, партия и проход — из последней записи "
-            "(исправили в таблице — быстрый ввод возьмёт исправленное). Поменяли D или T блоков между пробами — "
-            "«Изменить режим…»: отдельная строка со своим временем.<br>"
+            "Быстрый ввод: время — последняя проба + 30 мин; T наружная, T блоков, D, партия и проход — из последней "
+            "записи (исправили в таблице — быстрый ввод возьмёт исправленное). T наружная переносится, если записана "
+            "не раньше 3 ч назад: после ночи или выходных поле пустое — впишите по термометру. Поменяли D или "
+            "T блоков между пробами — «Изменить режим…»: отдельная строка со своим временем.<br>"
             "Таблицу можно править прямо здесь (двойной щелчок). Подробно — «Справка» → «Правила работы», "
             "разделы 4, 5 и 8.")
         lay.addWidget(self.j_help)
@@ -952,9 +953,9 @@ class MainWindow(QMainWindow):
         lay.addLayout(bar)
 
         qe = QGroupBox("Быстрый ввод пробы — Enter добавляет строку")
-        qe.setToolTip("Время — последняя проба + 30 мин; T блоков, D, партия и проход — из последней записи журнала "
-                      "(исправили их в таблице — быстрый ввод возьмёт исправленное). Поменяли режим между пробами — "
-                      "«Изменить режим…»: изменение запишется отдельной строкой со своим временем.")
+        qe.setToolTip("Время — последняя проба + 30 мин; T наружная, T блоков, D, партия и проход — из последней записи "
+                      "журнала (исправили их в таблице — быстрый ввод возьмёт исправленное). Поменяли режим между "
+                      "пробами — «Изменить режим…»: изменение запишется отдельной строкой со своим временем.")
         self._qe_auto: Dict[str, str] = {}               # что программа сама подставила в поля (не правка человека)
         self._qe_auto_time: Optional[datetime] = None
         self._qe_sync_timer = QTimer(self)
@@ -982,17 +983,23 @@ class MainWindow(QMainWindow):
         self.qe_time.setCalendarPopup(True)
         field(line1, "Время пробы", self.qe_time)
         self.qe: Dict[str, QLineEdit] = {}
+        self._qe_caps: Dict[str, str] = {}               # подписи полей — для сообщения «Не число: …»
         for line, key, cap, ph, width in (
                 (line1, "w_in", "Влага вход, %", "%", 76), (line1, "w_out", "Влага выход, %", "%", 76),
                 (line1, "t_a1", "T зерна низ", "°C", 64), (line1, "t_a2", "T зерна верх", "°C", 64),
+                (line1, "t_amb", "T наружная", "°C", 64),
                 (line2, "t_up", "T блока 1", "°C", 64), (line2, "t_low", "T блока 2", "°C", 64),
                 (line2, "d", "Разгрузка D", "с", 58), (line2, "batch", "Партия", "", 64),
                 (line2, "pass_no", "Проход", "", 58),
                 (line2, "note", "Примечание", "«Закончился 2 с., сушим с 1 с.», «рециркуляция», «Остановка», «Запуск»",
                  0)):
             le = QLineEdit()
+            self._qe_caps[key] = cap
             le.setPlaceholderText(ph)
-            le.setToolTip(cap)
+            le.setToolTip(cap if key != "t_amb" else
+                          "Наружный воздух, °C (можно с минусом: −5). Переносится с прошлой записи, если она не "
+                          "старше 3 ч, — меняйте, когда изменилась. Пусто — строка без T наружной: калибровка возьмёт "
+                          "таблицу погоды, «Текущий проход» — последнюю записанную.")
             le.setProperty("base_width", width)
             if width:
                 le.setFixedWidth(width)
@@ -1006,7 +1013,7 @@ class MainWindow(QMainWindow):
         b.clicked.connect(self._qe_add)
         field(line1, " ", b)
         self.qe_add_btn = b
-        hint = QLabel("Режим и метки ниже переносятся с прошлой записи сами — меняйте, только когда они меняются.")
+        hint = QLabel("T наружная, режим и метки — с прошлой записи; меняйте, только когда меняются.")
         hint.setWordWrap(True)
         self.qe_hint = hint
         line1.addSpacing(12)
@@ -1082,9 +1089,10 @@ class MainWindow(QMainWindow):
         changed: List[str] = []
         for key in QE_CARRY:
             v = vals.get(key)
-            if v is None:
+            if v is None and key != "t_amb":
                 continue
-            txt = str(v) if key == "batch" else fmt_num(v)
+            # T наружная старше 3 ч (после ночи, выходных) — поле, заполненное программой, очищается
+            txt = "" if v is None else (str(v) if key == "batch" else fmt_num(v))
             le = self.qe[key]
             cur = le.text().strip()
             auto = self._qe_auto.get(key)
@@ -1094,9 +1102,9 @@ class MainWindow(QMainWindow):
                 a, c = to_float(auto) if auto else None, to_float(cur) if cur else None
                 same = a is not None and c is not None and abs(a - c) < 1e-9
             if after_add or ((not cur or same) and not le.hasFocus()):
-                if cur and cur != txt and not after_add:
-                    changed.append(f"{REGIME_NAMES.get(key, {'batch': 'партия', 'pass_no': 'проход'}.get(key, key))} "
-                                   f"{cur} → {txt}")
+                if cur and txt and cur != txt and not after_add:
+                    names = {"batch": "партия", "pass_no": "проход", "t_amb": "T наружная"}
+                    changed.append(f"{REGIME_NAMES.get(key, names.get(key, key))} {cur} → {txt}")
                 if cur != txt:
                     le.setText(txt)
                 self._qe_auto[key] = txt
@@ -1131,10 +1139,16 @@ class MainWindow(QMainWindow):
             elif txt:
                 v = to_float(txt)
                 if v is None:
-                    bad.append(self.qe[key].placeholderText())
+                    bad.append(self._qe_caps.get(key, key))    # «T зерна низ», а не «°C», как было
                 row[key] = v
         if bad:
             QMessageBox.warning(self, "Быстрый ввод", "Не число: " + ", ".join(bad))
+            return
+        if row["t_amb"] is not None and not -40.0 <= row["t_amb"] <= 45.0:
+            QMessageBox.warning(self, "Быстрый ввод", f"T наружная {fmt_num(row['t_amb'])} °C — вне −40…45 °C. "
+                                                      "Проверьте число (запятая, минус).")
+            self.qe["t_amb"].setFocus()
+            self.qe["t_amb"].selectAll()
             return
         if row["note"] and not self._confirm_note(row["note"]):
             self.qe["note"].setFocus()

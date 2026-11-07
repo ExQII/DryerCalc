@@ -84,9 +84,15 @@ def run(out_path: str) -> int:
         n0 = win.tbl_j.rowCount()
         win.qe["w_in"].setText("29,5")
         win.qe["w_out"].setText("24,1")
+        win.qe["t_amb"].setText("−4")                      # минус U+2212 — как из Word или с сайта погоды
         win._qe_add()
         check(win.tbl_j.rowCount() == n0 + 1 and win.tbl_j.item(n0, 0).text().startswith("25.10.26 07:00"),
               f"быстрый ввод: строка {win.tbl_j.item(n0, 0).text()} добавлена, время сдвинулось на 30 мин")
+        from .calibration import FIELDS as _JF
+        _ta = win.tbl_j.item(n0, _JF.index("t_amb")).text()
+        check(_ta == "-4" and win.qe["t_amb"].text() == "-4",
+              f"быстрый ввод: T наружная {_ta} °C записана и перенесена на следующую пробу")
+        win.qe["t_amb"].clear()
         win.tbl_j.removeRow(n0)
         win._save_journal()
         wpath = os.path.join(tmp, "rp5.csv")

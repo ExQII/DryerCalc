@@ -106,6 +106,7 @@ def to_float(x) -> Optional[float]:
     s = str(x).strip()
     if s in ("", "-", "–", "—", "−"):
         return None
+    s = s.replace("−", "-")         # знак минус U+2212 (Word, телефон, копия с сайта погоды): «−5» — это −5, не 5
     m = _NUM.search(s)
     return float(m.group().replace(",", ".")) if m else None
 

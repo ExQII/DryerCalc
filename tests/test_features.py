@@ -824,6 +824,30 @@ def test_quick_entry_carry_and_next_sample_time():
     assert journal_carry([dict(x, ts="") for x in rows])[1] is None and journal_carry([]) == ({}, None)
 
 
+def test_quick_entry_carries_outside_temperature():
+    """1.6.2: T наружная — с прошлой записи (последняя записанная), но не старше 3 ч до следующей пробы."""
+    from app.calibration import to_float
+    from app.regime import AMB_CARRY_H, journal_carry
+
+    def r(ts, wi=None, wo=None, ta=None, note=""):
+        return {"ts": "05.11.26 " + ts, "w_in": wi, "w_out": wo, "t_a1": None, "t_a2": None, "t_up": 60, "t_low": 60,
+                "d": 39, "note": note, "batch": "", "pass_no": None, "t_amb": ta, "rh": None}
+    rows = [r("08:30", 23, 20, 4), r("09:00", 23, 20, -3.5)]
+    assert journal_carry(rows)[0]["t_amb"] == -3.5
+    # строка смены режима без T наружной — берётся последняя записанная
+    assert journal_carry(rows + [r("09:10", note="Режим: D 39→40 с")])[0]["t_amb"] == -3.5
+    assert journal_carry([r("08:30", 23, 20)])[0]["t_amb"] is None                       # не писали — пусто
+    # после остановки: следующая проба через 3 ч 30 мин после последней T наружной — не переносится
+    stop = rows + [r("09:05", note="Остановка"), r("12:00", note="Запуск")]
+    vals, nxt = journal_carry(stop)
+    assert AMB_CARRY_H == 3.0 and nxt == datetime(2026, 11, 5, 12, 30) and vals["t_amb"] is None
+    assert journal_carry(rows + [r("09:30", note="Остановка"), r("11:30", note="Запуск")])[0]["t_amb"] == -3.5
+    # время не распознано — возраст не проверить, переносится последняя
+    assert journal_carry([dict(x, ts="") for x in stop])[0]["t_amb"] == -3.5
+    # минус в любом написании: «−5» (U+2212) — это −5, а не 5
+    assert (to_float("−5"), to_float("-3,5"), to_float("−0,5 °C"), to_float("+2")) == (-5.0, -3.5, -0.5, 2.0)
+
+
 def test_regime_change_row_and_fix_of_later_rows():
     from app.calibration import note_trap, observe_all, prepare
     from app.regime import plan_regime_change, regime_note
@@ -915,6 +939,49 @@ def test_quick_entry_follows_journal_edits_in_window():
         assert win.qe["d"].text() == "45"
     finally:
         dlg_cls.exec = orig
+    win.close()
+
+
+def test_quick_entry_outside_temperature_in_window(monkeypatch):
+    """1.6.2: T наружная пишется быстрым вводом вместе с пробой и переносится на следующую; правка в таблице —
+    в быстрый ввод; вне −40…45 °C — переспросить, строку не добавлять."""
+    _qapp()
+    from PySide6.QtWidgets import QMessageBox
+    from app.calibration import FIELDS
+    from app.gui import MainWindow
+    st = Storage(_tmp("amb162.db"))
+    st.replace_journal([{"ts": "05.11.26 08:30", "w_in": 23.0, "w_out": 20.0, "t_a1": None, "t_a2": None,
+                         "t_up": 60.0, "t_low": 60.0, "d": 39.0, "note": "", "batch": "", "pass_no": None,
+                         "t_amb": None, "rh": None}])
+    win = MainWindow(st)
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[2]))
+    assert win.qe["t_amb"].text() == ""                                  # в журнале T наружной нет — пусто
+    win.qe["w_in"].setText("22,9")
+    win.qe["w_out"].setText("19,8")
+    win.qe["t_amb"].setText("-3,5")
+    win._qe_add()
+    rows = win._table_to_rows()
+    assert len(rows) == 2 and rows[-1]["t_amb"] == -3.5 and rows[-1]["w_out"] == 19.8
+    assert win.storage.load_journal()[-1]["t_amb"] == -3.5               # сохранено в базу
+    assert win.qe["t_amb"].text() == "-3,5" and win.qe["w_in"].text() == ""   # T наружная осталась, проба — нет
+    win.qe["w_in"].setText("22,8")                                       # следующая проба: T наружная та же
+    win._qe_add()
+    assert win._table_to_rows()[-1]["t_amb"] == -3.5
+    # исправили T наружную в последней строке таблицы — быстрый ввод взял исправленное
+    win.tbl_j.item(win.tbl_j.rowCount() - 1, FIELDS.index("t_amb")).setText("-2")
+    win._qe_sync_timer.stop()
+    win._qe_prefill()
+    assert win.qe["t_amb"].text() == "-2"
+    # опечатка — вне −40…45 °C: строка не добавляется
+    n = win.tbl_j.rowCount()
+    win.qe["w_in"].setText("22,7")
+    win.qe["t_amb"].setText("350")
+    win._qe_add()
+    assert win.tbl_j.rowCount() == n and warned and "вне −40…45" in warned[-1]
+    win.qe["t_amb"].setText("холодно")
+    win._qe_add()
+    assert win.tbl_j.rowCount() == n and warned[-1] == "Не число: T наружная"
     win.close()
 
 
