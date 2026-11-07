@@ -133,6 +133,51 @@ def meter_bias(pairs: Sequence[Dict]) -> Dict:
     return res
 
 
+METER_NEAR = 2.0    # п.п.: данные «у цели», если показание пары (или лабораторная W партии) в пределах ±2 от цели
+
+
+def meter_coverage(pairs: Sequence[Dict], points: Sequence[Dict], target: float, use_batches: bool = True,
+                   res: Optional[Dict] = None) -> Dict:
+    """Какие показания влагомера покрыты парами и есть ли данные у целевой влажности.
+
+    Поправка нужна в первую очередь у цели (там решается, досушено ли зерно), а пары обычно набирают на
+    сыром зерне. Без пар и партий у цели поправка там — заход за данные: при наклоне k_w, известном
+    ±se_kw на 1 %, неизвестность у цели добавляет ±se_kw·|цель − среднее показание| (1σ).
+    points — партии (batch_meter_points); res — результат meter_bias по тем же парам (для se_kw)."""
+    skip = set((res or {}).get("outliers") or [])           # выбросы в поправку не идут — и в покрытие тоже
+    reads = []
+    for i, pr in enumerate(pairs):
+        a, b = _f(pr.get("reading")), _f(pr.get("ref"))
+        if a is not None and b is not None and i not in skip:
+            reads.append(a)
+    out: Dict = {"n": len(reads), "target": target, "n_near": 0, "n_batch_near": 0, "lo": None, "hi": None,
+                 "u_target": None, "warn": False, "text": ""}
+    if not reads:
+        return out
+    lo, hi = min(reads), max(reads)
+    n_near = sum(1 for a in reads if abs(a - target) <= METER_NEAR)
+    nb = sum(1 for x in points if x.get("diff") is not None and x.get("lab") is not None
+             and abs(x["lab"] - target) <= METER_NEAR) if use_batches else 0
+    out.update(lo=lo, hi=hi, n_near=n_near, n_batch_near=nb)
+    txt = (f"Пары покрывают показания {lo:.1f}–{hi:.1f} %; у цели {target:g} % (±{METER_NEAR:g} п.п.): "
+           f"пар {n_near}" + (f", партий {nb}" if use_batches else ""))
+    if n_near or nb:
+        txt += "."
+    else:
+        out["warn"] = True
+        m1 = (res or {}).get("m1")
+        if m1 and m1.get("se_kw"):
+            mean_r = sum(reads) / len(reads)
+            out["u_target"] = abs(m1["se_kw"]) * abs(target - mean_r)
+        txt += (" — поправка у цели посчитана с заходом за данные"
+                + (f" (наклон k_w известен ±{abs(m1['se_kw']):.3f} на 1 % → у цели ещё "
+                   f"±{out['u_target']:.1f} п.п.)" if out["u_target"] is not None else "")
+                + ". Возьмите 3–5 пар на последнем проходе, когда выход у цели; партия с лабораторной W тоже "
+                  "даёт точку у цели.")
+    out["text"] = txt
+    return out
+
+
 # ----------------------------------------------------------------------------
 # Поправка влагомера по партиям: лабораторная влажность готовой партии против показаний выходного влагомера
 # ----------------------------------------------------------------------------

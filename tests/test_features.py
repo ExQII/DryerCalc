@@ -427,6 +427,93 @@ def test_experiment_plan_respects_limits():
     assert all(a.score >= b.score for a, b in zip(ok, ok[1:]))
 
 
+def test_experiment_plan_steps_from_explored_zone_and_pairs():
+    """1.6.1: опыт — не дальше 10 с / 10 °C от края изученного (лесенкой), T блоков — парой уставок."""
+    from app.doe import (DOE_STEP, experiment_bounds, explored_bounds, explored_passes, fmt_cand_t, suggest,
+                         typical_pair, typical_regime)
+    rows, _ = read_journal(SAMPLE)
+    passes = explored_passes(rows, P)
+    d_typ, t_typ = typical_regime(passes)
+    ex = explored_bounds(P, passes)                       # калибровки нет — по проходам журнала
+    assert ex["d"] == (min(x["d"] for x in passes), max(x["d"] for x in passes))
+    free, _ = suggest(P, C, 22.0, passes, 6.0, d_typ, t_typ, 4, True, t_max=70.0,
+                      bounds={"d": (10.0, 100.0), "t": (-1e9, 1e9)})
+    assert max(x.d for x in free) > ex["d"][1] + DOE_STEP["d"]          # без шага — скачок вдвое дальше
+    plan, ok = suggest(P, C, 22.0, passes, 6.0, d_typ, t_typ, 4, True, t_max=70.0)
+    b = experiment_bounds(P, passes)
+    assert plan and all(b["d"][0] <= x.d <= b["d"][1] for x in ok)
+    assert all(b["t"][0] <= x.t <= b["t"][1] for x in ok)
+    # калибровка расширила изученное — опыты идут дальше
+    p2 = replace(P, explored={"d": [33.0, 50.0], "t": [40.0, 70.0], "w": [18.0, 32.0]})
+    assert explored_bounds(p2, passes)["d"] == (33.0, 50.0)
+    plan2, _ = suggest(p2, C, 22.0, passes, 6.0, d_typ, t_typ, 4, True, t_max=70.0)
+    assert max(x.d for x in plan2) > ex["d"][1] + DOE_STEP["d"] and max(x.d for x in plan2) <= 60.0
+    # привычная пара — та, что простояла больше строк; пустая клетка — прежняя уставка
+    jr = [{"t_up": 60.0, "t_low": 55.0}, {}, {}, {"t_up": 50.0, "t_low": 50.0}, {"t_low": 45.0}]
+    assert typical_pair(jr) == (60.0, 55.0) and typical_pair([{"t_up": 60.0}]) is None
+    plan3, ok3 = suggest(P, C, 22.0, passes, 6.0, d_typ, t_typ, 4, True, t_max=70.0, t_pair=(60.0, 55.0))
+    assert plan3 and all(x.t_up - x.t_low == 5.0 and x.t == 0.5 * (x.t_up + x.t_low) for x in ok3)
+    assert all(max(x.t_up, x.t_low) <= 70.0 and (x.t_up - 60.0) % 5 == 0 for x in ok3)
+    for x in plan3:
+        assert fmt_cand_t(x) == f"{x.t_up:.0f}/{x.t_low:.0f}"
+        assert abs(x.d - d_typ) < 0.5 or (x.t_up, x.t_low) == (60.0, 55.0)   # один фактор: D — при привычной паре
+    assert fmt_cand_t(plan[0]) == f"{plan[0].t:.0f}"                         # без пары — одно число
+
+
+def test_meter_coverage_near_target():
+    """1.6.1: пары только на сыром зерне — предупреждение «у цели данных нет» с неизвестностью от наклона."""
+    from app.analysis import meter_coverage
+    raw = [{"reading": 18.0 + 0.5 * i, "ref": 18.0 + 0.5 * i + 0.7 + 0.1 * (-1) ** i} for i in range(12)]
+    r = meter_bias(raw)
+    cov = meter_coverage(raw, [], 14.0, True, r)
+    assert cov["warn"] and cov["n"] == 12 and cov["n_near"] == 0 and (cov["lo"], cov["hi"]) == (18.0, 23.5)
+    mean_r = sum(x["reading"] for x in raw) / 12
+    assert abs(cov["u_target"] - abs(r["m1"]["se_kw"]) * abs(14.0 - mean_r)) < 1e-12
+    assert "у цели 14 % (±2 п.п.): пар 0, партий 0 — поправка у цели посчитана с заходом" in cov["text"]
+    assert "3–5 пар на последнем проходе" in cov["text"]
+    near = raw + [{"reading": 14.5, "ref": 15.2}]
+    c2 = meter_coverage(near, [], 14.0, True, meter_bias(near))
+    assert not c2["warn"] and c2["n_near"] == 1 and c2["text"].endswith("пар 1, партий 0.")
+    batch = [{"lab": 14.2, "read": 13.5, "diff": -0.7}]
+    assert not meter_coverage(raw, batch, 14.0, True, r)["warn"]
+    c3 = meter_coverage(raw, batch, 14.0, False, r)
+    assert c3["warn"] and "партий" not in c3["text"].split("—")[0]          # партии выключены — не считаются
+    out = raw + [{"reading": 14.0, "ref": 30.0}]                             # выброс в покрытие не идёт
+    r4 = meter_bias(out)
+    assert len(out) - 1 in r4["outliers"] and meter_coverage(out, [], 14.0, True, r4)["n_near"] == 0
+    assert meter_coverage([], [], 14.0)["text"] == ""
+
+
+def test_doe_tab_and_meter_tab_show_new_lines():
+    """1.6.1 в окне: план опытов — T парой, пределы из журнала; влагомер — покрытие пар у цели."""
+    _qapp()
+    from app.gui import MainWindow
+    rows, _ = read_journal(SAMPLE)
+    stg = Storage(_tmp("doe161.db"))
+    stg.replace_journal(rows)
+    stg.save_params(replace(P, explored={"d": [34.0, 40.0], "t": [48.0, 73.0], "w": [18.0, 33.0]}))
+    stg.set_list("meter_pairs", [{"dt": "", "reading": 18.0 + 0.5 * i, "ref": 18.7 + 0.5 * i, "note": ""}
+                                 for i in range(12)])
+    win = MainWindow(stg)
+    tc = win.tab_check
+    tc.d_w.setValue(22.0)
+    tc.refresh_doe()
+    n = tc.doe_tbl.rowCount()
+    assert n >= 1
+    cells = [tc.doe_tbl.item(i, 2).text() for i in range(n)]
+    assert all("/" in x for x in cells)                                    # T блоков — «65/65», как на пульте
+    assert all(float(tc.doe_tbl.item(i, 1).text()) <= 50.0 for i in range(n))   # край 40 + 10 с
+    assert "журнал покрывает D 34–40 с и T блоков 48–73 °C" in tc.doe_hint.text()
+    assert "октября" not in tc.doe_hint.text() and "лесенкой" in tc.doe_hint.text()
+    assert "T блоков = 65/65 °C" in tc.doe_summary.text()
+    win.in_wk.setValue(14.0)
+    win.tab_data._m_stats()
+    txt = win.tab_data.m_stat.text()
+    assert "⚠ Пары покрывают показания 18.0–23.5 %; у цели 14 % (±2 п.п.): пар 0, партий 0" in txt
+    assert win.tab_data._m_cov["warn"]
+    win.close()
+
+
 def test_quality_and_thermal_efficiency():
     from app.batches import correlation, quality_findings, quality_table
     b = {"m_in": 400, "w_in": 30.0, "m_out": 360, "w_out": 20.0, "fuel": 4000}

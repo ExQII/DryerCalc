@@ -1,8 +1,8 @@
 """План опытов: какой режим поставить на следующих проходах, чтобы модель училась быстрее всего.
 
-Журнал октября покрывает узкую область: D 35–43, T блоков 48–73 °C. Внутри неё эмпирическая и физическая
-модели почти совпадают, а за её пределами расходятся — значит, решить, какая права, и уточнить параметры можно
-только проходами в других режимах. Подбор кандидата учитывает две вещи:
+Журнал покрывает узкую область режимов (в сезоне 2026: D 33–40,5 с, T блоков в среднем по ступеням 40–68 °C).
+Внутри неё эмпирическая и физическая модели почти совпадают, а за её пределами расходятся — значит, решить,
+какая права, и уточнить параметры можно только проходами в других режимах. Подбор кандидата учитывает две вещи:
 
 * новизна — расстояние от уже пройденных режимов в пространстве (D, T блоков, W вх) с масштабами
   10 с, 10 °C и 5 п.п. (единица ≈ «заметно другой режим»); точка внутри уже изученного облака почти ничего
@@ -12,7 +12,12 @@
   (T-оптимальный план различения моделей, Atkinson & Fedorov, 1975).
 
 Балл = min(новизна, 2) · (1 + min(расхождение, 3)). Кандидаты проверяются на ограничения: съём за проход в
-допустимом лимите, T блоков и ожидаемая T зерна не выше заданных пределов, D 10…100. По умолчанию меняется
+допустимом лимите, T блоков и ожидаемая T зерна не выше заданных пределов, D 10…100. Опыт уходит от края
+изученного не дальше шага DOE_STEP (10 с по D, 10 °C по T): балл растёт с расстоянием, и без шага первым
+опытом выходил бы самый дальний режим (на журнале 2026 — D 79 при изученных 33–40, вдвое больший поток).
+Пройденный шаг расширяет изученное, и следующий план идёт дальше — лесенкой. T блоков перебирается парой
+уставок (1-я / 2-я ступень, как на пульте): от привычной пары обе ступени сдвигаются на 5 °C; модель
+считает по среднему ступеней, как и при калибровке. По умолчанию меняется
 один фактор относительно привычного режима (проще для сушильщиков и чище для анализа). План из нескольких
 проходов набирается жадно: выбранная точка сразу добавляется к «уже изученным», чтобы следующая была другой.
 """
@@ -20,11 +25,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Dict, List, Sequence, Tuple
+from collections import Counter
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import model as mdl
 
 SCALE_D, SCALE_T, SCALE_W = 10.0, 10.0, 5.0
+DOE_STEP = {"d": 10.0, "t": 10.0}       # насколько опыт может уйти от края изученного: D, с; T блоков, °C
+T_SHIFT = 5.0                           # шаг перебора T блоков (обе ступени сразу), °C
 
 
 @dataclass
@@ -41,6 +49,8 @@ class Candidate:
     feasible: bool
     why: str
     issues: str
+    t_up: Optional[float] = None          # уставки ступеней, если T перебиралась парой (иначе — одно число t)
+    t_low: Optional[float] = None
 
 
 def explored_passes(rows: List[Dict], p: mdl.DryerParams) -> List[Dict]:
@@ -49,6 +59,46 @@ def explored_passes(rows: List[Dict], p: mdl.DryerParams) -> List[Dict]:
     obs, _, _ = observe_all(rows, p)
     return [{"d": s["d"], "t": s["t"], "w_in": s["w_in"], "dw": s["dw_obs"], "start": s["start"], "n": s["n"]}
             for s in segment_summary(obs, p)]
+
+
+def explored_bounds(p: mdl.DryerParams, passes: Sequence[Dict]) -> Optional[Dict[str, Tuple[float, float]]]:
+    """Изученные диапазоны D и T блоков (среднее ступеней): калибровка (p.explored) вместе с проходами журнала —
+    проходы могли добавиться после калибровки. None — нет ни того, ни другого."""
+    out: Dict[str, Tuple[float, float]] = {}
+    ex = p.explored or {}
+    for key in ("d", "t"):
+        vals = [float(x[key]) for x in passes if x.get(key) is not None]
+        try:
+            vals += [float(ex[key][0]), float(ex[key][1])]
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+        if not vals:
+            return None
+        out[key] = (min(vals), max(vals))
+    return out
+
+
+def experiment_bounds(p: mdl.DryerParams, passes: Sequence[Dict]) -> Optional[Dict[str, Tuple[float, float]]]:
+    """Куда может зайти опыт: изученные диапазоны ± DOE_STEP."""
+    b = explored_bounds(p, passes)
+    if b is None:
+        return None
+    return {k: (lo - DOE_STEP[k], hi + DOE_STEP[k]) for k, (lo, hi) in b.items()}
+
+
+def typical_pair(rows: Sequence[Dict]) -> Optional[Tuple[float, float]]:
+    """Привычные уставки T блоков (1-я, 2-я ступень) — пара, простоявшая больше всего строк журнала. Пустая клетка
+    в журнале — прежняя уставка; одна ступень не записана ни разу — пары нет (None)."""
+    up = low = None
+    cnt: Counter = Counter()
+    for r in rows:
+        if r.get("t_up") is not None:
+            up = float(r["t_up"])
+        if r.get("t_low") is not None:
+            low = float(r["t_low"])
+        if up is not None and low is not None:
+            cnt[(up, low)] += 1
+    return cnt.most_common(1)[0][0] if cnt else None
 
 
 def typical_regime(passes: Sequence[Dict]) -> Tuple[float, float]:
@@ -68,22 +118,35 @@ def _novelty(d: float, t: float, w: float, pts: Sequence[Tuple[float, float, flo
 
 def suggest(p: mdl.DryerParams, c_amb: mdl.Conditions, w_in: float, passes: Sequence[Dict], hard: float,
             d_typ: float, t_typ: float, n_plan: int = 4, one_factor: bool = True, sigma_pp: float = 0.35,
-            min_dw: float = 1.5, t_max: float = 70.0) -> Tuple[List[Candidate], List[Candidate]]:
+            min_dw: float = 1.5, t_max: float = 70.0, t_pair: Optional[Tuple[float, float]] = None,
+            bounds: Optional[Dict[str, Tuple[float, float]]] = None) -> Tuple[List[Candidate], List[Candidate]]:
     """Возвращает (план из n_plan проходов, все допустимые кандидаты по убыванию балла).
 
     hard — лимит съёма за проход для опытов (проверяется по обеим моделям — берётся худшая);
-    t_max — потолок T блоков для опытов (не выше заданного предела агента)."""
+    t_max — потолок T блоков для опытов (не выше заданного предела агента; для пары — по старшей ступени);
+    t_pair — привычные уставки ступеней: T перебирается парой (обе ступени ± 5 °C), t_typ — их среднее;
+    bounds — куда может зайти опыт (experiment_bounds); None — посчитать по p и passes."""
     emp = replace(p, model_kind="empirical")
     phys = replace(p, model_kind="physics")
     base = p
+    if bounds is None:
+        bounds = experiment_bounds(p, passes)
+    d_lo, d_hi = bounds["d"] if bounds else (10.0, 100.0)
+    t_lo, t_hi_b = bounds["t"] if bounds else (-1e9, 1e9)
     d_vals = sorted({int(round(d_typ + k)) for k in range(-25, 41, 5)} | {int(round(d_typ))})
-    d_vals = [d for d in d_vals if 10 <= d <= 100]
+    d_vals = [d for d in d_vals if 10 <= d <= 100 and d_lo - 1e-9 <= d <= d_hi + 1e-9]
     t_hi = min(t_max, p.t_agent_max) if p.t_agent_max else t_max
-    t_vals = sorted({round(t_typ + k) for k in range(-15, 16, 5)})
-    t_vals = [t for t in t_vals if 35 <= t <= t_hi]
+    if t_pair is not None:
+        t_typ = 0.5 * (t_pair[0] + t_pair[1])
+        t_opts = [(t_pair[0] + T_SHIFT * k, t_pair[1] + T_SHIFT * k) for k in range(-3, 4)]
+        t_opts = [(0.5 * (a + b), a, b) for a, b in t_opts if min(a, b) >= 35 and max(a, b) <= t_hi]
+    else:
+        t_opts = [(float(t), None, None) for t in sorted({round(t_typ + k) for k in range(-15, 16, 5)})
+                  if 35 <= t <= t_hi]
+    t_opts = [x for x in t_opts if t_lo - 1e-9 <= x[0] <= t_hi_b + 1e-9 or abs(x[0] - t_typ) < 0.5]
     cands: List[Candidate] = []
     for d in d_vals:
-        for t in t_vals:
+        for t, t_up, t_low in t_opts:
             if one_factor and not (abs(d - d_typ) < 0.5 or abs(t - t_typ) < 0.5):
                 continue
             if abs(d - d_typ) < 0.5 and abs(t - t_typ) < 0.5:
@@ -113,7 +176,7 @@ def suggest(p: mdl.DryerParams, c_amb: mdl.Conditions, w_in: float, passes: Sequ
                 why.append(f"модели расходятся на {abs(dw_e - dw_p):.1f} п.п. — покажет, какая права")
             cands.append(Candidate(d=float(d), t=float(t), dw_emp=dw_e, dw_phys=dw_p, w_out=pb.w_out, t_grain=tg,
                                    novelty=nov, disagreement=dis, score=score, feasible=not issues,
-                                   why="; ".join(why), issues="; ".join(issues)))
+                                   why="; ".join(why), issues="; ".join(issues), t_up=t_up, t_low=t_low))
     ok = sorted([x for x in cands if x.feasible], key=lambda x: -x.score)
     plan: List[Candidate] = []
     pts = [(x["d"], x["t"], x["w_in"]) for x in passes]
@@ -131,3 +194,10 @@ def suggest(p: mdl.DryerParams, c_amb: mdl.Conditions, w_in: float, passes: Sequ
         pts.append((best.d, best.t, w_in))
         pool.remove(best)
     return plan, ok
+
+
+def fmt_cand_t(x: Candidate) -> str:
+    """T блоков кандидата так, как её ставят: «60/55» (пара) или одно число."""
+    if x.t_up is not None and x.t_low is not None:
+        return f"{x.t_up:.0f}/{x.t_low:.0f}"
+    return f"{x.t:.0f}"

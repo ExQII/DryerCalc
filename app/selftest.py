@@ -104,6 +104,9 @@ def run(out_path: str) -> int:
         win.storage.set_list("meter_pairs", [{"reading": 15.0 + d, "ref": 15.0} for d in (0.6, 0.9, 0.8, 1.1, 0.7)])
         win.tab_data._load()
         check(abs(win.tab_data._m_result["mean"] - 0.82) < 1e-9, f"поправка влагомера по парам: {win.tab_data._m_result['text'][:60]}")
+        _cv = win.tab_data._m_cov
+        check(_cv["n_near"] == 4 and not _cv["warn"] and "у цели" in win.tab_data.m_stat.text(),
+              f"покрытие пар влагомера: у цели {_cv['target']:g} % — пар {_cv['n_near']}")
         win.tab_batches._from_journal()
         check(win.tab_batches.tbl_b.rowCount() == 3, f"партии из журнала: {win.tab_batches.tbl_b.rowCount()}")
         win.tab_batches._fill_batches([dict(b, m_in=400, w_in=30, m_out=352, w_out=23.6, fuel=5000, fuel_price=7)
@@ -137,8 +140,11 @@ def run(out_path: str) -> int:
         win.tab_check.d_w.setValue(22.0)
         win.tab_check.refresh_doe()
         n_plan = win.tab_check.doe_tbl.rowCount()
-        check(n_plan >= 1, f"план опытов: {n_plan} прох., первый D = "
-              f"{win.tab_check.doe_tbl.item(0, 1).text() if n_plan else '—'}")
+        t_cell = win.tab_check.doe_tbl.item(0, 2).text() if n_plan else ""
+        check(n_plan >= 1 and ("/" in t_cell or win.params.temp_source != "block"),
+              f"план опытов: {n_plan} прох., первый D = "
+              f"{win.tab_check.doe_tbl.item(0, 1).text() if n_plan else '—'}, T блоков {t_cell or '—'}")
+        check("журнал покрывает D" in win.tab_check.doe_hint.text(), "план опытов: пределы изученного — из журнала")
         win.tab_check.sub.setCurrentIndex(0)
         win.tab_recirc._from_journal()
         win.tab_recirc.recalc()

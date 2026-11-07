@@ -11,7 +11,8 @@ from PySide6.QtWidgets import (QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, Q
 
 from . import worker
 from .analysis import backtest, drift_text, rate_sigma_from_backtest
-from .doe import explored_passes, suggest, typical_regime
+from .doe import (DOE_STEP, explored_bounds, explored_passes, fmt_cand_t, suggest, typical_pair,
+                  typical_regime)
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import dspin, fnum, item, mute, scroll_wrap, size_by_current, table, with_legend
@@ -227,15 +228,7 @@ class CheckTab(QWidget):
         b = QPushButton("Подобрать план")
         b.clicked.connect(self.refresh_doe)
         lv.addWidget(b)
-        self.doe_hint = QLabel(
-            "Зачем: в журнале октября D было только 35–43, T блоков 48–73 °C. Внутри этой области обе модели "
-            "говорят почти одно и то же, а за её пределами расходятся — проверить, какая права, и уточнить "
-            "влияние T и времени пребывания можно только проходами в других режимах. Программа выбирает режимы, "
-            "которые (1) дальше всего от уже изученных и (2) там, где модели расходятся сильнее всего, — такой "
-            "проход даёт больше всего информации. Все кандидаты проверены на ваш лимит съёма по ОБЕИМ моделям "
-            "(берётся худшая), на пределы T блоков и T зерна. Правила: меняйте режим в начале прохода и держите его "
-            "весь проход; записывайте пробы как обычно; после прохода нажмите «Калибровать модель» в разделе "
-            "«Журнал проб». Если зерно семенное — согласуйте T с инструкцией.")
+        self.doe_hint = QLabel(self._doe_hint_text(None))
         self.doe_hint.setWordWrap(True)
         lv.addWidget(self.doe_hint)
         lv.addStretch(1)
@@ -253,7 +246,7 @@ class CheckTab(QWidget):
         tv.addWidget(self.doe_tbl)
         right.addWidget(top)
         self.doe_plot = SimplePlot()
-        self.doe_plot.set_labels("разгрузка D, с", "T блоков, °C")
+        self.doe_plot.set_labels("разгрузка D, с", "T блоков, среднее ступеней, °C")
         right.addWidget(with_legend(self.doe_plot, (("dot", "dot", "уже изучено"),
                                                     ("dot", "target", "предлагаемые опыты"),
                                                     ("dot", "ref", "другие допустимые режимы"))))
@@ -265,6 +258,27 @@ class CheckTab(QWidget):
         self.d_n.valueChanged.connect(self._doe_changed)
         self.d_one.stateChanged.connect(self._doe_changed)
         return w
+
+    @staticmethod
+    def _doe_hint_text(zone) -> str:
+        """Пояснение к плану; zone — изученные диапазоны D и T (explored_bounds) или None."""
+        if zone:
+            (d0, d1), (t0, t1) = zone["d"], zone["t"]
+            where = (f"Зачем: журнал покрывает D {d0:.0f}–{d1:.0f} с и T блоков {t0:.0f}–{t1:.0f} °C (среднее "
+                     f"ступеней). Внутри этой области обе модели ")
+        else:
+            where = "Зачем: в журнале узкая область режимов. Внутри неё обе модели "
+        return (where +
+                "говорят почти одно и то же, а за её пределами расходятся — проверить, какая права, и уточнить "
+                "влияние T и времени пребывания можно только проходами в других режимах. Программа выбирает режимы, "
+                "которые (1) дальше всего от уже изученных и (2) там, где модели расходятся сильнее всего, — такой "
+                "проход даёт больше всего информации. Опыт уходит от края изученного не дальше "
+                f"{DOE_STEP['d']:.0f} с по D и {DOE_STEP['t']:.0f} °C по T: после такого прохода и калибровки "
+                "изученное расширится, и следующий план пойдёт дальше — лесенкой, без скачка сразу в неизвестное. "
+                "Все кандидаты проверены на ваш лимит съёма по ОБЕИМ моделям (берётся худшая), на пределы T блоков "
+                "и T зерна. Правила: меняйте режим в начале прохода и держите его весь проход; записывайте пробы как "
+                "обычно; после прохода нажмите «Калибровать модель» в разделе «Журнал проб». Если зерно семенное — "
+                "согласуйте T с инструкцией.")
 
     def _doe_changed(self, *_a) -> None:
         self._doe_dirty = True
@@ -280,13 +294,19 @@ class CheckTab(QWidget):
             self.d_tmax.blockSignals(True)
             self.d_tmax.setValue(p.t_agent_max)
             self.d_tmax.blockSignals(False)
-        passes = explored_passes(self.win.journal_rows(), p)
+        rows = self.win.journal_rows()
+        passes = explored_passes(rows, p)
         d_typ, t_typ = typical_regime(passes)
+        pair = typical_pair(rows) if p.temp_source == "block" else None
+        if pair is not None:
+            t_typ = 0.5 * (pair[0] + pair[1])
+        self.doe_hint.setText(self._doe_hint_text(explored_bounds(p, passes)))
         c = self.win.conditions()
         sigma_pp = 0.35
         plan, ok = suggest(p, c, self.d_w.value(), passes, self.d_lim.value(), d_typ, t_typ, self.d_n.value(),
-                           self.d_one.isChecked(), sigma_pp, t_max=self.d_tmax.value())
-        explored = ", ".join(f"D {x['d']:.0f} / {x['t']:.0f} °C / W {x['w_in']:.0f} %" for x in passes) or "нет"
+                           self.d_one.isChecked(), sigma_pp, t_max=self.d_tmax.value(), t_pair=pair)
+        explored = "; ".join(f"D {x['d']:.0f} с, T {x['t']:.0f} °C, W {x['w_in']:.0f} %" for x in passes) or "нет"
+        t_name = f"{pair[0]:.0f}/{pair[1]:.0f}" if pair is not None else f"{t_typ:.0f}"
         if not plan:
             self.doe_summary.setText(
                 f"Изучено: {explored}.<br><span style='color:{th.error}'>Нет режимов, которые укладываются в лимит "
@@ -294,12 +314,13 @@ class CheckTab(QWidget):
                 f"«один фактор».</span>")
         else:
             self.doe_summary.setText(
-                f"Привычный режим по журналу: <b>D = {d_typ:.0f}, T блоков = {t_typ:.0f} °C</b>. Изученные проходы: "
-                f"{explored}.<br>Предлагаемый порядок опытов — ниже (каждый следующий выбран с учётом предыдущих). "
+                f"Привычный режим по журналу: <b>D = {d_typ:.0f} с, T блоков = {t_name} °C</b>. Изученные проходы "
+                f"(T — среднее ступеней): {explored}.<br>Предлагаемый порядок опытов — ниже (каждый следующий выбран "
+                f"с учётом предыдущих). "
                 f"Допустимых режимов всего: {len(ok)}.")
         self.doe_tbl.setRowCount(len(plan))
         for i, x in enumerate(plan):
-            cells = [str(i + 1), f"{x.d:.0f}", f"{x.t:.0f}", f"{x.dw_emp:.1f}", f"{x.dw_phys:.1f}", f"{x.w_out:.1f}",
+            cells = [str(i + 1), f"{x.d:.0f}", fmt_cand_t(x), f"{x.dw_emp:.1f}", f"{x.dw_phys:.1f}", f"{x.w_out:.1f}",
                      f"{x.t_grain:.0f}", f"{x.novelty:.1f}", f"{x.disagreement:.1f}", x.why]
             for j, txt in enumerate(cells):
                 it = item(txt, align_right=0 < j < 9)

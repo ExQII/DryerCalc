@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
                                QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
-from .analysis import batch_meter_points, combine_meter, meter_bias
+from .analysis import batch_meter_points, combine_meter, meter_bias, meter_coverage
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import mute, set_role, size_by_current, to_num, with_legend
@@ -352,6 +352,10 @@ class DataTab(QWidget):
         elif not points:
             txt += ("<br>Партий с лабораторной W после охлаждения пока нет — впишите её в разделе «Партии и очередь», "
                     "это ещё один независимый источник поправки.")
+        cov = meter_coverage(self._pairs(), points, self.win.in_wk.value(), self.cb_mb.isChecked(), r)
+        if cov["text"]:
+            txt += "<br>" + (f"<span style='color:{th.t.amber_ink}'>⚠ {cov['text']}</span>" if cov["warn"]
+                             else cov["text"])
         txt += (f"<br>Сейчас в модели: <b>a = {cur:+.2f}</b>" + (f", k_w = {p.out_kw:+.3f}" if p.out_kw else "")
                 + (f", k_t = {p.out_kt:+.3f}" if p.out_kt else "") + ".")
         if comb.get("a") is not None and comb.get("se") and abs(cur - comb["a"]) > 1.96 * comb["se"]:
@@ -376,6 +380,7 @@ class DataTab(QWidget):
             self.plot_m.set_title("")
         self._m_result = r
         self._m_comb = comb
+        self._m_cov = cov
 
     def _fill_mb(self, points) -> None:
         self.tbl_mb.setRowCount(len(points))
