@@ -67,6 +67,24 @@ class _JournalDelegate(QStyledItemDelegate):
             self._on_edit(index.row(), index.column(), old, new)
 
 
+LIMITS_DEFAULT = (75.0, 75.0)     # пределы T блоков (каждая ступень) и T зерна, °C — заданы инженером 08.11.2026
+
+
+def migrate_params(storage) -> mdl.DryerParams:
+    """Параметры из базы с однократными переводами старых настроек. v1.7.2: пределы T блоков и T зерна не заданы
+    (0 — «не задано», так было по умолчанию) — ставятся 75 и 75 °C; после этого — как выставил инженер (0 тоже)."""
+    p = storage.load_params()
+    mig = storage.get_json("migrations", {}) or {}
+    if not mig.get("limits_v1"):
+        if not p.t_agent_max and not p.t_grain_max:
+            from dataclasses import replace as _rp
+            p = _rp(p, t_agent_max=LIMITS_DEFAULT[0], t_grain_max=LIMITS_DEFAULT[1])
+            storage.save_params(p)
+        mig["limits_v1"] = True
+        storage.set_json("migrations", mig)
+    return p
+
+
 class MainWindow(QMainWindow):
     def __init__(self, storage: Optional[Storage] = None):
         super().__init__()
@@ -75,7 +93,7 @@ class MainWindow(QMainWindow):
         # оформление — до того, как строятся страницы: шрифт, палитра и общий QSS (design.py)
         self.ui_theme = (self.storage.get_json("ui_theme", {}) or {}).get("mode", "system")
         design.apply(QApplication.instance(), self.ui_theme, QApplication.font().pointSizeF())
-        self.params: mdl.DryerParams = self.storage.load_params()
+        self.params: mdl.DryerParams = migrate_params(self.storage)
         self.plans: List[mdl.Plan] = []
         self._loading = False
         # правки журнала сохраняются сами через секунду после последнего изменения
@@ -1932,7 +1950,7 @@ class MainWindow(QMainWindow):
         b = QPushButton("Подобрать a, b, c по журналу (датчики T зерна)")
         b.clicked.connect(self._fit_grain_temp)
         f.addRow(b)
-        f.addRow("Предел T блоков (агента) — по инструкции для вашего назначения зерна", self.s_tagmax)
+        f.addRow("Предел T блоков (агента), каждая ступень — по инструкции для назначения зерна", self.s_tagmax)
         f.addRow("Предел нагрева зерна", self.s_tgmax)
         right.addWidget(gb)
 
@@ -2086,7 +2104,7 @@ class MainWindow(QMainWindow):
 
     def _reload_all(self) -> None:
         self._ready = False
-        self.params = self.storage.load_params()
+        self.params = migrate_params(self.storage)
         self.tbl_j.setRowCount(0)
         self._load_journal_into_table()
         self._load_ui_state()

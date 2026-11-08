@@ -62,6 +62,8 @@ class LiveState:
     warmup: bool = False                      # сейчас рециркуляция-прогрев: сушилку заполнили, подачи ещё не было
     warmup_since: Optional[datetime] = None   # с какого времени прогрев
     fill: bool = False                        # идёт набор сушилки (последняя строка прохода — в наборе): выгрузки нет
+    loop: bool = False                        # идёт рециркуляция через силос: выгрузка в тот же силос
+    loop_since: Optional[datetime] = None     # с какого времени
     fill_since: Optional[datetime] = None     # с какого времени набор (последний в проходе)
     fill_end: Optional[datetime] = None       # когда набор кончился (рециркуляция / подача); None — идёт
     fill_w: List[float] = field(default_factory=list)   # пробы входа в наборе — зерно, которым заполнена шахта
@@ -169,6 +171,10 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
             st.warmup_since = None
         elif st.warmup_since is None:
             st.warmup_since = r["dt"]
+        if not r.get("loop"):
+            st.loop_since = None
+        elif st.loop_since is None:
+            st.loop_since = r["dt"]
         if r.get("fill"):
             if st.fill_since is None or st.fill_end is not None:     # новый набор (прошлый в проходе кончился)
                 st.fill_since, st.fill_end, st.fill_w = r["dt"], None, []
@@ -188,13 +194,13 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
     # влажность выхода по времени (истинная — с поправкой влагомера) — для средней влажности приёмного силоса
     rd = [(r["dt"], r["w_out"], mdl.true_from_read(p, r["w_out"], 0.5 * (r["t_a1"] + r["t_a2"])
                                                     if r.get("t_a1") is not None and r.get("t_a2") is not None else None))
-          for r in rs if r.get("w_out") is not None and not r.get("recirc")]
+          for r in rs if r.get("w_out") is not None and not r.get("recirc") and not r.get("loop")]
     t_rd = [(t - rs[0]["dt"]).total_seconds() / 3600.0 for t, _, _ in rd]
     unloaded = silo_sum = silo_sum_read = 0.0
     for a, b in zip(rs, rs[1:] + [None]):
         t_next = b["dt"] if b is not None else end
         if (a.get("d_f") is not None and not a.get("stopped") and not a.get("fill") and not a.get("recirc")
-                and not a.get("burner_off")):
+                and not a.get("burner_off") and not a.get("loop")):
             dm = mdl.q_at(p, a["d_f"]) * max((t_next - a["dt"]).total_seconds(), 0.0) / 3600.0
             unloaded += dm
             if rd and dm > 0:
@@ -209,6 +215,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
     st.recirc = bool(rs[-1].get("recirc"))
     st.warmup = bool(rs[-1].get("warmup"))
     st.fill = bool(rs[-1].get("fill"))
+    st.loop = bool(rs[-1].get("loop"))
     st.burner_off = bool(rs[-1].get("burner_off"))
     start = st.fill or st.warmup          # сушилку набрали (набирают) — совет на запуск / на подачу
     if start and p.temp_source == "block" and not (st.t_up and st.t_up > 0 and st.t_low and st.t_low > 0):
@@ -493,8 +500,9 @@ def verified_regime(p: mdl.DryerParams, st: LiveState, c: mdl.Conditions, fc: "L
             break
         if not (t_lo - 1e-9 <= t_k <= t_hi + 1e-9):
             continue                      # текущая T сама вне зоны: идём дальше в ту же сторону, к зоне
-        if p.t_agent_max and t_k > p.t_agent_max + 1e-9:
-            reason = f"T блоков пришлось бы выше ограничения {p.t_agent_max:g} °C"
+        if p.t_agent_max and max(up + dt, low + dt) > p.t_agent_max + 1e-9:     # предел — для каждой ступени
+            reason = (f"T блоков пришлось бы {up + dt:.0f}/{low + dt:.0f} °C — выше ограничения {p.t_agent_max:g} °C "
+                      f"на ступень")
             break
         tg_k = tg_now + p.tg_b * dt
         if p.t_grain_max and tg_k > p.t_grain_max + 1e-9:
@@ -661,8 +669,11 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
         cool_h = fc.m_out_pass / mdl.q_full(p) if cool and mdl.q_full(p) > 0 else 0.0
         fc.batch_end = pe + timedelta(hours=(p.overhead_h if cool else 0.0) + cool_h)
     fc.t_grain_est = mdl.grain_temp(p, c.t_proc, w_in)
-    if p.t_agent_max and c.t_proc > p.t_agent_max:
-        fc.warnings.append(f"T блоков {c.t_proc:.0f} °C выше заданного ограничения {p.t_agent_max:.0f} °C")
+    pair = t_pair(st) if p.temp_source == "block" else None
+    t_top = max(pair) if pair else c.t_proc                  # предел T блоков — для каждой ступени
+    if p.t_agent_max and t_top > p.t_agent_max + 1e-9:
+        t_txt = fmt_t(pair) if pair else f"{c.t_proc:.0f}"
+        fc.warnings.append(f"T блоков {t_txt} °C выше заданного ограничения {p.t_agent_max:.0f} °C на ступень")
     tg = st.t_grain if st.t_grain is not None else fc.t_grain_est
     if p.t_grain_max and tg > p.t_grain_max:
         fc.warnings.append(f"T зерна {tg:.0f} °C выше ограничения {p.t_grain_max:.0f} °C")

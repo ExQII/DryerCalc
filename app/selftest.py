@@ -482,6 +482,15 @@ def run(out_path: str) -> int:
         check(_s9f.fill and _a9f.get("phase") == "fill" and _a9f["head"].startswith("При запуске — D = ")
               and _a9f["t_rec"] == (60, 60) and {"fill", "recirc"} <= _kinds,
               f"набор сушилки: «{_a9f['head']}» по пробе набора {_s9f.w_in:g} %; прогрев сушит зерно в шахте")
+        # --- v1.7.2: рециркуляция через силос — начало следующего прохода; пределы T 75/75 ---
+        _rows10 = [dict(r) for r in _rows9]
+        _rows10[-1] = dict(_rows10[-1], note="Закончился 4 силос, рециркуляция через 3 силос")
+        _rows10 += [_r9(22.0, 24.0, 22.0, d=35), _r9(22.5, 23.8, 21.5, "Сушим в 4 силос", 35, pn=2)]
+        _jp10 = _jp(_prep(_rows10)[0], win.params, 15.0)
+        check([(x["pass_no"], x["end_kind"]) for x in _jp10] == [(1, "silo"), (2, None)]
+              and (win.params.t_agent_max, win.params.t_grain_max) == (75.0, 75.0),
+              f"рециркуляция через силос начинает проход {_jp10[-1]['pass_no']:g}; пределы T блоков/зерна "
+              f"{win.params.t_agent_max:g}/{win.params.t_grain_max:g} °C")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

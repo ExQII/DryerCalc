@@ -72,8 +72,17 @@ RECIRC_END_RE = re.compile(r"((закончил|окончил|прекрати�
 # сушиться. «Набрался 1 силос» (приёмный силос полон) — не набор сушилки: нет слова «сушилк» / «шахт»
 FILL_RE = re.compile(r"(набира\w*|набор\w*|наполн\w*|заполн\w*|загруж\w*|загрузк\w*|засып\w*)\s+(сушилк|шахт)|"
                      r"(сушилк|шахт)\w*\s+(набира|наполн|заполн|загруж|засып)", re.I)
+# рециркуляция через силос: «рециркуляция через 3 силос» — зерно берут из силоса 3 и сушат в него же. Делают так в
+# начале нового прохода вместо рециркуляции по шахте: вход виден по пробам и зерно не пересушивается. Для программы это
+# подача из силоса (выгрузка идёт), а не рециркуляция; если в проходе уже сушили — начало следующего прохода
+THROUGH_SILO_RE = re.compile(r"рецирк\w*\s+через\s+(\d+\s*)?(силос|с\.|с\b)", re.I)
 # рециркуляция, когда выход уже у цели партии (13–14 % после охлаждения, с запасом 1 п.п.), — досушка и конец партии
 FINAL_W = 15.0
+
+
+def is_through_silo_note(note: str) -> bool:
+    """Рециркуляция через силос: подача из силоса N в тот же силос (начало нового прохода)."""
+    return bool(THROUGH_SILO_RE.search(note or ""))
 
 
 def is_fill_note(note: str) -> bool:
@@ -408,7 +417,17 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
       или охлаждения. Выгрузка стоит, пробы входа — зерно, которым заполнена шахта; пробы выхода в наборе не
       считаются сушкой (прогрев после набора остаётся прогревом);
     stopped — сушилка остановлена: от «Остановка» до «Запуск», подачи или рециркуляции (после остановки на набор
-      сушильщик пишет «Рециркуляция» и «Сушим в N с.», а не «Запуск»); новый проход начинается не остановленным."""
+      сушильщик пишет «Рециркуляция» и «Сушим в N с.», а не «Запуск»); новый проход начинается не остановленным;
+    through — «рециркуляция через N силос» (is_through_silo_note): подача из силоса N в него же, выгрузка идёт, это не
+      рециркуляция. Если в проходе уже сушили — с этой строки следующий проход (так её и делают — в начале нового
+      прохода вместо рециркуляции по шахте); до первой сушки — начало сушки того же прохода (как подача после прогрева).
+    loop — идёт рециркуляция через силос: от такой строки до следующей подачи («Сушим в 4 силос»), рециркуляции,
+      охлаждения. Сушилка работает (шахта, калибровка — как обычно), но выгруженное уходит в тот же силос и потом
+      подаётся снова — в «выгружено» прохода и среднюю приёмного силоса не идёт (журнал 03.11: иначе 2-й проход
+      «выгрузил» 1065 т при 969 т по балансу; без этих ≈ 58 т — +3,9 %, как 1-й и 3-й проходы, +3,5 % и +2,8 %).
+    Номер «Проход» сушильщик часто вписывает позже, чем начался проход по событию (журнал 03.11.2026: «рециркуляция
+    через 3 силос» в 16:20 — ещё «1», «Сушим в 4 силос» в 19:30 — уже «2»). Проход, начатый событием при прежнем номере,
+    не делится второй раз, когда номер в той же партии вырос на 1, если проход ещё не закончился."""
     times, reliable = assign_times(rows)
     prep: List[Dict] = []
     seg = 0
@@ -417,6 +436,8 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
     last_up = last_low = last_d = None
     recirc = burner_off = cool = False
     fill = stopped = False
+    lag = None                          # проход начат событием, а «Проход» в журнале ещё прежний: (партия, номер)
+    loop = False                        # рециркуляция через силос: выгрузка в тот же силос
     ended = False                       # проход закончен (рециркуляция / охлаждение): следующая подача — новый проход
     dried = False                       # в проходе уже сушили: была проба выхода вне рециркуляции и охлаждения
     warmup = False                      # идёт рециркуляция-прогрев (до первой сушки прохода)
@@ -436,8 +457,16 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
         key = (batch, pass_no)
         gap = bool(reliable and dt is not None and prev_dt is not None
                    and (dt - prev_dt).total_seconds() > 1.5 * 3600)
-        feed = is_feed_note(note) or ("запуск" in note and not any(w in note for w in RECIRC_WORDS + BURNER_OFF_WORDS))
-        new_pass = i > 0 and (key != prev_key or (ended and (feed or gap)))
+        through = is_through_silo_note(note)
+        feed = (is_feed_note(note) or through
+                or ("запуск" in note and not any(w in note for w in RECIRC_WORDS + BURNER_OFF_WORDS)))
+        key_changed = i > 0 and key != prev_key
+        if (key_changed and lag is not None and not ended and batch == lag[0] and pass_no is not None
+                and lag[1] is not None and abs(pass_no - (lag[1] + 1)) < 1e-9):
+            key_changed, lag = False, None                  # номер «Проход» догнал проход, начатый событием
+        new_pass = i > 0 and (key_changed or (ended and (feed or gap)) or (through and dried))
+        if new_pass:
+            lag = key if (not key_changed and key == prev_key) else None
         warm_end = recirc and warmup and feed and not new_pass       # прогрев кончился: пошла подача — сушка
         brk = i > 0 and (new_pass or gap or warm_end or any(w in note for w in BREAK_WORDS))
         if brk:
@@ -447,14 +476,19 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
             pass_idx += 1
             ended = dried = fill = stopped = False
         rec_end = bool(RECIRC_END_RE.search(note))
-        rec_start = not rec_end and any(w in note for w in RECIRC_WORDS)
+        rec_start = not rec_end and not through and any(w in note for w in RECIRC_WORDS)
         if any(w in note for w in STOP_STEMS):
             stopped = True
-        elif "запуск" in note or rec_start or is_feed_note(note):
+        elif "запуск" in note or rec_start or feed:
             stopped = False
+        if through:
+            loop = True
+        elif loop and (is_feed_note(note) or rec_start or rec_end or _burner_off_note(note) or is_fill_note(note)
+                       or (new_pass and key_changed)):
+            loop = False                                    # подача в приёмный силос, рециркуляция, охлаждение
         if is_fill_note(note):
             fill = True
-        elif fill and (rec_start or rec_end or is_feed_note(note) or _burner_off_note(note)):
+        elif fill and (rec_start or rec_end or feed or _burner_off_note(note)):
             fill = False                                    # шахта полна: прогрев по кругу или сразу подача
         if rec_end:
             recirc = warmup = False                         # конец рециркуляции (после сушки проход уже закончен)
@@ -472,7 +506,7 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
             burner_off = cool = False
         p["recirc"], p["burner_off"], p["cool"] = recirc, burner_off, cool
         p["warmup"] = recirc and warmup
-        p["fill"], p["stopped"] = fill, stopped
+        p["fill"], p["stopped"], p["through"], p["loop"] = fill, stopped, through, loop
         if r.get("w_out") is not None and not recirc and not burner_off and not fill:
             dried = True
         p["batch_f"], p["pass_f"] = batch, pass_no
@@ -515,7 +549,8 @@ def journal_passes(prep: List[Dict], p: Optional[DryerParams] = None, final_w: f
     pass — номер в prepare; segs — его участки; start / end — первая и последняя строка со временем;
     batch — «Партия» из журнала (если вписана в строках прохода, иначе ""); batch_no — номер партии по счёту;
     pass_no — «Проход» из журнала, а если не вписан — номер по счёту в партии (pass_auto = True);
-    end_kind — чем закончилась подача: "recirc" (рециркуляция), "cool" (охлаждение) или None (проход идёт);
+    end_kind — чем закончилась подача: "recirc" (рециркуляция), "cool" (охлаждение), "silo" (следующий проход начат
+      рециркуляцией через силос) или None (проход идёт);
     w_end — истинная влажность выхода в конце подачи (медиана трёх последних проб до рециркуляции / охлаждения);
     batch_end — партия на этом проходе закончена: охлаждение; рециркуляция, когда выход уже ≤ final_w
       (досушка); или следующий проход — другой «Партии»."""
@@ -537,14 +572,17 @@ def journal_passes(prep: List[Dict], p: Optional[DryerParams] = None, final_w: f
             batch_no, in_batch, prev_lab = batch_no + 1, 0, None
         in_batch += 1
         label = next(((r.get("batch") or "").strip() for r in lst if (r.get("batch") or "").strip()), "")
-        lab_pass = next((r.get("pass_no") for r in lst if r.get("pass_no") is not None), None)
-        if lab_pass is not None and lab_pass == prev_lab:
-            lab_pass = None          # номер прохода после рециркуляции не сменили — считаем сами
+        labs = [r.get("pass_no") for r in lst if r.get("pass_no") is not None]
+        # номер прохода после рециркуляции не сменили — считаем сами; сменили позже, чем начался проход (отставший
+        # номер, см. prepare) — берём новый
+        lab_pass = next((x for x in labs if x != prev_lab), None)
         prev_lab = lab_pass if lab_pass is not None else prev_lab
         dts = [r["dt"] for r in lst if r.get("dt") is not None]
         last = lst[-1]
         end_kind = "cool" if last.get("cool") or any(r.get("cool") for r in lst) else (
             "recirc" if any(r.get("recirc") and not r.get("warmup") for r in lst) else None)   # прогрев — не конец
+        if end_kind is None and k + 1 < len(order) and groups[order[k + 1]][0].get("through"):
+            end_kind = "silo"                          # следующий проход начат рециркуляцией через силос
         drying = [r for r in lst if r.get("w_out") is not None and not r.get("recirc") and not r.get("burner_off")]
         w_end = None
         if drying:
@@ -651,6 +689,9 @@ def note_meaning(note: str) -> List[str]:
     n = (note or "").lower()
     if RECIRC_END_RE.search(n):
         return ["конец рециркуляции; следующая подача из силоса — новый проход"]
+    if is_through_silo_note(n):
+        return ["рециркуляция через силос: зерно из силоса сушится в тот же силос — выгрузка идёт; если в проходе "
+                "уже сушили — начало следующего прохода"]
     out = [text for stems, text in _STEM_MEANING if any(w in n for w in stems)]
     if is_fill_note(n):
         out.append("набор сушилки: выгрузка стоит, пробы входа — зерно, которым заполняют шахту; по ним «Текущий "

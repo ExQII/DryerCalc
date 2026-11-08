@@ -2035,6 +2035,40 @@ def _zone_case(explored_t=(40.0, 70.0), target=23.5, **extra):
     return p, st, c, fc, live_advice(p, st, fc)
 
 
+def test_block_limit_per_stage_and_75_migration():
+    """1.7.2: предел T блоков — для каждой ступени (как на пульте: «75/75»), а не для средней; база без пределов
+    один раз получает 75/75 °C, дальше — как выставил инженер."""
+    from app.gui import LIMITS_DEFAULT, migrate_params
+    from app.live import live_advice
+    rows, _row, t0 = _silo_journal()
+    cut = [dict(r, t_low=65.0 if r.get("t_low") is not None else None)
+           for r in rows if r["ts"] < (t0 + timedelta(hours=19)).strftime("%d.%m.%y %H:%M")]
+    p = replace(P, explored={"d": [33.0, 37.0], "t": [40.0, 75.0], "w": [20.0, 30.0]}, t_agent_max=68.0)
+    st = live_state(cut, p, final_w=15.0)
+    assert (st.t_up, st.t_low) == (60.0, 65.0)
+    fc = live_forecast(p, Conditions(st.t_proc, 10.0, 70.0), st, 300.0, 19.0, 14.0, 6.0, 10.0)
+    # сдвиг +5 °C дал бы 65/70: средняя 67,5 ≤ 68, но 2-я ступень 70 > 68 — нельзя
+    assert fc.d_out_of_zone and fc.alt is None and "65/70" in fc.alt_reason and "на ступень" in fc.alt_reason
+    hot = [dict(r, t_up=70.0 if r.get("t_up") is not None else None, t_low=75.0 if r.get("t_low") is not None else None)
+           for r in cut]
+    st2 = live_state(hot, replace(p, t_agent_max=72.0), final_w=15.0)
+    fc2 = live_forecast(replace(p, t_agent_max=72.0), Conditions(st2.t_proc, 10.0, 70.0), st2, 300.0, 23.5, 14.0, 6.0,
+                        10.0)
+    assert any("T блоков 70/75 °C выше заданного ограничения 72 °C на ступень" in w for w in fc2.warnings)
+    assert not any("ограничения" in w for w in live_forecast(replace(p, t_agent_max=75.0), Conditions(
+        st2.t_proc, 10.0, 70.0), st2, 300.0, 23.5, 14.0, 6.0, 10.0).warnings)
+    # перевод пределов: пустая база — 75/75; поставили 0 сами — остаётся 0; заданные — не трогаются
+    st_db = Storage(_tmp("limits172.db"))
+    assert LIMITS_DEFAULT == (75.0, 75.0)
+    p1 = migrate_params(st_db)
+    assert (p1.t_agent_max, p1.t_grain_max) == (75.0, 75.0) and st_db.load_params().t_agent_max == 75.0
+    st_db.save_params(replace(p1, t_agent_max=0.0, t_grain_max=0.0))
+    assert migrate_params(st_db).t_agent_max == 0.0
+    own = Storage(_tmp("limits172b.db"))
+    own.save_params(replace(P, t_agent_max=70.0, t_grain_max=0.0))
+    assert (migrate_params(own).t_agent_max, migrate_params(own).t_grain_max) == (70.0, 0.0)
+
+
 def test_explored_zone():
     """1.5: проверенная зона — изученные калибровкой D и T блоков с тем же запасом, что у пометок «вне изученного»."""
     from app.model import EXPLORED_MARGIN, explored_flags, explored_zone
@@ -2228,8 +2262,8 @@ def _warmup_journal():
     row(20.0, 33.0, 23.6, note="Закончился 3 силос, открыли с 4 силоса", d=35, t=60)
     for k in range(41, 60):
         row(0.5 * k, 32.5, 23.9, d=35, t=60)
-    row(30.0, 24.3, 24.8, note="Закончился 4 силос, рециркуляция через 3 силос", d=35, t=60)
-    row(30.5, 24.2, 23.7, d=35, t=60)
+    row(30.0, None, 24.8, note="Закончился 4 силос, рециркуляция", d=35, t=60)
+    row(30.5, None, 23.7, d=35, t=60)
     row(31.0, 21.6, 17.9, note="Сушим в 4 силос", d=40, t=60)
     for k in range(63, 80):
         row(0.5 * k, 23.0, 17.5, d=40, t=60)
@@ -2514,6 +2548,57 @@ def test_journal_summary_without_recirculation_and_cooling():
     win = [r["w_in"] for r in rows if r["w_in"] is not None
            and datetime.strptime(r["ts"], "%d.%m.%y %H:%M") < t0 + timedelta(hours=30)]
     assert abs(first["w_in"] - sum(win) / len(win)) < 1e-9                  # набор — вход прохода, рециркуляция — нет
+
+
+def test_recirculation_through_silo_starts_next_pass():
+    """1.7.2: «рециркуляция через 3 силос» — зерно из силоса 3 сушится в него же в начале нового прохода (вместо
+    рециркуляции по шахте). Это подача, а не рециркуляция: с неё следующий проход; выгрузка в тот же силос в
+    «выгружено» и среднюю приёмного силоса не идёт; отставший номер «Проход» второй раз проход не делит."""
+    from app.calibration import is_through_silo_note, journal_passes, note_meaning, note_trap, observe_all, prepare
+    for n in ("Закончился 4 силос, рециркуляция через 3 силос", "рециркуляция через силос 2", "рециркуляция через 1 с."):
+        assert is_through_silo_note(n.lower()), n
+        assert note_trap(n) is None and "рециркуляция через силос" in note_meaning(n)[0]
+    assert not is_through_silo_note("рециркуляция") and not is_through_silo_note("рециркуляция воздуха через вентилятор")
+    t0 = datetime(2026, 11, 3, 6, 0)
+    rows = []
+
+    def row(h, wi=None, wo=None, note="", d=35, pn=1):
+        rows.append({"ts": (t0 + timedelta(hours=h)).strftime("%d.%m.%y %H:%M"), "w_in": wi, "w_out": wo,
+                     "t_a1": 30 if wo else None, "t_a2": 28 if wo else None, "t_up": 60, "t_low": 60, "d": d,
+                     "note": note, "batch": "1", "pass_no": pn, "t_amb": 3, "rh": None})
+    for k in range(20):
+        row(0.5 * k, 31.0, 24.0, note="Сушим в 1 силос" if k == 0 else "")
+    row(10.0, 24.3, 24.8, note="Закончился 4 силос, рециркуляция через 3 силос")     # «Проход» ещё 1
+    for k in range(1, 7):
+        row(10.0 + 0.5 * k, 23.5, 19.0)
+    row(13.5, 22.0, 18.0, note="Сушим в 4 силос", d=40, pn=2)                       # номер догнал
+    for k in range(1, 12):
+        row(13.5 + 0.5 * k, 22.5, 18.2, d=40, pn=2)
+    prep, _ = prepare(rows)
+    jp = journal_passes(prep, P, 15.0)
+    assert [(x["pass_no"], x["pass_auto"], x["end_kind"]) for x in jp] == [(1, False, "silo"), (2, False, None)]
+    assert jp[1]["start"] == t0 + timedelta(hours=10.0)
+    loop = [r for r in prep if r.get("loop")]
+    assert loop and loop[0]["dt"] == t0 + timedelta(hours=10.0) and loop[-1]["dt"] == t0 + timedelta(hours=13.0)
+    assert not any(r["recirc"] for r in prep)                              # не рециркуляция по шахте
+    st = live_state(rows, P, final_w=15.0)
+    assert st.pass_no == 2 and not st.recirc and not st.loop and st.start == t0 + timedelta(hours=10.0)
+    assert abs(st.unloaded - q_at(P, 40) * 5.5) < 1e-6                     # с «Сушим в 4 силос», без рециркуляции
+    assert st.silo_w is not None and st.silo_w < 19.0                      # выход в силос 3 — не в среднюю
+    mid = live_state(rows[:24], P, final_w=15.0)
+    assert mid.loop and not mid.recirc and mid.ok and mid.unloaded == 0.0 and mid.loop_since == t0 + timedelta(hours=10.0)
+    # калибровка: строки рециркуляции через силос — сушка (через τ после её начала пары «вход — выход» есть)
+    obs, _, _ = observe_all(rows, P)
+    assert any(t0 + timedelta(hours=10.0) < o["dt"] for o in obs)
+    # до первой сушки (после набора) — начало сушки того же прохода
+    fresh = [{"ts": "03.11.26 01:00", "w_in": 31.0, "w_out": None, "note": "Набираем сушилку с 3 силоса", "d": 0,
+              "t_up": 0, "t_low": 0, "batch": "1", "pass_no": 1},
+             {"ts": "03.11.26 02:00", "w_in": 31.2, "w_out": 28.0, "note": "рециркуляция через 3 силос", "d": 35,
+              "t_up": 60, "t_low": 60, "batch": "1", "pass_no": 1},
+             {"ts": "03.11.26 02:30", "w_in": 31.1, "w_out": 26.0, "note": "", "d": 35, "t_up": 60, "t_low": 60,
+              "batch": "1", "pass_no": 1}]
+    pf, _ = prepare(fresh)
+    assert len({r["pass"] for r in pf}) == 1 and pf[1]["loop"] and not pf[1]["fill"] and not pf[1]["recirc"]
 
 
 def test_live_correction_off_by_default_and_migrated():

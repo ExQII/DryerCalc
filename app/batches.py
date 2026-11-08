@@ -189,7 +189,7 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
         span = [r for r in lst if t0 <= r["dt"] <= t1]
         for a, b in zip(span, span[1:]):
             if (a.get("d_f") is not None and not a.get("stopped") and not a.get("fill") and not a.get("recirc")
-                    and not a.get("burner_off")):
+                    and not a.get("burner_off") and not a.get("loop")):
                 unloaded += mdl.q_at(p, a["d_f"]) * max((b["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
         w_in_avg = sum(win) / len(win) if win else None
         w_out_avg = sum(wout) / len(wout) if wout else None

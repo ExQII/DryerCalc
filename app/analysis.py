@@ -215,14 +215,16 @@ def batch_meter_points(batches: Sequence[Dict], rows: List[Dict], p: mdl.DryerPa
             continue
         last = pass_of[data[-1]["seg"]]
         lst = [r for r in sel if pass_of[r["seg"]] == last]
-        rd = [r for r in lst if r.get("w_out") is not None and not r.get("recirc") and not r.get("burner_off")]
+        rd = [r for r in lst if r.get("w_out") is not None and not r.get("recirc") and not r.get("burner_off")
+              and not r.get("loop")]                  # рециркуляция через силос — в тот же силос, не в готовую партию
         hours = [(r["dt"] - lst[0]["dt"]).total_seconds() / 3600.0 for r in rd]
         vals = [r["w_out"] for r in rd]
         temps = [0.5 * (r["t_a1"] + r["t_a2"]) if r.get("t_a1") is not None and r.get("t_a2") is not None else None
                  for r in rd]
         mass = s_w = s_t = m_t = 0.0
         for a, nb in zip(lst, lst[1:]):
-            if a.get("d_f") is None or a.get("stopped") or a.get("fill") or a.get("recirc") or a.get("burner_off"):
+            if (a.get("d_f") is None or a.get("stopped") or a.get("fill") or a.get("recirc") or a.get("burner_off")
+                    or a.get("loop")):
                 continue
             dm = mdl.q_at(p, a["d_f"]) * max((nb["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
             if dm <= 0:
