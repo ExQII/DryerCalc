@@ -210,7 +210,9 @@ def test_headers_mapping():
     assert map_header("T агента 1") == "t_a1"
     assert map_header("Т агента (датчик 2)") == "t_a2"
     assert map_header("T зерна низ, °C") == "t_a1" and map_header("T зерна верх, °C") == "t_a2"
-    assert map_header("Т кукурузы") == "grain_pair"
+    assert map_header("Т кукурузы") == "grain_pair"          # культура в заголовке — температура зерна
+    assert map_header("Т пшеницы") == "grain_pair" and map_header("Т ячменя верх") == "t_a2"
+    assert map_header("Интервал, минут") is None
     assert map_header("Т топочных блоков") == "block_pair"
     assert map_header("Топочные блоки") == "block_pair"
     assert map_header("T блока верх, °C") == "t_up"
@@ -227,7 +229,7 @@ def test_read_journal_csv_with_pairs_dashes_and_decimal_comma():
         path = os.path.join(d, "j.csv")
         with open(path, "w", encoding="cp1251", newline="") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow(["Время", "Вход", "Выход", "Т кукурузы", "Т топочных блоков", "Разгрузка", "Примечание"])
+            w.writerow(["Время", "Вход", "Выход", "Т зерна", "Т топочных блоков", "Разгрузка", "Примечание"])
             w.writerow(["25.10 08:00", "28,4", "23,1", "26°-24°", "60-55", "35", "Запуск"])
             w.writerow(["25.10 08:30", "28,2", "22,9", "27-25", "—", "—", ""])
             w.writerow(["25.10 09:00", "", "", "", "", "", ""])

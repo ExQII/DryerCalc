@@ -3,7 +3,7 @@
 Каждая иконка — о содержании раздела: журнал — тетрадь, текущий проход — шкала-прибор, досушка — круг по кругу,
 план партии — ступени влажности по проходам, масса на выходные — календарь с залитыми
 выходными, быстрая оценка — секундомер, партии — мешки, погода — облако,
-точность — мишень, настройки — регуляторы, справка — вопрос. Знак программы — зерно кукурузы. Оформление:
+точность — мишень, настройки — регуляторы, справка — вопрос. Знак программы — зерно. Оформление:
 солнце (светлое), месяц (тёмное), полузалитый круг (как в Windows).
 """
 from __future__ import annotations
@@ -186,21 +186,19 @@ def _auto(p: QPainter, c: QColor) -> None:
 
 
 def _kernel(p: QPainter, c: QColor) -> None:
-    """Зерно кукурузы: широкая округлая «шапка», сужение к ножке; блик зародыша."""
-    path = QPainterPath(QPointF(12, 21.5))
-    path.cubicTo(8.0, 21.0, 4.0, 15.5, 4.2, 9.5)
-    path.cubicTo(4.4, 4.6, 8.0, 2.5, 12, 2.5)
-    path.cubicTo(16.0, 2.5, 19.6, 4.6, 19.8, 9.5)
-    path.cubicTo(20.0, 15.5, 16.0, 21.0, 12, 21.5)
+    """Зерно без признаков культуры: овал, наклонённый на 30°, с бороздкой вдоль."""
+    p.save()
+    p.translate(12, 12)
+    p.rotate(30)
     p.setPen(Qt.NoPen)
     p.setBrush(c)
-    p.drawPath(path)
-    germ = QPainterPath(QPointF(12, 17.8))
-    germ.cubicTo(9.6, 16.6, 8.6, 12.8, 9.4, 9.8)
-    germ.cubicTo(10.2, 7.4, 13.8, 7.4, 14.6, 9.8)
-    germ.cubicTo(15.4, 12.8, 14.4, 16.6, 12, 17.8)
-    p.setBrush(QColor(255, 255, 255, 120))
-    p.drawPath(germ)
+    p.drawEllipse(QPointF(0, 0), 5.6, 9.2)
+    groove = QPen(QColor(255, 255, 255, 140), 1.3)
+    groove.setCapStyle(Qt.RoundCap)
+    p.setPen(groove)
+    p.setBrush(Qt.NoBrush)
+    p.drawLine(QPointF(0, -6.0), QPointF(0, 6.0))
+    p.restore()
 
 
 _DRAW: Dict[str, Callable[[QPainter, QColor], None]] = {

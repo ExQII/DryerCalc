@@ -57,7 +57,7 @@ def run(out_path: str) -> int:
         xl = os.path.join(tmp, "j.xlsx")
         wb = Workbook()
         ws = wb.active
-        ws.append(["Время", "Вход", "Выход", "Т кукурузы", "Т топочных блоков", "Разгрузка", "Примечание"])
+        ws.append(["Время", "Вход", "Выход", "Т зерна", "Т топочных блоков", "Разгрузка", "Примечание"])
         ws.append([_dt(2026, 10, 25, 8, 0), 28.4, 23.1, "26°-24°", "60-55", 35, "Запуск"])
         ws.append([_dt(2026, 10, 25, 8, 30), 28.2, 22.9, "27-25", "—", None, ""])
         wb.save(xl)
@@ -209,8 +209,9 @@ def run(out_path: str) -> int:
         check(max(abs(a - b) for a, b in zip(_wo, _ws)) < 1e-9,
               f"numpy {_np.__version__}, pyqtgraph {_pg.__version__}: расчёт по массивам совпадает со скалярным")
         from .calibration import note_trap as _trap
-        check(bool(_trap("зерно на выходе хорошо охлаждено")) and _trap("Остановка: силос полный") is None,
-              "слова-ловушки в примечании распознаются")
+        check(bool(_trap("зерно на выходе хорошо охлаждено")) and _trap("Остановка: силос полный") is None
+              and _trap("Сушим в 1 силос") is None and _trap("Закончился 2 силос, рециркуляция") is None,
+              "слова-ловушки в примечании распознаются, обычные записи о силосах — нет")
         from PySide6.QtCore import QDateTime as _QDT
         n_before = win.tbl_j.rowCount()
         last_ts = win.tbl_j.item(n_before - 1, 0).text()

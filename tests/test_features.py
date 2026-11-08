@@ -1013,16 +1013,17 @@ def _live_rows(d_late=None, change_at=None, note_last=""):
 
 
 def test_live_advice_follows_operating_rules():
-    """Совет на «Текущем проходе» — правила работы 7.3: < 3 с — не менять; после смены D — подождите τ/2;
-    конец прохода — не менять; рециркуляция и нет данных — куда идти."""
+    """Совет на «Текущем проходе» — правила работы 7.3: выход меняется < 0,5 п.п. — не менять; после смены D —
+    подождите τ/2; конец прохода — не менять; рециркуляция и нет данных — куда идти."""
     from app import pages
-    from app.live import D_STEP_MIN, live_advice
+    from app.live import D_KEEP_PP, live_advice
     st = live_state(_live_rows(), P)
     c = Conditions(st.t_proc, 10.0, 70.0)
     base = live_forecast(P, c, st, 400.0, 24.0, 14.0, 6.0, 10.0)
     keep = live_forecast(P, c, st, 400.0, base.w_out_now, 14.0, 6.0, 10.0)     # цель = то, что выходит сейчас
     a = live_advice(P, st, keep)
-    assert abs(keep.d_rec - st.d) < D_STEP_MIN and a["kind"] == "keep" and a["head"] == "D не менять — 35 с"
+    assert abs(keep.w_out_rec - keep.w_out_now) < D_KEEP_PP and a["kind"] == "keep" and a["head"] == "D не менять — 35 с"
+    assert "п.п., меньше 0.5: на уровне точности влагомера" in a["sub"][1]
     far = live_forecast(P, c, st, 400.0, base.w_out_now + 3.0, 14.0, 6.0, 10.0)
     a = live_advice(P, st, far)
     assert a["kind"] == "change" and a["head"] == f"Поставьте D = {far.d_rec:.0f} с" and a["record"] == {"d": far.d_rec}
@@ -1260,8 +1261,12 @@ def test_rules_doc_journal_claims_hold():
     for ev in ("Запуск, сушим с 2 с. в 1 с.", "Закончился 2 с., сушим с 1 с.", "Остановка: силос 1 полный",
                "рециркуляция", "охлаждение", "Откл. т.б.", "Запуск подачи с 1 с.", "открыли с 1 с.", "сушим со 2 с.",
                "Остановка, закончили партию К-07", "без пробы", "D 35→38 по «Сейчас»", "на выходе холодное",
-               "закончили рециркуляцию", "открыли люк, почистили", "переключили вентилятор", "снимаем пробу"):
+               "закончили рециркуляцию", "открыли люк, почистили", "переключили вентилятор", "снимаем пробу",
+               # 1.7.1: обычные записи журнала ноября — раньше программа переспрашивала каждый раз
+               "Сушим в 1 силос", "Набрался 1 силос, сушим в 3 силос", "Закончился 2 силос, рециркуляция",
+               "Закончился 4 силос, рециркуляция через 3 силос", "Закончился 3 с., рециркуляция"):
         assert note_trap(ev) is None, ev
+    assert note_trap("закончился газ, рециркуляция воздуха") and note_trap("рециркуляция воздуха в шахте плохая")
     # сам файл правил на месте и содержит ключевые разделы
     text = open(os.path.join(ROOT, "docs", "rules_ru.txt"), encoding="utf-8-sig").read()
     for key in ("СЛОВА-ЛОВУШКИ", "ЗАДАНИЕ НА СУШКУ ПАРТИИ", "ЧЕК-ЛИСТЫ", "ОДИН КОМПЬЮТЕР, ОДНА БАЗА"):
@@ -1641,8 +1646,8 @@ def test_weekend_capacity_short_window_and_weekday():
     assert next_weekday_time(datetime(2026, 11, 9, 9, 0), 0, 8) == datetime(2026, 11, 16, 8, 0)
 
 
-def test_allowable_storage_of_wet_corn_follows_table():
-    """Допустимый срок хранения сырой кукурузы: узлы таблицы FSA1058 точно, между ними — монотонно."""
+def test_allowable_storage_of_wet_grain_follows_table():
+    """Допустимый срок хранения сырого зерна: узлы таблицы FSA1058 точно, между ними — монотонно."""
     from app.weekend import STORAGE_DAYS, STORAGE_MC, STORAGE_TF, allowable_storage_days
 
     def c_of(f):
@@ -2447,6 +2452,68 @@ def test_live_tab_fill_and_reminders():
     summ = re.sub(r"<[^>]+>", "", tl.summary.text())
     assert "Если подача пойдёт сейчас, на выходе (влагомер): через 1 ч" in summ
     win.close()
+
+
+def test_keep_d_by_outlet_difference_not_seconds():
+    """1.7.1: «D не менять» — когда выход при совете и при текущем D отличается меньше чем на 0,5 п.п. В последних
+    проходах (съём мал) 1 с D меняет выход в 2–2,5 раза меньше, чем в 1-м: прежний порог «3 с» давал «Поставьте
+    D = …» ради 0,2–0,4 п.п. (журнал ноября: 34 из 41 совета в 3-м проходе)."""
+    from app.live import D_KEEP_PP, keep_d, live_advice
+    rows = []
+    t0 = datetime(2026, 11, 7, 6, 0)
+    for k in range(14):        # последний проход: вход ≈ 18 %, выход ≈ 14 %, D 35
+        rows.append({"ts": (t0 + timedelta(minutes=30 * k)).strftime("%d.%m.%y %H:%M"), "w_in": 18.0, "w_out": 14.2,
+                     "t_a1": 30, "t_a2": 28, "t_up": 60, "t_low": 60, "d": 35, "note": "", "batch": "1", "pass_no": 3,
+                     "t_amb": 5, "rh": None})
+    st = live_state(rows, P, final_w=13.0)
+    c = Conditions(st.t_proc, 5.0, 70.0)
+    base = live_forecast(P, c, st, 900.0, 14.0, 14.0, 6.0, 10.0)
+    # цель, при которой совет D — на 4–6 с от текущего, но выход меняется меньше чем на 0,5 п.п.
+    for dg in (0.2, 0.3, 0.4):
+        fc = live_forecast(P, c, st, 900.0, base.w_out_now + dg, 14.0, 6.0, 10.0)
+        if abs(fc.d_rec - st.d) >= 4:
+            break
+    assert abs(fc.d_rec - st.d) >= 4 and abs(fc.w_out_rec - fc.w_out_now) < D_KEEP_PP and keep_d(fc)
+    assert live_advice(P, st, fc)["kind"] == "keep"
+    far = live_forecast(P, c, st, 900.0, base.w_out_now + 1.0, 14.0, 6.0, 10.0)
+    assert not keep_d(far) and live_advice(P, st, far)["kind"] == "change"
+
+
+def test_deviation_reminder_silent_when_outlet_is_not_this_pass():
+    """1.7.1: «Выход ушёл от цели» молчит на прогреве, рециркуляции, наборе и в первые τ часов прохода (на выходе —
+    зерно, вошедшее до прохода); цель — как в плитке (с выравниванием силоса)."""
+    from app.live import live_forecast as _lf
+    from app.reminders import live_numbers
+    ui = {"w_target": 24.0, "wk": 14.0, "silo": True}
+    rows, t0 = _warmup_journal()
+    def cut(h):
+        return [r for r in rows if r["ts"] <= (t0 + timedelta(hours=h)).strftime("%d.%m.%y %H:%M")]
+    assert live_numbers(cut(1.0), P, ui, 6.0, 10.0) == (None, None)           # набор
+    assert live_numbers(cut(4.0), P, ui, 6.0, 10.0)[1] is None                 # прогрев
+    tau = P.lag_k * P.m_dryer / q_at(P, 35)
+    assert live_numbers(cut(5.5 + tau - 0.6), P, ui, 6.0, 10.0)[1] is None    # первые τ ч подачи — зерно прогрева
+    later = cut(5.5 + tau + 1.0)
+    pe, tr = live_numbers(later, P, ui, 6.0, 10.0)
+    st = live_state(later, P, final_w=15.0)
+    fc = _lf(P, Conditions(st.t_proc, P.t_amb_ref, P.rh_ref), st, 500.0, 24.0, 14.0, 6.0, 10.0, use_corr=False,
+             silo=True)
+    from app.model import read_from_true
+    assert tr is not None and abs(tr - read_from_true(P, fc.w_goal, st.t_grain)) < 1e-9
+    assert live_numbers(cut(30.5), P, ui, 6.0, 10.0) == (None, None)            # рециркуляция конца подачи
+
+
+def test_journal_summary_without_recirculation_and_cooling():
+    """1.7.1: средние прохода для «Партий» и отчёта — по строкам сушки: без рециркуляции, охлаждения и прогрева."""
+    from app.batches import journal_summary
+    rows, t0 = _warmup_journal()
+    js = journal_summary(rows, P, t0, None)
+    first = js["passes"][0]
+    dry_out = [r["w_out"] for r in rows if r["w_out"] is not None
+               and t0 + timedelta(hours=5.5) <= datetime.strptime(r["ts"], "%d.%m.%y %H:%M") < t0 + timedelta(hours=30)]
+    assert abs(first["w_out_read"] - sum(dry_out) / len(dry_out)) < 1e-9
+    win = [r["w_in"] for r in rows if r["w_in"] is not None
+           and datetime.strptime(r["ts"], "%d.%m.%y %H:%M") < t0 + timedelta(hours=30)]
+    assert abs(first["w_in"] - sum(win) / len(win)) < 1e-9                  # набор — вход прохода, рециркуляция — нет
 
 
 def test_live_correction_off_by_default_and_migrated():

@@ -14,9 +14,9 @@ SetCompressorDictSize 64
 RequestExecutionLevel user
 
 !define APPNAME "DryerCalc"
-!define APPTITLE "DryerCalc — расчёт сушки кукурузы"
+!define APPTITLE "DryerCalc — расчёт сушки зерна"
 !ifndef VERSION
-  !define VERSION "1.7.0"
+  !define VERSION "1.7.1"
 !endif
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
 
@@ -27,7 +27,7 @@ InstallDirRegKey HKCU "Software\${APPNAME}" "InstallDir"
 BrandingText "DryerCalc ${VERSION}"
 VIProductVersion "${VERSION}.0"
 VIAddVersionKey /LANG=1049 "ProductName" "DryerCalc"
-VIAddVersionKey /LANG=1049 "FileDescription" "Установка DryerCalc — расчёт времени сушки кукурузы"
+VIAddVersionKey /LANG=1049 "FileDescription" "Установка DryerCalc — расчёт времени сушки зерна"
 VIAddVersionKey /LANG=1049 "FileVersion" "${VERSION}"
 VIAddVersionKey /LANG=1049 "ProductVersion" "${VERSION}"
 VIAddVersionKey /LANG=1049 "LegalCopyright" "ExQII"

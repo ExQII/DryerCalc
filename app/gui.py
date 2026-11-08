@@ -83,7 +83,7 @@ class MainWindow(QMainWindow):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(1000)
         self._save_timer.timeout.connect(self._save_journal)
-        self.setWindowTitle(f"Расчёт времени сушки кукурузы — шахтная сушилка Araj  v{__version__}")
+        self.setWindowTitle(f"Расчёт времени сушки зерна — шахтная зерносушилка  v{__version__}")
         icon = resource_path("assets/dryer.png")
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
@@ -111,7 +111,7 @@ class MainWindow(QMainWindow):
         self.tab_check = built[pg.CHECK] = CheckTab(self)
         built[pg.SETTINGS] = self._build_settings_tab()
         self.tab_help = built[pg.HELP] = HelpTab()
-        tabs = NavPanel("DryerCalc", "шахтная сушилка Araj")
+        tabs = NavPanel("DryerCalc", "шахтная зерносушилка")
         tabs.backdrop = False              # фон рисует окно целиком — без шва у строки состояния
         self.tabs = tabs
         self.setCentralWidget(tabs)
@@ -1533,7 +1533,7 @@ class MainWindow(QMainWindow):
         self.tabs.apply_theme()           # ширина меню и заголовок — под размер шрифта режима
         QTimer.singleShot(0, lambda sz=size_before: self._relayout(sz))
         self.lbl_mode.setText("Режим сушильщика" if op else "Режим инженера")
-        self.setWindowTitle(f"Расчёт времени сушки кукурузы — шахтная сушилка Araj  v{__version__}"
+        self.setWindowTitle(f"Расчёт времени сушки зерна — шахтная зерносушилка  v{__version__}"
                             + ("  — режим сушильщика" if op else ""))
         if save:
             cfg = self.storage.get_json("ui_mode", {}) or {}
@@ -1838,7 +1838,7 @@ class MainWindow(QMainWindow):
         gb = QGroupBox("Производительность выгрузки Q(D)")
         gb.setMaximumWidth(380)
         gv = QVBoxLayout(gb)
-        gv.addWidget(mute(QLabel("т/ч по листу пересчёта: кукуруза, натура 0,65")))
+        gv.addWidget(mute(QLabel("т/ч по листу пересчёта сушилки (по умолчанию — натура 0,65 т/м³)")))
         self.s_qtbl = QTableWidget(0, 2)
         self.s_qtbl.setHorizontalHeaderLabels(["Разгрузка D, с", "Q, т/ч"])
         self.s_qtbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -1865,7 +1865,7 @@ class MainWindow(QMainWindow):
         self.s_src.addItem("Зерно: (T низ + T верх) / 2", "agent")
         self.s_model = QComboBox()
         self.s_model.addItem("Эмпирическая (по журналу; точнее на ваших данных)", "empirical")
-        self.s_model.addItem("Физическая (кинетика сушки кукурузы + КПД слоя)", "physics")
+        self.s_model.addItem("Физическая (кинетика сушки в тонком слое + КПД слоя)", "physics")
         for cb in (self.s_src, self.s_model):         # длинные пункты не раздувают ширину страницы
             cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             cb.setMinimumContentsLength(18)
@@ -1917,7 +1917,7 @@ class MainWindow(QMainWindow):
         f.addRow("Коэффициент по RH b_rh (на 30 %)", self.s_brh)
         right.addWidget(gb)
 
-        gb = QGroupBox("Физическая модель (Thompson, 1968: тонкий слой кукурузы) — см. «Справка»")
+        gb = QGroupBox("Физическая модель (Thompson, 1968: тонкий слой зерна) — см. «Справка»")
         f = QFormLayout(gb)
         f.addRow("КПД слоя η (калибруется по журналу)", self.s_eta)
         f.addRow("Доля горячей зоны в объёме сушилки", self.s_fhot)

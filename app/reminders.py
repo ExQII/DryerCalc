@@ -4,8 +4,11 @@
   (последний участок журнала не закончен охлаждением/остановкой и последней записи меньше 8 ч).
 * «Проход заканчивается» — по прогнозу раздела «Текущий проход» до конца прохода осталось меньше заданного времени
   (одно напоминание на проход): пора готовить силос и следующий проход.
-* «Выход ушёл от цели» — последнее показание выходного влагомера отличается от цели прохода (в пересчёте
-  на показание влагомера) больше чем на заданный порог (одно напоминание на запись).
+* «Выход ушёл от цели» — последнее показание выходного влагомера отличается от цели (в пересчёте на показание
+  влагомера) больше чем на заданный порог (одно напоминание на запись). Цель — та же, что в плитке «Выход, влагомер»
+  (с выравниванием силоса). Молчит, когда сравнивать не с чем: рециркуляция и прогрев (зерно ходит по кругу),
+  набор сушилки, охлаждение и первые τ часов прохода — на выходе ещё зерно, вошедшее до начала прохода (правила 7.3,
+  п. 5). На журнале ноября 2026 в 1-м проходе это 13 ложных напоминаний «Проверьте D» из 30.
 
 Логика — чистая функция check(): её проверяют тесты; окно только показывает сообщения
 (всплывающее уведомление Windows у часов, строка состояния, мигание кнопки на панели задач).
@@ -110,15 +113,16 @@ def check(rows: List[Dict], now: datetime, state: Dict, cfg: ReminderCfg, pass_e
 def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: float, hard: float, weather=None,
                  now: Optional[datetime] = None, plan: Optional[Tuple[float, float]] = None
                  ) -> Tuple[Optional[datetime], Optional[float]]:
-    """(ожидаемый конец текущего прохода, цель прохода в показаниях влагомера) — как в разделе «Текущий проход».
-    Во время рециркуляции подача прохода уже закончилась — «проход скоро закончится» не напоминаем.
+    """(ожидаемый конец текущего прохода, цель в показаниях влагомера) — как в разделе «Текущий проход».
+    Во время рециркуляции подача прохода уже закончилась — «проход скоро закончится» не напоминаем. Цель — None, когда
+    пробу выхода не с чем сравнивать (рециркуляция, прогрев, набор, охлаждение, первые τ часов прохода).
     plan — (масса партии, W₀) из «План сушки партии»: при «авто» масса на входе прохода считается, как в разделе."""
     from .live import live_forecast, live_state, pass_mass
     st = live_state(rows, p, now=now, weather=weather, final_w=float(ui_live.get("wk", 14.0)) + 1.0)
     if not st.ok:
         return None, None
-    if st.recirc or st.fill:          # подача кончилась или ещё не начиналась (набор сушилки)
-        return None, mdl.read_from_true(p, float(ui_live.get("w_target", 24.0)), st.t_grain)
+    if st.recirc or st.fill or st.warmup:     # подача кончилась или ещё не начиналась: выход сравнивать не с чем
+        return None, None
     w_target = float(ui_live.get("w_target", 24.0))
     c = mdl.Conditions(st.t_proc, float(ui_live.get("t_amb", p.t_amb_ref)), float(ui_live.get("rh", p.rh_ref)))
     m_pass = float(ui_live.get("m_pass", 500.0))
@@ -128,4 +132,9 @@ def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: floa
     fc = live_forecast(p, c, st, m_pass, w_target, float(ui_live.get("wk", 14.0)),
                        soft, hard, use_corr=bool(ui_live.get("corr", False)) and ui_live.get("corr_v") == 2, now=now,
                        silo=bool(ui_live.get("silo", True)), silo_lim=float(ui_live.get("silo_lim", 1.0)))
-    return fc.pass_end, mdl.read_from_true(p, w_target, st.t_grain)
+    # первые τ часов прохода на выходе — зерно, вошедшее до его начала (прогрев, прошлый проход): с целью не сравнивать
+    q = mdl.q_at(p, st.d) if st.d else 0.0
+    tau_h = p.lag_k * p.m_dryer / q if q > 0 else 0.0
+    if st.start is not None and st.last_sample is not None and st.last_sample < st.start + timedelta(hours=tau_h):
+        return fc.pass_end, None
+    return fc.pass_end, mdl.read_from_true(p, fc.w_goal, st.t_grain)

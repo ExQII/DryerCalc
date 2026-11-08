@@ -689,8 +689,14 @@ def outlet_soon(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], h
 # Главное на экране «Текущий проход»: одно действие с D и почему
 # ----------------------------------------------------------------------------------------------------------------
 
-D_STEP_MIN = 3.0      # разница с советом меньше 3 с (≈ 0,5 п.п. на выходе) — D не менять (правила работы, 7.3)
+D_KEEP_PP = 0.5       # выход при совете и при текущем D отличается меньше чем на 0,5 п.п. — D не менять (правила, 7.3)
 D_STEP_BIG = 10.0     # больше 10 с — сначала проверить пробу входа, D и T блоков в журнале и задание
+
+
+def keep_d(fc: "LiveForecast") -> bool:
+    """D не менять: ожидаемый выход при совете и при текущем D отличается меньше чем на D_KEEP_PP (оба — на том же
+    входе, T блоков и поправке)."""
+    return abs(fc.w_out_rec - fc.w_out_now) < D_KEEP_PP
 
 
 def zone_lines(fc: "LiveForecast", ready: Optional[datetime] = None) -> Tuple[List[str], List[str]]:
@@ -801,7 +807,7 @@ def _start_advice(p: mdl.DryerParams, st: LiveState, fc: LiveForecast, base: Dic
     sub = [f"Прогрев{since}: {what_in} сохнет по кругу; вход ≈ {st.w_in:.1f} %" + src, out_line]
     d_now = st.d if st.d is not None and st.d > 0 else None
     diff = d_set - d_now if d_now is not None else float("inf")
-    if t_alt is None and abs(diff) < D_STEP_MIN:
+    if t_alt is None and d_now is not None and keep_d(fc):
         return dict(base, kind="keep", head=f"Прогрев — при подаче D не менять ({d_now:.0f} с)", sub=sub,
                     warn=z_warn + warn, go=None, d_now=d_now, d_rec=fc.d_rec, phase="warmup", warmup=True)
     what = (f"D = {d_set:.0f} с" if abs(diff) >= 0.5 else "") + (" и " if abs(diff) >= 0.5 and t_alt else "") + \
@@ -825,8 +831,11 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
     "alt" — проверенный (так по правилам работы, 7.3.8, если инженер не решил иначе), "d" — только D.
 
     Правила работы (раздел 7.3), зашитые в совет:
-      * совет отличается от текущего D меньше чем на 3 с — «D не менять»: это ≈ 0,5 п.п. на выходе, на уровне
-        точности влагомера, а лишние перестановки раскачивают выход;
+      * ожидаемый выход при совете и при текущем D отличается меньше чем на D_KEEP_PP = 0,5 п.п. — «D не менять»:
+        это уровень точности влагомера и модели (±0,5 п.п.), а лишние перестановки раскачивают выход. Порог — по
+        выходу, а не в секундах: на журнале ноября 1 с D меняет выход на 0,155 п.п. в 1-м проходе и на 0,06–0,08 п.п.
+        в последних (съём меньше). Прежний порог «3 с» в 3-м проходе пропускал 34 из 41 совета «Поставьте», которые
+        меняли выход меньше чем на 0,5 п.п.;
       * после смены D — ждать хотя бы половину времени «будет видно на выходе» (τ при текущем D), иначе следующая
         смена делается вслепую, по зерну, которое ещё шло со старым D;
       * совет требует изменения D больше 10 с — сначала проверить последнюю пробу входа, D и T блоков в журнале.
@@ -883,11 +892,12 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
     if fc.d_out_of_zone and not use_alt:
         z_warn = [f"D {fc.d_rec:.0f} с — вне проверенного журналом, смотрите пробы чаще."
                   + ("" if fc.alt else f" Проверенного D + T нет: {fc.alt_reason}.")]
-    if not use_alt and abs(diff) < D_STEP_MIN:
+    if not use_alt and keep_d(fc):
+        dw = abs(fc.w_out_rec - fc.w_out_now)
         return dict(base, kind="keep", head=f"D не менять — {st.d:.0f} с",
                     sub=[f"Выйдет ≈ {fc.w_out_now:.1f} % (влагомер {fc.w_out_now_read:.1f} %) · цель {fc.w_goal:.1f} %",
-                         f"Совет {fc.d_rec:.0f} с — отличие меньше {D_STEP_MIN:.0f} с, ≈ 0,5 п.п.: на уровне точности "
-                         f"влагомера"],
+                         f"Совет {fc.d_rec:.0f} с — на выходе разница {dw:.1f} п.п., меньше {D_KEEP_PP:g}: на уровне "
+                         f"точности влагомера"],
                     warn=z_warn + warn, go=None, d_now=st.d, d_rec=fc.d_rec)
     # после смены D — подождать половину времени прохода зерна через шахту
     if st.d_changed_at is not None and t_now is not None:

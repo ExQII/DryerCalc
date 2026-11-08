@@ -156,7 +156,10 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
     """Проходы журнала между start и end: длительность, средние W, D, T, съём.
 
     Проход с остановкой внутри (участки с теми же «Партия»/«Проход», разделённые «Остановка»/«Запуск») — одна
-    строка; длительность и выгрузка считаются без времени простоя."""
+    строка; длительность и выгрузка считаются без времени простоя. Средние влажности, T зерна и съём — по строкам
+    сушки: рециркуляция (зерно по кругу или уже следующий проход через силос), охлаждение и прогрев в них не идут, а
+    пробы входа набора сушилки — идут (это зерно прохода). На журнале ноября 2026 с рециркуляцией 1-й проход выходил
+    «23,5 %» вместо 23,2 %, вход — 30,3 % вместо 30,8 %."""
     from .calibration import _t_proc, pass_of_segment, prepare
     prep, reliable = prepare(rows)
     if not reliable:
@@ -177,8 +180,9 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
         for sub in sorted({r["seg"] for r in data}):
             dts = [r["dt"] for r in data if r["seg"] == sub]
             hours += (max(dts) - min(dts)).total_seconds() / 3600.0
-        win = [r["w_in"] for r in data if r.get("w_in") is not None]
-        wout = [r["w_out"] for r in data if r.get("w_out") is not None]
+        dry = [r for r in data if not r.get("recirc") and not r.get("burner_off")]
+        win = [r["w_in"] for r in dry if r.get("w_in") is not None]
+        wout = [r["w_out"] for r in dry if r.get("w_out") is not None and not r.get("fill")]
         ds = [r["d_f"] for r in data if r.get("d_f") is not None]
         ts = [x for x in (_t_proc(r, p.temp_source) for r in data) if x is not None]
         unloaded = 0.0
@@ -189,7 +193,7 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
                 unloaded += mdl.q_at(p, a["d_f"]) * max((b["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
         w_in_avg = sum(win) / len(win) if win else None
         w_out_avg = sum(wout) / len(wout) if wout else None
-        tgs = [0.5 * (r["t_a1"] + r["t_a2"]) for r in data if r.get("t_a1") is not None and r.get("t_a2") is not None]
+        tgs = [0.5 * (r["t_a1"] + r["t_a2"]) for r in dry if r.get("t_a1") is not None and r.get("t_a2") is not None]
         tg_avg = sum(tgs) / len(tgs) if tgs else None
         w_true = mdl.true_from_read(p, w_out_avg, tg_avg) if w_out_avg is not None else None
         passes.append({

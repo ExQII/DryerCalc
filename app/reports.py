@@ -34,7 +34,7 @@ def journal_blank_pdf(path: str, start: Optional[datetime] = None, hours: int = 
     w.setPageOrientation(QPageLayout.Landscape)
     w.setPageMargins(QMarginsF(10, 9, 10, 9), QPageLayout.Millimeter)
     w.setResolution(300)
-    w.setTitle("Журнал сушки кукурузы")
+    w.setTitle("Журнал сушки зерна")
     w.setCreator(f"DryerCalc {__version__}")
     p = QPainter(w)
     try:
@@ -50,7 +50,7 @@ def journal_blank_pdf(path: str, start: Optional[datetime] = None, hours: int = 
                 w.newPage()
             y = 0
             p.setFont(f_title)
-            p.drawText(QRectF(0, y, W, 9 * mm), Qt.AlignLeft | Qt.AlignVCenter, "Журнал сушки кукурузы")
+            p.drawText(QRectF(0, y, W, 9 * mm), Qt.AlignLeft | Qt.AlignVCenter, "Журнал сушки зерна")
             p.setFont(f_cell)
             fields = (f"Дата: {start:%d.%m.%Y}" if start else "Дата: ____________") + \
                      "     Смена: ______     Сушильщик: ______________________     " + \
