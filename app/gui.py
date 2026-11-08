@@ -212,14 +212,97 @@ class MainWindow(QMainWindow):
     PHOTO_BIAS = 0.8
 
     def _startup_model(self) -> None:
-        """Один раз после запуска: убрать поправку влагомера с фото журнала октября (с перекалибровкой), иначе —
-        дополнить допуски модели прошлой версии."""
+        """Один раз после запуска: убрать поправку влагомера с фото журнала октября (с перекалибровкой); заменить
+        b_нар, подобранный по журналу версией до 1.7.3, физической оценкой (с перекалибровкой); иначе — дополнить
+        допуски модели прошлой версии."""
         if not shiboken6.isValid(self):              # окно удалено раньше, чем сработал отложенный вызов
             return
         if self._has_photo_bias():
             self._drop_photo_bias()
+        elif self._has_fitted_amb():
+            self._reset_fitted_amb()
         else:
             self._upgrade_model()
+
+    # b_нар по журналу не подбирается с 1.7.3 (calibration.NOT_FITTED) — физическая оценка из стартовой модели
+    AMB_PRIOR = mdl.DryerParams().b_amb
+
+    def _has_fitted_amb(self) -> bool:
+        """b_нар подобран по журналу версией до 1.7.3 (модель калибровали по своему журналу, b_нар не равен физической
+        оценке) и его ещё не заменяли. Стартовую модель не трогаем."""
+        if (self.storage.get_json("migrations", {}) or {}).get("amb_v1"):
+            return False
+        p = self.params
+        return not p.calib_info.startswith("стартовая") and abs(p.b_amb - self.AMB_PRIOR) > 1e-9
+
+    def _mark_amb_done(self, info: Dict) -> None:
+        mig = self.storage.get_json("migrations", {}) or {}
+        mig["amb_v1"] = dict(info, done=datetime.now().strftime("%d.%m.%Y %H:%M"))
+        self.storage.set_json("migrations", mig)
+
+    def _reset_fitted_amb(self) -> None:
+        """b_нар, подобранный по журналу, — артефакт: строки без записи T нар шли в подбор как 10 °C, а в узком
+        диапазоне погоды влияние не отделить от различий между проходами (calibration.NOT_FITTED). b_нар входит в
+        подобранный R₀, поэтому модель перекалибровывается по журналу с физической оценкой (как кнопкой «Калибровать
+        модель», в фоне). Журнала мало или модель уже ждала калибровки — пометка «перекалибруйте»."""
+        from dataclasses import replace as _replace
+        if getattr(self, "_cal_job", None) is not None:          # идёт другая калибровка — позже
+            QTimer.singleShot(5000, self._startup_model)
+            return
+        old = self.params
+        base = _replace(old, b_amb=self.AMB_PRIOR)
+        note = f"b_нар {old.b_amb:+.2f} по журналу заменён физической оценкой {self.AMB_PRIOR:+.2f}"
+
+        def finish(new_p: mdl.DryerParams, how: str, msg: str) -> None:
+            self.set_params(new_p)
+            self._mark_amb_done({"how": how, "b_amb_old": round(old.b_amb, 4), "r_ref_old": round(old.r_ref, 4),
+                                 "r_ref_new": round(new_p.r_ref, 4)})
+            self.storage.log_event("amb_fit_removed", {"how": how, "b_amb_old": round(old.b_amb, 4),
+                                                       "r_ref_old": round(old.r_ref, 4),
+                                                       "r_ref_new": round(new_p.r_ref, 4)})
+            self.statusBar().showMessage(
+                f"Влияние наружной T: подобранный по журналу b_нар = {old.b_amb:+.2f} заменён физической оценкой "
+                f"{self.AMB_PRIOR:+.2f} — по журналу его не определить («Справка» → «Для инженера», «Что нового в v1.7.3»). "
+                f"{msg}", 120000)
+
+        def fallback() -> None:
+            new_p = _replace(base, calibrated=False, calib_info=f"{note} — перекалибруйте по журналу",
+                             phys_info=f"{note} — перекалибруйте по журналу")
+            finish(new_p, "нужна калибровка", "Журнала для калибровки мало — перекалибруйте модель, когда он наберётся.")
+
+        rows = self._table_to_rows()
+        if not rows or not old.calibrated:
+            fallback()
+            return
+
+        def done(res) -> None:
+            self._cal_job = None
+            if self.params is not old:                           # параметры уже поменяли — не перетирать
+                return
+            new_p, rep = res
+            if rep["n_used"] < 12:
+                fallback()
+                return
+            new_p = _replace(new_p, calib_info=f"{new_p.calib_info} (b_нар — физическая оценка)")
+            head = ""
+            used = rep.get("used") or []
+            if used:
+                from .calibration import _obs_arr, predict_out
+                arr = _obs_arr(used)
+                e_old = predict_out(_replace(old, model_kind="empirical"), used, arr)[0] - arr["w_out"]
+                head = (f"Перекалибровка 1.7.3: b_нар = {old.b_amb:+.2f} был подобран по журналу прошлой версией — "
+                        f"заменён физической оценкой {self.AMB_PRIOR:+.2f}. Ошибка w_вых на этих строках: прежняя модель "
+                        f"±{float(abs(e_old).mean()):.2f} п.п., новая ±{rep['mae']:.2f} п.п.; вне обучения новая не хуже, "
+                        f"а на морозе прежняя завышала бы съём. «Было» ниже — прежние коэффициенты с новым b_нар.\n\n")
+            self.report.setPlainText(head + rep["text"])
+            finish(new_p, "перекалибровано", f"Модель перекалибрована по журналу: расход влаги R₀ "
+                                             f"{old.r_ref:.2f} → {new_p.r_ref:.2f} т воды/ч.")
+
+        def failed(_e) -> None:
+            self._cal_job = None
+
+        self._cal_job = worker.start(calibrate, rows, base, half_life_days=self.tab_check.half_life(),
+                                     weather=self.weather_series(), on_done=done, on_error=failed)
 
     def _has_photo_bias(self) -> bool:
         """В модели стоит поправка с фото (+0,8 постоянная, без k_w и k_t) и её ещё не убирали. Поправку, внесённую по
@@ -240,11 +323,14 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(5000, self._startup_model)
             return
         old = self.params
-        base = _replace(old, out_bias=0.0)
+        amb = self._has_fitted_amb()                  # заодно и b_нар, подобранный по журналу (одна перекалибровка)
+        base = _replace(old, out_bias=0.0, **({"b_amb": self.AMB_PRIOR} if amb else {}))
         note = "поправка влагомера с фото журнала октября убрана"
 
         def finish(new_p: mdl.DryerParams, how: str, msg: str) -> None:
             self.set_params(new_p)
+            if amb:
+                self._mark_amb_done({"how": how, "b_amb_old": round(old.b_amb, 4), "with": "meter_photo"})
             self.storage.set_json("meter_photo", {"done": datetime.now().strftime("%d.%m.%Y %H:%M"), "how": how,
                                                   "r_ref_old": round(old.r_ref, 4), "r_ref_new": round(new_p.r_ref, 4)})
             self.storage.log_event("meter_photo_removed", {"how": how, "r_ref_old": round(old.r_ref, 4),
@@ -1931,7 +2017,10 @@ class MainWindow(QMainWindow):
         f.addRow("Равновесная влажность w_eq", self.s_weq)
         f.addRow("Показатель по влажности b_w", self.s_bw)
         f.addRow("Показатель по температуре b_dt", self.s_bdt)
-        f.addRow("Коэффициент по T наружной b_нар (на 10 °C)", self.s_bamb)
+        f.addRow("Коэффициент по T наружной b_нар (на 10 °C, не калибруется)", self.s_bamb)
+        self.s_bamb.setToolTip("Физическая оценка: +3 % расхода влаги на каждые +10 °C наружного воздуха (прогрев\n"
+                               "холодного зерна). По журналу не подбирается: в узком диапазоне погоды его не\n"
+                               "отделить от различий между проходами. Калибровка оставляет значение отсюда.")
         f.addRow("Коэффициент по RH b_rh (на 30 %)", self.s_brh)
         right.addWidget(gb)
 

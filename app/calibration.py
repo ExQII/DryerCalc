@@ -1028,18 +1028,26 @@ def _param_cov(x: np.ndarray, wt: np.ndarray, a: np.ndarray, res: np.ndarray, gr
     return cov * deff, deff
 
 
-def _fit_use(feats: Dict[str, np.ndarray], ii: np.ndarray, has_rh: bool, has_amb: bool) -> List[str]:
-    """Какие показатели подбираются по журналу: при 12+ строках — те, у признака которых есть разброс; влияние
-    погоды — только если T/RH наружные есть хотя бы у половины строк."""
+# v1.7.3: влияние наружной T (b_нар) по журналу не подбирается — остаётся физическая оценка (+3 % R на 10 °C,
+# прогрев холодного зерна). Проверка на журнале ноября 2026 (T нар 0–6 °C): строки без записи T нар шли в подбор
+# как 10 °C (опорная) — от этого b_нар = −0,11…−0,17 вместо +0,02 (пустые заполнены ближайшим замером) и +0,07 ± 0,06
+# (только строки с T нар); внутри проходов +0,06. В узком диапазоне погоды b_нар не отделить от различий между
+# проходами (без одного прохода он прыгал от −0,11 до +0,10), а ошибка знака на морозе даёт D на 20–40 % выше
+# нужного. С b_нар = +0,03 прогноз вне обучения тот же или точнее (без одного прохода ±0,79 против ±0,84 п.п.).
+NOT_FITTED = ("b_amb",)
+
+
+def _fit_use(feats: Dict[str, np.ndarray], ii: np.ndarray, has_rh: bool) -> List[str]:
+    """Какие показатели подбираются по журналу: при 12+ строках — те, у признака которых есть разброс; b_нар — нет
+    (NOT_FITTED); b_rh — только если RH наружная записана во всех строках: строка без записи шла бы в подбор с
+    опорными 70 %, а такая подстановка на T нар как раз и испортила b_нар."""
     use: List[str] = []
     if len(ii) >= 12:
         for k in feats:
-            if float(np.std(feats[k][ii])) > 0.02:
+            if k not in NOT_FITTED and float(np.std(feats[k][ii])) > 0.02:
                 use.append(k)
     if "b_rh" in use and not has_rh:
         use.remove("b_rh")
-    if "b_amb" in use and not has_amb:
-        use.remove("b_amb")
     return use
 
 
@@ -1109,9 +1117,8 @@ def tolerance_for(rows: List[Dict], p: DryerParams, lam: float = 3.0, half_life_
             keep = np.abs(res_all - med) <= 3.0 * mad
             if 0.7 * n <= int(keep.sum()) < n:
                 idx = idx[keep]
-    has_rh = sum(o["has_rh"] for o in obs) >= 0.5 * n
-    has_amb = sum(o["has_amb"] for o in obs) >= 0.5 * n
-    use = _fit_use(feats, idx, has_rh, has_amb)
+    has_rh = all(o["has_rh"] for o in obs)
+    use = _fit_use(feats, idx, has_rh)
     wt = wts_all[idx]
     x = np.column_stack([np.ones(len(idx))] + [feats[k][idx] for k in use])
     a = x.T @ (wt[:, None] * x) + np.diag(np.array([0.0] + [lam] * len(use)))
@@ -1147,14 +1154,13 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
     y = np.log(np.fromiter((o["r"] for o in obs), dtype=float, count=n))
     feats = _features(obs, p)
     prior = {"b_w": p.b_w, "b_dt": p.b_dt, "b_amb": p.b_amb, "b_rh": p.b_rh}
-    has_rh = sum(o["has_rh"] for o in obs) >= 0.5 * n
-    has_amb = sum(o["has_amb"] for o in obs) >= 0.5 * n
+    has_rh = all(o["has_rh"] for o in obs)
 
     def fit(idx: List[int]):
         """Взвешенная регрессия ln R с регуляризацией к априорным показателям (ridge к prior)."""
         ii = np.asarray(idx, dtype=int)
         m = len(ii)
-        use = _fit_use(feats, ii, has_rh, has_amb)
+        use = _fit_use(feats, ii, has_rh)
         wt = wts_all[ii]
         y_adj = y[ii].copy()
         for k in feats:
@@ -1233,7 +1239,9 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
          % (p.lag_k * p.m_dryer / max(q_at(p, 35), 1e-9), sum(1 for o in used if o.get("mixed")), len(used)))
         if lag else "Времени в журнале нет или оно не распознано: лаг не учитывается (вход и выход берутся из одной строки).",
         (f"Наружная T/RH есть у {n_amb} из {len(used)} строк (журнал + таблица погоды)." if n_amb else
-         "Наружной T/RH нет ни в журнале, ни в таблице погоды: взяты опорные 10 °C / 70 %."),
+         "Наружной T/RH нет ни в журнале, ни в таблице погоды: взяты опорные 10 °C / 70 %.")
+        + f" Влияние наружной T по журналу не подбирается: b_нар = {p.b_amb:+.2f} (физическая оценка) — в узком "
+          "диапазоне погоды его не отделить от различий между проходами.",
         ("Свежие данные весят больше: полураспад %g сут." % half_life_days) if half_life_days and half_life_days > 0
         else "Все строки журнала с одинаковым весом.",
         "",

@@ -491,6 +491,13 @@ def run(out_path: str) -> int:
               and (win.params.t_agent_max, win.params.t_grain_max) == (75.0, 75.0),
               f"рециркуляция через силос начинает проход {_jp10[-1]['pass_no']:g}; пределы T блоков/зерна "
               f"{win.params.t_agent_max:g}/{win.params.t_grain_max:g} °C")
+        # --- v1.7.3: влияние наружной T по журналу не подбирается (физическая оценка) ---
+        _rows11 = [dict(r, t_amb=(10.0 if r.get("batch") == "C" else float(i % 4))) for i, r in enumerate(rows)]
+        _p11, _rep11 = calibrate(_rows11, mdl.DryerParams())
+        check(_p11.b_amb == mdl.DryerParams().b_amb and "не подбирается" in _rep11["text"]
+              and not win._has_fitted_amb(),
+              f"T нар в каждой строке, меняется с проходом: b_нар = {_p11.b_amb:+.2f} (физическая оценка), "
+              f"R₀ = {_p11.r_ref:.2f}")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

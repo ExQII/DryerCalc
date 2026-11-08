@@ -2629,6 +2629,102 @@ def test_live_correction_off_by_default_and_migrated():
     b = live_numbers(rows, P, {"corr": False, "w_target": 24.0}, 6.0, 10.0)
     assert a == b
 
+# ---------------------------------------------------------------------------
+# v1.7.3: влияние наружной T по журналу не подбирается; подобранный прошлой версией b_нар заменяется
+# ---------------------------------------------------------------------------
+
+def _sample_with_weather(rh_every: int = 0):
+    """Журнал октября с наружной T, которая меняется вместе с проходом (как в ноябре: сырой проход теплее), и RH —
+    в каждой rh_every-й строке (0 — во всех, None — нигде)."""
+    rows = [dict(r) for r in _sample_rows()]
+    for i, r in enumerate(rows):
+        r["t_amb"] = 10.0 if r.get("batch") == "C" else float(i % 4)
+        if rh_every is None:
+            r["rh"] = None
+        elif rh_every == 0 or i % rh_every == 0:
+            r["rh"] = 50.0 + (i * 7) % 50
+    return rows
+
+
+def test_ambient_effect_not_fitted_and_rh_only_when_complete():
+    """b_нар остаётся физической оценкой, даже когда T нар записана везде и меняется вместе с проходом (так на
+    журнале ноября подбор давал −0,17 вместо +0,03); b_rh подбирается, только когда RH есть во всех строках."""
+    from app.calibration import NOT_FITTED
+    assert "b_amb" in NOT_FITTED
+    p, rep = calibrate(_sample_with_weather(None), P)
+    assert p.b_amb == P.b_amb and p.b_rh == P.b_rh and "не подбирается" in rep["text"]
+    assert "b_amb" in p.unc_feats                                    # в допуске — с априорной СКО
+    q, _ = calibrate(_sample_with_weather(3), P)                     # RH в трети строк — остальные были бы «70 %»
+    assert q.b_amb == P.b_amb and q.b_rh == P.b_rh
+    r, _ = calibrate(_sample_with_weather(0), P)                     # RH во всех строках — подбирается
+    assert r.b_amb == P.b_amb and abs(r.b_rh - P.b_rh) > 1e-6
+    # ручное значение из настроек калибровка не трогает
+    m, _ = calibrate(_sample_with_weather(None), replace(P, b_amb=0.05))
+    assert m.b_amb == 0.05
+
+
+def test_fitted_ambient_replaced_once_with_recalibration():
+    """Модель, у которой прошлая версия подобрала b_нар по журналу, один раз перекалибровывается с физической
+    оценкой (в фоне, как «Калибровать модель»); второй запуск ничего не трогает; без журнала — пометка
+    «перекалибруйте»; стартовую модель не трогаем."""
+    app = _qapp()
+    from app import worker
+    from app.gui import MainWindow
+    rows = _sample_with_weather(None)
+    db = _tmp("amb.db")
+    if os.path.exists(db):
+        os.remove(db)
+    st = Storage(db)
+    st.replace_journal(rows)
+    fitted, _ = calibrate(rows, P)
+    old = replace(fitted, b_amb=-0.17, calib_info="08.11.2026, строк 245, ошибка w_вых ±0.38 п.п.")
+    st.save_params(old)
+    st.set_json("meter_photo", {"done": "тест"})
+    st.close()
+    win = MainWindow(Storage(db))
+    assert win._has_fitted_amb()
+    win._startup_model()
+    worker.wait_all()
+    for _ in range(30):
+        app.processEvents()
+    p = win.params
+    ref, _rep = calibrate(win.journal_rows(), replace(old, b_amb=P.b_amb), half_life_days=win.tab_check.half_life(),
+                          weather=win.weather_series())
+    assert p.b_amb == P.b_amb and abs(p.r_ref - ref.r_ref) < 1e-9 and p.calibrated
+    assert "физическая оценка" in p.calib_info and "b_нар = -0.17" in win.statusBar().currentMessage()
+    mig = win.storage.get_json("migrations")["amb_v1"]
+    assert mig["how"] == "перекалибровано" and mig["b_amb_old"] == -0.17 and not win._has_fitted_amb()
+    win.close()
+    _cleanup_windows()
+    win2 = MainWindow(Storage(db))                       # второй раз не трогает, даже если b_нар поменяли вручную
+    win2.set_params(replace(win2.params, b_amb=0.05))
+    assert not win2._has_fitted_amb()
+    win2.close()
+    _cleanup_windows()
+    db2 = _tmp("amb_empty.db")                           # журнала нет — пометка «перекалибруйте»
+    if os.path.exists(db2):
+        os.remove(db2)
+    st = Storage(db2)
+    st.save_params(old)
+    st.set_json("meter_photo", {"done": "тест"})
+    st.close()
+    win3 = MainWindow(Storage(db2))
+    win3._startup_model()
+    q = win3.params
+    assert q.b_amb == P.b_amb and not q.calibrated and "перекалибруйте" in q.calib_info
+    win3.close()
+    _cleanup_windows()
+    db3 = _tmp("amb_start.db")                           # стартовая модель — не трогаем
+    if os.path.exists(db3):
+        os.remove(db3)
+    st = Storage(db3)
+    st.save_params(replace(P, b_amb=0.05))
+    st.close()
+    win4 = MainWindow(Storage(db3))
+    assert not win4._has_fitted_amb()
+    win4.close()
+
+
 def _cleanup_windows():
     """Окна прошлых тестов удаляются: каждое новое окно ставит оформление на всё приложение и перерисовывает все
     живые окна — без уборки тесты с окнами замедляются квадратично (в программе окно одно)."""
