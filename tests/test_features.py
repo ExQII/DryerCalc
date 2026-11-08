@@ -2252,7 +2252,9 @@ def test_feed_into_silo_and_warmup_recirculation():
     st = live_state(cut, P, final_w=15.0)
     a = live_advice(P, st, live_forecast(P, Conditions(st.t_proc, 10.0, 70.0), st, 1000.0, 24.0, 14.0, 6.0, 10.0))
     assert st.recirc and st.warmup and st.warmup_since == t0 + timedelta(hours=2.5) and st.unloaded == 0.0
-    assert a["kind"] == "info" and a["head"] == "Прогрев — подачи ещё не было" and a.get("warmup") and a["go"] is None
+    # 1.7: на прогреве — совет к подаче по пробам входа (раньше «Прогрев — подачи ещё не было» без совета)
+    assert a["kind"] in ("keep", "change") and a["head"].startswith("Прогрев — при подаче") and a.get("warmup")
+    assert a["go"] is None and a["phase"] == "warmup"
     # сушка с «Сушим в 1 силос»: тот же проход 1, выгрузка — с этого момента, переключение силоса не делит проход
     cut = [r for r in rows if r["ts"] <= (t0 + timedelta(hours=25.0)).strftime("%d.%m.%y %H:%M")]
     st = live_state(cut, P, final_w=15.0)
@@ -2268,6 +2270,183 @@ def test_feed_into_silo_and_warmup_recirculation():
     obs, skipped, _ = observe_all(rows, P)
     assert all(not (t0 + timedelta(hours=2.5) <= o["dt"] < t0 + timedelta(hours=5.5)) for o in obs)
     assert sum(1 for o in obs if o["dt"] < t0 + timedelta(hours=30)) >= 40
+
+
+def _fill_journal(t_fill=0.0, d_fill=0.0, warm=True, feed=True):
+    """Конец прошлой партии и набор новой — как в журнале 08.11.2026: проход при 60/60 (дольше всего) и 65/65 в конце,
+    охлаждение, «Остановка, набираем сушилку с 1 силоса» (D 0, T блоков t_fill), 4 пробы входа набора,
+    «Рециркуляция» (прогрев, D 35, 60/60), пробы выхода прогрева, «Сушим в 1 силос» и сушка."""
+    t0 = datetime(2026, 11, 7, 6, 0)
+    rows = []
+
+    def row(h, wi=None, wo=None, note="", d=None, t=None, b="1", pn=3.0):
+        rows.append({"ts": (t0 + timedelta(hours=h)).strftime("%d.%m.%y %H:%M"), "w_in": wi, "w_out": wo,
+                     "t_a1": 30 if wo else None, "t_a2": 28 if wo else None, "t_up": t, "t_low": t, "d": d,
+                     "note": note, "batch": b, "pass_no": pn, "t_amb": None, "rh": None})
+    for k in range(30):
+        row(0.5 * k, 18.5, 14.0, d=35, t=60)
+    for k in range(30, 36):
+        row(0.5 * k, 18.4, 13.9, d=33, t=65)
+    row(18.0, None, 14.2, note="Закончился 2 силос, рециркуляция", d=33, t=65)
+    row(19.5, None, 13.9, note="Охлаждение", d=100, t=0)
+    tf = 21.5
+    row(tf, 32.0, note="Остановка, набираем сушилку с 1 силоса", d=d_fill, t=t_fill, b="2", pn=1.0)
+    for k, w in enumerate((32.4, 33.5, 33.3), 1):
+        row(tf + 0.5 * k, w, d=d_fill, t=t_fill, b="2", pn=1.0)
+    if warm:
+        row(tf + 2.0, None, 29.0, note="Рециркуляция", d=35, t=60, b="2", pn=1.0)
+        for k in range(1, 6):
+            row(tf + 2.0 + 0.5 * k, None, 29.0 - 0.8 * k, d=35, t=60, b="2", pn=1.0)
+    if feed:
+        row(tf + 5.0, 33.0, 24.5, note="Сушим в 1 силос", d=30, t=60, b="2", pn=1.0)
+        for k in range(1, 9):
+            row(tf + 5.0 + 0.5 * k, 33.0, 24.0, d=30, t=60, b="2", pn=1.0)
+    return rows, t0 + timedelta(hours=tf)
+
+
+def test_fill_note_flags_and_restart_after_stop():
+    """1.7: «набираем сушилку» — набор: выгрузки нет, пробы входа — зерно в шахте; остановку после набора снимает
+    рециркуляция или подача (сушильщик не пишет «Запуск»), выгрузка с подачи считается."""
+    from app.calibration import is_fill_note, note_meaning, note_trap, prepare
+    for n in ("Остановка, набираем сушилку с 1 силоса", "Набираем  сушилку с 3 силоса", "загрузка сушилки",
+              "Заполняем шахту", "сушилку набираем", "Набор сушилки из 2 с."):
+        assert is_fill_note(n.lower()), n
+        assert note_trap(n) is None, n                                    # явное событие — без переспроса
+    for n in ("Набрался 1 силос, сушим в 3 силос", "набираем с 1 силоса", "Загрузка", "Сушим в 1 силос"):
+        assert not is_fill_note(n.lower()), n
+    assert any("набор сушилки" in x for x in note_meaning("Набираем сушилку с 3 силоса"))
+    rows, tf = _fill_journal()
+    prep, _ = prepare(rows)
+    by = {r["dt"]: r for r in prep}
+    assert all(by[tf + timedelta(hours=h)]["fill"] for h in (0.0, 0.5, 1.0, 1.5))
+    assert by[tf]["stopped"] and by[tf + timedelta(hours=1.5)]["stopped"]
+    w = by[tf + timedelta(hours=2.0)]
+    assert not w["fill"] and not w["stopped"] and w["recirc"] and w["warmup"]      # рециркуляция снимает остановку
+    f = by[tf + timedelta(hours=5.0)]
+    assert not f["recirc"] and not f["stopped"] and f["pass"] == by[tf]["pass"]
+    st = live_state(rows, P, final_w=15.0)
+    assert st.start == tf + timedelta(hours=5.0) and not st.fill and not st.warmup
+    assert abs(st.unloaded - q_at(P, 30) * 4.0) < 1e-6                   # с «Сушим в 1 силос», без «Запуск»
+    assert st.fill_since == tf and st.fill_end == tf + timedelta(hours=2.0)
+    assert st.fill_w == [32.0, 32.4, 33.5, 33.3]
+
+
+def test_start_advice_during_fill_and_warmup():
+    """1.7: набор — совет на запуск по пробам набора (D и T блоков); горелки выключены — T привычная по журналу;
+    прогрев — совет D к подаче. Раньше в наборе был «D не менять — 0 с» и «сушилка не успевает»."""
+    from app.live import fill_range, live_advice
+
+    def advise(rows, d_try=None):
+        st = live_state(rows, P, final_w=15.0)
+        fc = live_forecast(P, Conditions(st.t_proc, 10.0, 70.0), st, 1000.0, 24.0, 14.0, 6.0, 10.0) if st.ok else None
+        return st, fc, live_advice(P, st, fc, d_try)
+    rows, tf = _fill_journal(warm=False, feed=False)
+    st, fc, a = advise(rows)
+    assert st.ok and st.fill and st.w_in == 33.3 and st.d == 0.0
+    assert (st.t_up, st.t_low, st.t_src) == (60.0, 60.0, "привычная по журналу")   # 60/60 стояло дольше 65/65
+    assert fill_range(st) == "4 пробы, 32.0–33.5 %"
+    assert a["phase"] == "fill" and a["kind"] == "change" and a["record"] is None and a["d_now"] is None
+    assert a["head"] == f"При запуске — D = {fc.d_rec:.0f} с и T блоков 60/60 °C" and a["t_rec"] == (60.0, 60.0)
+    assert a["sub"][0] == "Набор с 03:30: вход ≈ 33.3 % (4 пробы, 32.0–33.5 %) · T блоков — привычная по журналу"
+    want = d_for_target(P, Conditions(60.0, 10.0, 70.0), 33.3, 24.0)
+    assert abs(fc.d_rec - round(want)) < 1e-9 and fc.w_out_now == fc.w_out_rec
+    assert not any("не успевает" in w for w in a["warn"])
+    # горелки уже включены в наборе (уставки записаны) — T как в журнале
+    rows2, _ = _fill_journal(t_fill=55.0, warm=False, feed=False)
+    st2, fc2, a2 = advise(rows2)
+    assert (st2.t_up, st2.t_low, st2.t_src) == (55.0, 55.0, "") and a2["t_rec"] == (55.0, 55.0)
+    assert "привычная" not in a2["sub"][0] and fc2.d_rec < fc.d_rec               # T ниже — медленнее
+    # первая строка набора: проба одна — совет уже есть; пробы ещё нет — сообщение
+    st3, _, a3 = advise(rows[:-3])
+    assert st3.ok and a3["sub"][0].startswith("Набор с 03:30: вход ≈ 32.0 % (1 проба)")
+    no_sample = [dict(r) for r in rows[:-3]]
+    no_sample[-1]["w_in"] = None
+    st4, _, a4 = advise(no_sample)
+    assert not st4.ok and a4["kind"] == "nodata" and "пробы входа ещё нет" in st4.message
+    # журнал начинается с набора, уставок T ещё не было ни разу — просим вписать
+    st5, _, _ = advise([r for r in rows if r["ts"] >= tf.strftime("%d.%m.%y %H:%M")])
+    assert not st5.ok and "T блоков в журнале ещё не было" in st5.message
+    # прогрев: D и T стоят — совет к подаче
+    rows6, _ = _fill_journal(feed=False)
+    st6, fc6, a6 = advise(rows6)
+    assert st6.warmup and not st6.fill and st6.t_src == "" and st6.d == 35.0
+    assert a6["phase"] == "warmup" and a6["head"] == f"Прогрев — при подаче D = {fc6.d_rec:.0f} с"
+    assert a6["record"] == {"d": fc6.d_rec} and a6["sub"][0].startswith(
+        "Прогрев с 05:30: зерно набора (4 пробы, 32.0–33.5 %) сохнет по кругу; вход ≈ 33.3 %")
+    assert advise(rows6, d_try=33.0)[2]["head"].startswith("При D = 33 с")           # проверка D — как раньше
+    # подача пошла — обычный совет
+    st7, _, a7 = advise(_fill_journal()[0])
+    assert not st7.fill and not st7.warmup and "phase" not in a7
+
+
+def test_shaft_after_fill_and_recirculation_drying():
+    """1.7: шахта после набора — зерно набора (пробы набора по времени засыпки), рециркуляция при горелках сушит.
+    Порция, которая выйдет первой, — засыпана первой, сушится часы прогрева плюс путь до выхода."""
+    import numpy as np
+    from app.live import transit_profile
+    from app.model import d_at, solve_out_arr
+    rows, tf = _fill_journal(feed=False)
+    st = live_state(rows, P, final_w=15.0)
+    kinds = {r[0]: r[5] for r in st.regime}
+    assert kinds[tf] == "fill" and kinds[tf + timedelta(hours=2.0)] == "recirc"
+    assert kinds[tf - timedelta(hours=2.0)] == "idle"                       # охлаждение — зерно не сушится
+    c = Conditions(60.0, 10.0, 70.0)
+    prof = transit_profile(P, st, c, 30.0, 0.0, st.last)
+    m_sh = P.lag_k * P.m_dryer
+    assert prof["known"].all()
+    # первая порция: снизу шахты, засыпана в начале набора (32,0 %), сушится 2,5 ч прогрева + путь до выхода
+    j = 0
+    m_ahead = prof["m"][j]
+    t_load = tf + (timedelta(hours=2.0)) * (m_ahead / m_sh)
+    assert abs(prof["w_in"][j] - float(np.interp((t_load - tf).total_seconds() / 3600, [0, .5, 1, 1.5],
+                                                   [32.0, 32.4, 33.5, 33.3]))) < 1e-9
+    tau = 2.5 + m_ahead / q_at(P, 30.0)
+    w, _ = solve_out_arr(P, np.array([prof["w_in"][j]]), np.array([d_at(P, m_sh / tau)]), np.array([60.0]), 10.0, 70.0)
+    assert abs(prof["w"][j] - w[0]) < 1e-9
+    # без часов прогрева то же зерно вышло бы заметно сырее
+    tau0 = m_ahead / q_at(P, 30.0)
+    w0, _ = solve_out_arr(P, np.array([prof["w_in"][j]]), np.array([d_at(P, m_sh / tau0)]), np.array([60.0]), 10.0,
+                          70.0)
+    assert w0[0] - w[0] > 1.0
+    # в наборе: старое зерно прошлой партии в прогноз не попадает — только пробы набора
+    st2 = live_state(_fill_journal(warm=False, feed=False)[0], P, final_w=15.0)
+    prof2 = transit_profile(P, st2, c, 30.0, 0.0, st2.last)
+    assert prof2["known"].all() and min(prof2["w_in"]) >= 32.0
+
+
+def test_live_tab_fill_and_reminders():
+    """1.7 в окне: набор — приборы «при запуске», кнопки записи нет, сводка без «было 0» и «видно на выходе»;
+    напоминание «проход скоро закончится» в наборе молчит."""
+    _qapp()
+    import re
+    from app.gui import MainWindow
+    from app.reminders import live_numbers
+    rows, tf = _fill_journal(warm=False, feed=False)
+    st = Storage(_tmp("fill17.db"))
+    st.replace_journal(rows)
+    st.set_json("ui_live", {"now": False})
+    win = MainWindow(st)
+    tl = win.tab_live
+    tl.refresh()
+    assert tl.advice["phase"] == "fill"
+    assert tl.lbl_head.text().replace("\xa0", " ").startswith("При запуске — D = ")
+    assert tl.dial.state()[0] == "change" and tl.dial.state()[3] == "при запуске" and tl.dial.state()[1] is None
+    assert tl.tdial.state()[3] == "при запуске" and tl.tdial.text() == "60/60"
+    assert not tl.btn_record.isVisible()
+    assert "Набор сушилки" in tl.lbl_state.text()
+    summ = re.sub(r"<[^>]+>", "", tl.summary.text())
+    assert "Набор сушилки с 03:30" in summ and "При запуске с T блоков 60/60 °C (привычная по журналу)" in summ
+    assert "было 0" not in summ and "видно на выходе" not in summ and "через 1 ч" not in summ
+    assert "Если подача пойдёт сейчас, проход закончится" in summ
+    assert live_numbers(rows, P, {"wk": 14.0}, 6.0, 10.0)[0] is None
+    # прогрев: «при подаче», запись в журнал — можно
+    win.storage.replace_journal(_fill_journal(feed=False)[0])
+    win._reload_all()
+    tl.refresh()
+    assert tl.advice["phase"] == "warmup" and tl.dial.state()[3] in ("при подаче", "не менять при подаче")
+    summ = re.sub(r"<[^>]+>", "", tl.summary.text())
+    assert "Если подача пойдёт сейчас, на выходе (влагомер): через 1 ч" in summ
+    win.close()
 
 
 def test_live_correction_off_by_default_and_migrated():

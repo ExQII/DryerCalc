@@ -194,7 +194,7 @@ def batch_meter_points(batches: Sequence[Dict], rows: List[Dict], p: mdl.DryerPa
     показания не используются; масса охлаждения обычно — одна загрузка шахты). Разница «показание − лаборатория» —
     одна оценка поправки влагомера на средних для партии влажности и температуре зерна."""
     from .batches import parse_when
-    from .calibration import STOP_STEMS, pass_of_segment, prepare
+    from .calibration import pass_of_segment, prepare
     prep, reliable = prepare(rows)
     if not reliable:
         return []
@@ -221,14 +221,8 @@ def batch_meter_points(batches: Sequence[Dict], rows: List[Dict], p: mdl.DryerPa
         temps = [0.5 * (r["t_a1"] + r["t_a2"]) if r.get("t_a1") is not None and r.get("t_a2") is not None else None
                  for r in rd]
         mass = s_w = s_t = m_t = 0.0
-        stopped = False
         for a, nb in zip(lst, lst[1:]):
-            note = (a.get("note") or "").lower()
-            if any(w in note for w in STOP_STEMS):
-                stopped = True
-            elif "запуск" in note:
-                stopped = False
-            if a.get("d_f") is None or stopped or a.get("recirc") or a.get("burner_off"):
+            if a.get("d_f") is None or a.get("stopped") or a.get("fill") or a.get("recirc") or a.get("burner_off"):
                 continue
             dm = mdl.q_at(p, a["d_f"]) * max((nb["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
             if dm <= 0:

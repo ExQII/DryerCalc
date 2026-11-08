@@ -157,7 +157,7 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
 
     Проход с остановкой внутри (участки с теми же «Партия»/«Проход», разделённые «Остановка»/«Запуск») — одна
     строка; длительность и выгрузка считаются без времени простоя."""
-    from .calibration import STOP_STEMS, _t_proc, pass_of_segment, prepare
+    from .calibration import _t_proc, pass_of_segment, prepare
     prep, reliable = prepare(rows)
     if not reliable:
         return {"passes": [], "hours": 0.0, "note": "в журнале не распознано время"}
@@ -182,15 +182,10 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
         ds = [r["d_f"] for r in data if r.get("d_f") is not None]
         ts = [x for x in (_t_proc(r, p.temp_source) for r in data) if x is not None]
         unloaded = 0.0
-        stopped = False
         span = [r for r in lst if t0 <= r["dt"] <= t1]
         for a, b in zip(span, span[1:]):
-            note = (a.get("note") or "").lower()
-            if any(w in note for w in STOP_STEMS):
-                stopped = True
-            elif "запуск" in note:
-                stopped = False
-            if a.get("d_f") is not None and not stopped and not a.get("recirc") and not a.get("burner_off"):
+            if (a.get("d_f") is not None and not a.get("stopped") and not a.get("fill") and not a.get("recirc")
+                    and not a.get("burner_off")):
                 unloaded += mdl.q_at(p, a["d_f"]) * max((b["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
         w_in_avg = sum(win) / len(win) if win else None
         w_out_avg = sum(wout) / len(wout) if wout else None

@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QBrush, QColor
@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (QCheckBox, QFormLayout, QFrame, QGridLayout, QGro
                                QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from . import model as mdl
-from .live import (LiveState, fmt_t, live_advice, live_forecast, live_state, outlet_soon, pass_mass, t_pair,
-                   zone_lines)
+from .live import (LiveState, fill_range, fmt_t, live_advice, live_forecast, live_state, outlet_soon, pass_mass,
+                   t_pair, zone_lines)
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import (Collapsible, Tile, dspin, fmt_hours, fnum, item, mute, set_role, size_by_current, table)
@@ -544,6 +544,9 @@ class LiveTab(QWidget):
         msg = ""
         if not ok:
             msg = st.message or "—"
+        elif st.fill:
+            msg = ("Набор сушилки: выгрузка стоит, пробы входа — зерно, которым заполняют шахту. По ним совет — режим "
+                   "на запуск. Дальше в журнале: «Рециркуляция» (прогрев) или сразу «Сушим в N с.».")
         elif st.recirc and st.warmup:
             msg = ("Прогрев: сушилку заполнили и греют по кругу. Проход начнётся с подачи («сушим с N с.» или «сушим в "
                    "N с.»).")
@@ -603,10 +606,11 @@ class LiveTab(QWidget):
                                                        if other else [])))
         self._show_t(kind, adv)
         d_now, d_rec = adv.get("d_now"), adv.get("d_rec")
+        when = {"fill": "при запуске", "warmup": "при подаче"}.get(adv.get("phase") or "")
         if kind == "change":
-            self.dial.set_state("change", d_now, d_rec, f"было {d_now:.0f}" if d_now is not None else "")
+            self.dial.set_state("change", d_now, d_rec, when or (f"было {d_now:.0f}" if d_now is not None else ""))
         elif kind == "keep":
-            self.dial.set_state("keep", d_now, d_now, "не менять")
+            self.dial.set_state("keep", d_now, d_now, f"не менять {when}" if when else "не менять")
         elif kind == "wait":
             until = adv.get("until")
             self.dial.set_state("wait", d_now, d_now, f"до {until:%H:%M}" if until else "подождать")
@@ -626,7 +630,10 @@ class LiveTab(QWidget):
 
         def mid(t):
             return 0.5 * (t[0] + t[1])
-        if kind == "change" and t_rec:
+        if adv.get("phase") == "fill" and t_rec:
+            # набор: горелки, может быть, ещё не включены — T блоков ставится при запуске
+            self.tdial.set_state("change", None, mid(t_rec), "при запуске", text=fmt_t(t_rec))
+        elif kind == "change" and t_rec:
             self.tdial.set_state("change", mid(t_now), mid(t_rec), f"было {fmt_t(t_now)}", text=fmt_t(t_rec))
         elif kind == "keep":
             self.tdial.set_state("keep", mid(t_now), mid(t_now), "не менять", text=fmt_t(t_now))
@@ -683,10 +690,14 @@ class LiveTab(QWidget):
                            n_total=self.npass.value() or None)
         self.fc = fc
         d_use = d_try or fc.d_rec
-        lines = [f"Сейчас при D = {st.d:.0f}: на выходе ≈ <b>{fc.w_out_now:.1f} %</b> "
-                 f"(влагомер покажет {fc.w_out_now_read:.1f} %)."]
+        start = (st.fill or st.warmup) and not d_try      # набор / прогрев: совет на запуск и на подачу
         sl = fc.silo
-        if sl:
+        if start:
+            lines = self._start_lines(p, st, fc)
+        else:
+            lines = [f"Сейчас при D = {st.d:.0f}: на выходе ≈ <b>{fc.w_out_now:.1f} %</b> "
+                     f"(влагомер покажет {fc.w_out_now_read:.1f} %)."]
+        if sl and not start:
             lines.append(f"В приёмный силос ушло {sl['m_done']:.0f} т со средней влажностью <b>{sl['w_done']:.1f} %</b> "
                          f"(влагомер {sl['w_done_read']:.1f} %)"
                          + (f"; ещё ≈ {sl['m_tr']:.0f} т уже в шахте — выйдут ≈ {sl['w_tr']:.1f} %." if sl["m_tr"] >= 1
@@ -702,7 +713,9 @@ class LiveTab(QWidget):
                 lines.append(f"Чтобы среднее по силосу вышло {self.w_target.value():g} %, зерну, которое войдёт с этого "
                              f"момента ({sl['m_new']:.0f} т), нужно <b>{fc.w_goal:.1f} %</b>{lim_txt}.")
         goal_txt = f"{fc.w_goal:.1f}" if abs(fc.w_goal - self.w_target.value()) >= 0.05 else f"{self.w_target.value():g}"
-        if d_try:
+        if start:
+            pass
+        elif d_try:
             lines.append(f"При вашем D = <b>{d_try:.0f}</b>: на выходе ≈ <b>{fc.w_out_rec:.1f} %</b> "
                          f"(подобранное для {goal_txt} %: D = {fc.d_rec:.0f}).")
         else:
@@ -721,10 +734,13 @@ class LiveTab(QWidget):
             lines.append(f"Ожидаемая средняя влажность приёмного силоса после прохода: <b>{sl['avg']:.1f} %</b>.")
         if fc.d_note:
             lines.append(f"<span style='color:{th.error}'>{fc.d_note}.</span>")
-        if fc.visible_at:
+        if fc.visible_at and not start:
             lines.append(f"Изменение D будет видно на выходе через <b>{fc.tau_h:.1f} ч</b> — к {fc.visible_at:%d.%m %H:%M}.")
-        soon = self._soon(p, st, fc)
-        if soon:
+        soon = self._soon(p, st, fc) if not st.fill else ""      # в наборе подача ещё не скоро: когда — неизвестно
+        if soon and start:
+            lines.append(f"Если подача пойдёт сейчас, на выходе (влагомер): {soon} — это зерно из шахты, его уже сушит "
+                         f"прогрев; дальше — по совету. По первым ≈ {p.lag_k * p.m_dryer:.0f} т D не трогать.")
+        elif soon:
             lines.append(f"На выходе в ближайшие часы (влагомер): {soon}. Это зерно уже в шахте — прогноз учитывает "
                          f"все D и T блоков, при которых оно шло, и новое D до выхода.")
         if fc.overrun:
@@ -732,8 +748,8 @@ class LiveTab(QWidget):
                          f"подача идёт: проход закончится, когда опустеет силос («рециркуляция» в журнале). Конец "
                          f"партии ниже — не раньше указанного.")
         elif fc.pass_end:
-            lines.append(f"Проход закончится ≈ <b>{fc.pass_end:%d.%m %H:%M}</b> (осталось выгрузить "
-                         f"{fc.remaining:.0f} т).")
+            lines.append(("Если подача пойдёт сейчас, проход" if start else "Проход")
+                         + f" закончится ≈ <b>{fc.pass_end:%d.%m %H:%M}</b> (осталось выгрузить {fc.remaining:.0f} т).")
         if fc.rest_plan is not None:
             ds = " / ".join(f"{x.d:.0f}" for x in fc.rest_plan.passes)
             rng = (f" (90 %: {fc.batch_end_range[0]:%d.%m %H:%M} … {fc.batch_end_range[1]:%d.%m %H:%M})"
@@ -753,6 +769,31 @@ class LiveTab(QWidget):
         self._fill_tiles(p, st, fc, target_read)
         if not keep:
             self._table(p, st, fc, c, d_use, now, th, target_read)
+
+    def _start_lines(self, p, st, fc) -> List[str]:
+        """Сводка набора и прогрева (v1.7): что в шахте, какой режим на запуск или к подаче и почему первые тонны
+        выйдут суше совета."""
+        goal = fc.w_goal
+        read = mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
+        rng = fill_range(st)
+        t_txt = f"T блоков {fmt_t(t_pair(st))} °C" + (f" ({st.t_src})" if st.t_src else "")
+        d_now = f" (сейчас {st.d:.0f})" if st.warmup and st.d else ""
+        out = (f"для {goal:.1f} % на выходе <b>D = {fc.d_rec:.0f}</b>{d_now}; ожидается {fc.w_out_rec:.1f} % "
+               f"(влагомер {read:.1f} %).")
+        m_sh = p.lag_k * p.m_dryer
+        if st.fill:
+            since = f" с {st.fill_since:%H:%M}" if st.fill_since else ""
+            return [f"Набор сушилки{since}: выгрузка стоит, шахту заполняют" + (f" — {rng}" if rng else "")
+                    + f"; вход по последней пробе ≈ <b>{st.w_in:.1f} %</b>.",
+                    f"При запуске с {t_txt}: {out}",
+                    f"Прогрев по кругу перед подачей тоже сушит (журнал 02.11: за 3 ч выход упал с 28,6 до 24,2 %) — "
+                    f"первые ≈ {m_sh:.0f} т при подаче выйдут суше совета; по ним D не трогать."]
+        since = f" с {st.warmup_since:%H:%M}" if st.warmup_since else ""
+        hrs = (st.end - st.warmup_since).total_seconds() / 3600.0 if st.end and st.warmup_since else 0.0
+        what = f"зерно набора ({rng})" if rng else "зерно в шахте"
+        return [f"Прогрев{since}" + (f", {fmt_hours(hrs)}" if hrs >= 0.25 else "") + f": {what} ходит по кругу и "
+                f"сохнет; вход по последней пробе ≈ <b>{st.w_in:.1f} %</b>.",
+                f"К подаче при {t_txt}: {out}"]
 
     def _soon(self, p, st, fc, hours=(1.0, 2.0)) -> str:
         return outlet_soon(p, st, fc, hours)
@@ -797,6 +838,8 @@ class LiveTab(QWidget):
         at = st.end or st.last
         live = self.cb_now.isChecked() and st.end is not None and st.end > st.last
         when = (f"на {at:%H:%M}" if live else f"на последнюю запись {at:%H:%M}") if at else ""
+        if st.fill or st.warmup:
+            when = "если подача пойдёт сейчас"          # набор / прогрев: когда пойдёт подача — неизвестно
         froze = (f"\nнет записей с {st.last:%H:%M} — счёт остановлен на {at:%H:%M}" if st.frozen else "")
         if st.silo_w is not None:
             self.t_silo.set(f"{st.silo_w:.1f} %",
@@ -899,8 +942,8 @@ class LiveTab(QWidget):
         tr = fc.transit
         steady = mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
         legend = [("dot", "ref", "вход"), ("dot", "dot", "выход по влагомеру"), ("dash", "target", "цель на влагомере")]
-        if st.recirc:
-            pass                            # подача закончилась — прогноз выхода «при этом D» не рисуем
+        if st.recirc or st.fill:
+            pass                            # подача закончилась или ещё не начиналась — прогноз «при этом D» не рисуем
         elif tr is not None and len(tr["t"]):
             # ожидаемый выход по часам: зерно, которое уже в шахте (с его историей), затем новое зерно при этом D
             xs = [(x - st.start).total_seconds() / 3600.0 for x in tr["t"]]

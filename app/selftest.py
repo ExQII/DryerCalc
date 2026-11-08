@@ -473,6 +473,14 @@ def run(out_path: str) -> int:
               and not win.tab_live.cb_corr.isChecked() and not win.tab_live.sw_d_only.isChecked(),
               f"прогрев и «сушим в 1 силос»: проходов {len(_jp9)}, при прогреве — «{_a9w['head']}», в сушке выгружено "
               f"{_s9.unloaded:.0f} т; поправка по последним замерам — выключена, «Только разгрузка» — выключено")
+        # --- v1.7: набор сушилки — совет на запуск по пробам набора; рециркуляция сушит зерно в шахте ---
+        _s9f = live_state(_rows9[:1], win.params, final_w=15.0)
+        _f9f = _lf(win.params, mdl.Conditions(60.0, 10.0, 70.0), _s9f, 1000.0, 24.0, 14.0, 6.0, 10.0)
+        _a9f = _la(win.params, _s9f, _f9f)
+        _kinds = {x[5] for x in _s9w.regime}
+        check(_s9f.fill and _a9f.get("phase") == "fill" and _a9f["head"].startswith("При запуске — D = ")
+              and _a9f["t_rec"] == (60, 60) and {"fill", "recirc"} <= _kinds,
+              f"набор сушилки: «{_a9f['head']}» по пробе набора {_s9f.w_in:g} %; прогрев сушит зерно в шахте")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

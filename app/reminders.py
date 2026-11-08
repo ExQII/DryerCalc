@@ -117,7 +117,7 @@ def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: floa
     st = live_state(rows, p, now=now, weather=weather, final_w=float(ui_live.get("wk", 14.0)) + 1.0)
     if not st.ok:
         return None, None
-    if st.recirc:
+    if st.recirc or st.fill:          # подача кончилась или ещё не начиналась (набор сушилки)
         return None, mdl.read_from_true(p, float(ui_live.get("w_target", 24.0)), st.t_grain)
     w_target = float(ui_live.get("w_target", 24.0))
     c = mdl.Conditions(st.t_proc, float(ui_live.get("t_amb", p.t_amb_ref)), float(ui_live.get("rh", p.rh_ref)))

@@ -54,6 +54,7 @@ HEADERS_RU = {
 # силоса («Закончился 2 с., сушим с 1 с.») — нет: зерно через шахту идёт без перерыва
 BREAK_WORDS = ("остановк", "запуск", "загрузка", "зачистка")
 RECIRC_WORDS = ("рецирк",)
+STOP_STEMS = ("остановк",)              # остановка сушилки — до «Запуск», подачи или рециркуляции
 BURNER_OFF_WORDS = ("охлажд",)          # плюс «откл…» вместе с «т.б.» / «блок» / «горел» / «топ»
 BURNER_ON_WORDS = ("запуск", "вкл. т", "вкл т", "включ")
 # подача из силоса: «сушим с 1 с.», «открыли с 3 с.», «переключили на 2 с.», «набираем из 4», «подача с 1 с.»,
@@ -66,8 +67,18 @@ FEED_RE = re.compile(r"(сушим\s+(с|со|из|\d|в\s+(\d|силос|с\.))
 # конец рециркуляции словами: «закончили рециркуляцию», «рециркуляция окончена», «стоп рециркуляция»
 RECIRC_END_RE = re.compile(r"((закончил|окончил|прекратил|остановил|завершил)\w*|конец|стоп)\s+рецирк|"
                            r"рецирк\w*\s+(закончен|окончен|завершен|стоп)", re.I)
+# набор сушилки: «Набираем сушилку с 1 силоса», «Остановка, набираем сушилку», «загрузка сушилки», «заполняем
+# шахту». Выгрузка стоит, шахта заполняется зерном из силоса — пробы входа в эти строки и есть зерно, которое будет
+# сушиться. «Набрался 1 силос» (приёмный силос полон) — не набор сушилки: нет слова «сушилк» / «шахт»
+FILL_RE = re.compile(r"(набира\w*|набор\w*|наполн\w*|заполн\w*|загруж\w*|загрузк\w*|засып\w*)\s+(сушилк|шахт)|"
+                     r"(сушилк|шахт)\w*\s+(набира|наполн|заполн|загруж|засып)", re.I)
 # рециркуляция, когда выход уже у цели партии (13–14 % после охлаждения, с запасом 1 п.п.), — досушка и конец партии
 FINAL_W = 15.0
+
+
+def is_fill_note(note: str) -> bool:
+    """Набор сушилки: шахту заполняют, выгрузка стоит."""
+    return bool(FILL_RE.search(note or ""))
 
 
 def is_feed_note(note: str) -> bool:
@@ -387,7 +398,12 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
       заполнили и греют по кругу. Проход она НЕ заканчивает: подача («сушим с N с.», «сушим в N с.») начинает сушку
       того же прохода (новый участок, рециркуляция снята), номер прохода не растёт;
     burner_off — после «охлаждение» / «откл. т.б.» до «запуск» / «вкл.» (горелки выключены, сушки нет);
-    cool — охлаждение (конец сушки: после него следующая подача — новый проход)."""
+    cool — охлаждение (конец сушки: после него следующая подача — новый проход);
+    fill — набор сушилки (is_fill_note): от «набираем сушилку» до первой рециркуляции, подачи, конца рециркуляции
+      или охлаждения. Выгрузка стоит, пробы входа — зерно, которым заполнена шахта; пробы выхода в наборе не
+      считаются сушкой (прогрев после набора остаётся прогревом);
+    stopped — сушилка остановлена: от «Остановка» до «Запуск», подачи или рециркуляции (после остановки на набор
+      сушильщик пишет «Рециркуляция» и «Сушим в N с.», а не «Запуск»); новый проход начинается не остановленным."""
     times, reliable = assign_times(rows)
     prep: List[Dict] = []
     seg = 0
@@ -395,6 +411,7 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
     t0 = next((t for t in times if t is not None), None)
     last_up = last_low = last_d = None
     recirc = burner_off = cool = False
+    fill = stopped = False
     ended = False                       # проход закончен (рециркуляция / охлаждение): следующая подача — новый проход
     dried = False                       # в проходе уже сушили: была проба выхода вне рециркуляции и охлаждения
     warmup = False                      # идёт рециркуляция-прогрев (до первой сушки прохода)
@@ -423,10 +440,20 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
             recirc = burner_off = cool = warmup = False
         if new_pass:
             pass_idx += 1
-            ended = dried = False
-        if RECIRC_END_RE.search(note):
+            ended = dried = fill = stopped = False
+        rec_end = bool(RECIRC_END_RE.search(note))
+        rec_start = not rec_end and any(w in note for w in RECIRC_WORDS)
+        if any(w in note for w in STOP_STEMS):
+            stopped = True
+        elif "запуск" in note or rec_start or is_feed_note(note):
+            stopped = False
+        if is_fill_note(note):
+            fill = True
+        elif fill and (rec_start or rec_end or is_feed_note(note) or _burner_off_note(note)):
+            fill = False                                    # шахта полна: прогрев по кругу или сразу подача
+        if rec_end:
             recirc = warmup = False                         # конец рециркуляции (после сушки проход уже закончен)
-        elif any(w in note for w in RECIRC_WORDS):
+        elif rec_start:
             recirc = True
             if dried:
                 ended = True                                # рециркуляция после сушки — подача прохода закончилась
@@ -440,7 +467,8 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
             burner_off = cool = False
         p["recirc"], p["burner_off"], p["cool"] = recirc, burner_off, cool
         p["warmup"] = recirc and warmup
-        if r.get("w_out") is not None and not recirc and not burner_off:
+        p["fill"], p["stopped"] = fill, stopped
+        if r.get("w_out") is not None and not recirc and not burner_off and not fill:
             dried = True
         p["batch_f"], p["pass_f"] = batch, pass_no
         last_batch, last_pass = batch, pass_no
@@ -459,9 +487,6 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
         p["dt"] = dt
         prep.append(p)
     return prep, reliable
-
-
-STOP_STEMS = ("остановк",)
 
 
 def pass_of_segment(prep: List[Dict]) -> Dict[int, int]:
@@ -587,6 +612,8 @@ _EVENT_PATTERNS = [re.compile(x, re.I) for x in (
     r"^\s*переключ\w*\s+(на\s+)?(с\b|с\.|силос|подач)",
     r"^\s*(загрузка|зачистка)(\s+(сушилки|шахты|силоса?)\b.*)?\s*[.,;:!]?\s*$",
     r"^\s*(набираем|снимаем)\s+(с\b|с\.|в\b|из\b|силос)",
+    r"^\s*(остановк\w*[,.;]?\s*)?((набира|набор|наполн|заполн|загруж|загрузк|засып)\w*\s+(сушилк|шахт)|"
+    r"(сушилк|шахт)\w*\s+(набира|наполн|заполн|загруж|засып))",
     r"^\s*(запуск\w*[,.;]?\s*)?(сушим|подача)\s+(с|со|из|\d)",
     r"^\s*(начали\s+)?рециркуляци\w*\b(?!.*(воздух|откл))",
     r"^\s*(закончил\w*|окончил\w*|конец|стоп)\s+рециркуляци\w*\s*[.,;:!]?\s*$",
@@ -613,6 +640,9 @@ def note_meaning(note: str) -> List[str]:
     if RECIRC_END_RE.search(n):
         return ["конец рециркуляции; следующая подача из силоса — новый проход"]
     out = [text for stems, text in _STEM_MEANING if any(w in n for w in stems)]
+    if is_fill_note(n):
+        out.append("набор сушилки: выгрузка стоит, пробы входа — зерно, которым заполняют шахту; по ним «Текущий "
+                   "проход» советует режим на запуск")
     if is_feed_note(n) and not any(w in n for w in RECIRC_WORDS):
         out.append("подача из силоса: внутри прохода — переключение силоса (проход продолжается), после "
                    "рециркуляции — начало следующего прохода")

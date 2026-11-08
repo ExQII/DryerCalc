@@ -61,6 +61,11 @@ class LiveState:
     recirc_since: Optional[datetime] = None   # с какого времени рециркуляция (текущая, не прогрев)
     warmup: bool = False                      # сейчас рециркуляция-прогрев: сушилку заполнили, подачи ещё не было
     warmup_since: Optional[datetime] = None   # с какого времени прогрев
+    fill: bool = False                        # идёт набор сушилки (последняя строка прохода — в наборе): выгрузки нет
+    fill_since: Optional[datetime] = None     # с какого времени набор (последний в проходе)
+    fill_end: Optional[datetime] = None       # когда набор кончился (рециркуляция / подача); None — идёт
+    fill_w: List[float] = field(default_factory=list)   # пробы входа в наборе — зерно, которым заполнена шахта
+    t_src: str = ""                           # откуда T блоков для совета на запуск, если горелки ещё не включены
     unloaded: float = 0.0
     hours: float = 0.0
     corr: float = 0.0
@@ -86,7 +91,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
     """final_w — выше какой влажности выхода (истинной) рециркуляция — конец прохода, а не досушка партии
     (по умолчанию calibration.FINAL_W = 15 %; раздел «Текущий проход» передаёт Wк + 1 п.п.).
     now — считать выгрузку до этого момента (реальное время), но не дальше live_cap_h после последней записи."""
-    from .calibration import FINAL_W, STOP_STEMS, _t_proc, journal_passes, observe_all, pass_of_segment, prepare
+    from .calibration import FINAL_W, _t_proc, journal_passes, observe_all, pass_of_segment, prepare
     st = LiveState()
     if weather is not None:
         rows = weather.fill_rows(rows)
@@ -98,10 +103,11 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.message = "В журнале не распознано время проб — режим «по факту» работает только с временем."
         return st
     data_segs = [r["seg"] for r in prep if r.get("w_in") is not None or r.get("w_out") is not None]
-    if not data_segs:
+    fill_now = bool(prep[-1].get("fill"))       # идёт набор сушилки: текущий проход — его, даже без пробы
+    if not data_segs and not fill_now:
         st.message = "В журнале нет замеров влажности."
         return st
-    seg = data_segs[-1]
+    seg = prep[-1]["seg"] if fill_now else data_segs[-1]
     pass_of = pass_of_segment(prep)
     chain = {s for s, first in pass_of.items() if first == pass_of[seg]}      # участки этого прохода
     rs = [r for r in prep if r["seg"] in chain and r.get("dt") is not None]
@@ -124,8 +130,8 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.batch_end = bool(info["batch_end"] and info["end_kind"])
     # начало прохода — первая строка, где сушилка работает (проход может начаться строкой «Остановка» после
     # рециркуляции прошлого прохода)
-    st.start = next((r["dt"] for r in rs if r.get("d_f") is not None and not r.get("recirc")
-                     and not r.get("burner_off") and not any(w in (r.get("note") or "").lower() for w in STOP_STEMS)),
+    st.start = next((r["dt"] for r in rs if r.get("d_f") is not None and r["d_f"] > 0 and not r.get("recirc")
+                     and not r.get("burner_off") and not r.get("stopped") and not r.get("fill")),
                     rs[0]["dt"])
     st.last = rs[-1]["dt"]
     prev_d = None
@@ -163,6 +169,13 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
             st.warmup_since = None
         elif st.warmup_since is None:
             st.warmup_since = r["dt"]
+        if r.get("fill"):
+            if st.fill_since is None or st.fill_end is not None:     # новый набор (прошлый в проходе кончился)
+                st.fill_since, st.fill_end, st.fill_w = r["dt"], None, []
+            if r.get("w_in") is not None:
+                st.fill_w.append(r["w_in"])
+        elif st.fill_since is not None and st.fill_end is None:
+            st.fill_end = r["dt"]
         st.series.append((r["dt"], r.get("w_in"), r.get("w_out")))
     end = st.last
     if now is not None and now > st.last:
@@ -178,15 +191,10 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
           for r in rs if r.get("w_out") is not None and not r.get("recirc")]
     t_rd = [(t - rs[0]["dt"]).total_seconds() / 3600.0 for t, _, _ in rd]
     unloaded = silo_sum = silo_sum_read = 0.0
-    stopped = False
     for a, b in zip(rs, rs[1:] + [None]):
-        note = (a.get("note") or "").lower()
-        if any(w in note for w in STOP_STEMS):
-            stopped = True
-        elif "запуск" in note:
-            stopped = False
         t_next = b["dt"] if b is not None else end
-        if a.get("d_f") is not None and not stopped and not a.get("recirc") and not a.get("burner_off"):
+        if (a.get("d_f") is not None and not a.get("stopped") and not a.get("fill") and not a.get("recirc")
+                and not a.get("burner_off")):
             dm = mdl.q_at(p, a["d_f"]) * max((t_next - a["dt"]).total_seconds(), 0.0) / 3600.0
             unloaded += dm
             if rd and dm > 0:
@@ -200,7 +208,18 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
     st.regime, st.inlet = _journal_regime(prep, p)
     st.recirc = bool(rs[-1].get("recirc"))
     st.warmup = bool(rs[-1].get("warmup"))
+    st.fill = bool(rs[-1].get("fill"))
     st.burner_off = bool(rs[-1].get("burner_off"))
+    start = st.fill or st.warmup          # сушилку набрали (набирают) — совет на запуск / на подачу
+    if start and p.temp_source == "block" and not (st.t_up and st.t_up > 0 and st.t_low and st.t_low > 0):
+        # горелки ещё не включены (уставки 0 или не записаны) — T блоков для совета: привычная пара по журналу
+        from .doe import typical_pair
+        pair = typical_pair(rows)
+        if pair is not None:
+            st.t_up, st.t_low, st.t_proc = pair[0], pair[1], 0.5 * (pair[0] + pair[1])
+            st.t_src = "привычная по журналу"
+        else:
+            st.t_up = st.t_low = st.t_proc = None
     st.hours = (end - st.start).total_seconds() / 3600.0
     # поправка по последним наблюдениям этого прохода
     seg_rows = [rows[i] for i, r in enumerate(prep) if r["seg"] in chain]
@@ -218,7 +237,15 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.message = ("Горелки выключены (в журнале «охлаждение» / «откл. т.б.»): проход закончен, идёт охлаждение. "
                       "Для рециркуляции — раздел «Досушка».")
         return st
-    if st.w_in is None or st.d is None or st.t_proc is None:
+    if start and st.w_in is None:
+        st.message = ("Набор сушилки: пробы входа ещё нет — совет на запуск появится с первой пробой." if st.fill else
+                      "Прогрев: в проходе нет пробы входа — совет на подачу появится с пробой входа.")
+        return st
+    if start and st.t_proc is None:
+        st.message = ("Сушилку набрали, но T блоков в журнале ещё не было ни разу — впишите уставки, с которыми "
+                      "запустите, и здесь будет совет по D.")
+        return st
+    if st.w_in is None or (st.d is None and not start) or st.t_proc is None:
         st.message = "В текущем проходе не хватает данных: нужны влага на входе, разгрузка D и температура."
         return st
     st.ok = True
@@ -249,33 +276,50 @@ def pass_mass(m0: float, w0: Optional[float], passes: List[Dict]) -> Tuple[Optio
 
 
 def _journal_regime(prep: List[Dict], p: mdl.DryerParams) -> Tuple[List[Tuple], List[Tuple[datetime, float]]]:
-    """Весь журнал по времени: режим [(время, Q, T блоков, идёт ли выгрузка, D)] — от строки до следующей — и вход
-    [(время, W)]. Во время остановки, охлаждения и рециркуляции зерно в шахте не движется к выходу из силоса
-    (выгрузка = 0) и не сушится в учёт времени прохода."""
-    from .calibration import STOP_STEMS, _t_proc
+    """Весь журнал по времени: режим [(время, Q, T блоков, идёт ли выгрузка, D, что с шахтой)] — от строки до
+    следующей — и вход [(время, W)]. Что с шахтой:
+      "run" — выгрузка идёт: зерно движется к выходу и сушится;
+      "recirc" — рециркуляция при работающих горелках (T блоков > 0, D > 0): прогрев после набора или остаток
+        прохода по кругу. В силос ничего не уходит, но зерно в шахте ходит по кругу и сохнет — время идёт в сушку.
+        Журнал ноября 2026 (v1.7): после набора выход за 3 ч прогрева упал с 28,6 до 24,2 %; прогноз выхода зерна из
+        шахты в момент подачи после рециркуляции (3 подачи, 15 проб) — смещение +3,9 → +0,5 п.п., RMS 4,1 → 1,0;
+        после рециркуляции конца прохода 06.11 — RMS 3,8 → 0,4;
+      "fill" — набор сушилки: шахту заполняют, выгрузки нет (_walk_back берёт порции из зерна набора);
+      "idle" — остановка, охлаждение, рециркуляция без горелок, нет D: зерно стоит, время не считается."""
+    from .calibration import _t_proc
     tl: List[Tuple] = []
     inlet: List[Tuple[datetime, float]] = []
-    stopped = False
     for r in prep:
         if r.get("dt") is None:
             continue
-        note = (r.get("note") or "").lower()
-        if any(w in note for w in STOP_STEMS):
-            stopped = True
-        elif "запуск" in note:
-            stopped = False
         d = r.get("d_f")
         ok = d is not None and 0 < d <= 100
-        running = ok and not stopped and not r.get("burner_off") and not r.get("recirc")
-        tl.append((r["dt"], mdl.q_at(p, d) if ok else None, _t_proc(r, p.temp_source), running, d if ok else None))
+        temp = _t_proc(r, p.temp_source)
+        works = ok and not r.get("stopped") and not r.get("burner_off")
+        if r.get("fill"):
+            kind = "fill"
+        elif works and not r.get("recirc"):
+            kind = "run"
+        elif works and r.get("recirc") and temp is not None and temp > 0:
+            kind = "recirc"
+        else:
+            kind = "idle"
+        tl.append((r["dt"], mdl.q_at(p, d) if ok else None, temp, kind == "run", d if ok else None, kind))
         if r.get("w_in") is not None and not r.get("recirc"):
             inlet.append((r["dt"], r["w_in"]))
     return tl, inlet
 
 
-def _walk_back(tl: List[Tuple], t_now: datetime, mass: float, times: Optional[List[datetime]] = None):
+def _walk_back(tl: List[Tuple], t_now: datetime, mass: float, times: Optional[List[datetime]] = None,
+               m_fill: float = 0.0):
     """Порция, за которой с момента её входа выгружено mass т: (вход, часов сушки, ∫T dt по известной T, часов с
-    известной T, D — если он не менялся, иначе None) или None — журнала не хватает (зашла раньше первой записи)."""
+    известной T, D — если он не менялся, иначе None) или None — журнала не хватает (зашла раньше первой записи).
+
+    Дошли до набора сушилки (m_fill — сколько в шахте, т), а выгружено после него меньше mass, — порция из зерна
+    набора. Шахту заполняли снизу: чем меньше осталось «добрать» до mass, тем выше порция лежала и тем позже её
+    засыпали (засыпка по времени равномерная); вход — время засыпки, влажность — пробы набора в это время.
+    Перемешивание стопки прогревом по кругу не учитывается: пробы набора обычно близки (02.11 — 31,2–32,4 %).
+    Часы рециркуляции ("recirc") идут в сушку, выгрузки в них нет."""
     import bisect
     times = times if times is not None else [row[0] for row in tl]
     idx = bisect.bisect_right(times, t_now) - 1
@@ -283,11 +327,26 @@ def _walk_back(tl: List[Tuple], t_now: datetime, mass: float, times: Optional[Li
     ds = set()
     end = t_now
     for j in range(idx, -1, -1):
-        t_j, q_j, temp_j, run_j, d_j = tl[j]
+        t_j, q_j, temp_j, run_j, d_j, kind_j = tl[j]
         dur = max((end - t_j).total_seconds() / 3600.0, 0.0)
-        end = t_j
-        if dur <= 0 or not run_j:
-            continue                      # остановка / охлаждение / рециркуляция: зерно стоит, время не считаем
+        f1, end = end, t_j
+        if kind_j == "fill" and m_fill > 0:
+            k = j
+            while k > 0 and tl[k - 1][5] == "fill":
+                k -= 1
+            f0 = tl[k][0]
+            r = min(max(mass - acc, 0.0), m_fill)
+            return f0 + (f1 - f0) * (1.0 - r / m_fill), h_run, t_int, t_known, None
+        if dur <= 0:
+            continue
+        if kind_j == "recirc":
+            h_run += dur
+            t_int += temp_j * dur
+            t_known += dur
+            ds.add(None)                  # время в шахте уже не m/Q(D): действующий D — по времени
+            continue
+        if not run_j:
+            continue                      # остановка / охлаждение / набор без учёта: зерно стоит, время не считаем
         if q_j is None or q_j <= 0:
             return None
         ds.add(d_j)
@@ -332,7 +391,7 @@ def transit_profile(p: mdl.DryerParams, st: LiveState, c: mdl.Conditions, d_futu
     known = np.zeros(n, dtype=bool)
     times = [row[0] for row in st.regime]
     for j in range(n):
-        wb = _walk_back(st.regime, t_now, m_shaft - m_ahead[j], times)
+        wb = _walk_back(st.regime, t_now, m_shaft - m_ahead[j], times, m_shaft)
         if wb is None:                     # журнала не хватает — как будто вошла сейчас и идёт при новом режиме
             w_in[j], d_eff[j], t_eff[j] = st.w_in, d_future, c.t_proc
             continue
@@ -492,10 +551,11 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
     fc = LiveForecast()
     corr = st.corr if use_corr else 0.0
     w_in = st.w_in
-    d_now = st.d
+    d_now = st.d if st.d is not None and st.d > 0 else None      # набор сушилки: выгрузка стоит, D нет
     t_now = (st.end or max(now, st.last)) if now else st.last      # «сейчас» — с тем же ограничением, что выгрузка
-    fc.w_out_now = mdl.solve_pass(p, c, w_in, 1.0, d_now).w_out + corr
-    fc.w_out_now_read = mdl.read_from_true(p, fc.w_out_now, st.t_grain)
+    if d_now is not None:
+        fc.w_out_now = mdl.solve_pass(p, c, w_in, 1.0, d_now).w_out + corr
+        fc.w_out_now_read = mdl.read_from_true(p, fc.w_out_now, st.t_grain)
 
     def choose_d(w_goal_: float, c_: mdl.Conditions) -> Tuple[float, float, str]:
         raw_ = mdl.d_for_target(p, c_, w_in, w_goal_ - corr)
@@ -512,7 +572,7 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
         d_, raw_, note_ = choose_d(w_goal_, c_)
         sl = None
         if silo and st.silo_w is not None and st.unloaded > 1.0:
-            w_now_ = mdl.solve_pass(p, c_, w_in, 1.0, d_now).w_out + corr
+            w_now_ = mdl.solve_pass(p, c_, w_in, 1.0, d_now or d_).w_out + corr
             m_total = m_pass * (100.0 - w_in) / (100.0 - w_target)
             m_done = st.unloaded
             m_rem = max(m_total - m_done, 0.0)
@@ -551,6 +611,8 @@ def live_forecast(p: mdl.DryerParams, c: mdl.Conditions, st: LiveState, m_pass: 
     d_use = d_override if d_override else fc.d_rec
     fc.transit = transit_profile(p, st, c, d_use, corr, t_now)
     fc.w_out_rec = mdl.solve_pass(p, c, w_in, 1.0, d_use).w_out + corr
+    if d_now is None:                     # D ещё не ставили — «сейчас» и «по совету» одно и то же
+        fc.w_out_now, fc.w_out_now_read = fc.w_out_rec, mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
     if fc.silo:
         sl = fc.silo
         new_part = fc.w_out_rec * sl["m_new"] if sl["m_new"] > 0 else 0.0
@@ -685,6 +747,71 @@ def regime_options(p: mdl.DryerParams, fc: LiveForecast) -> Dict[str, Dict]:
     return out
 
 
+def fill_range(st: LiveState) -> str:
+    """«4 пробы, 32,0–33,5 %» — пробы входа набора сушилки."""
+    n = len(st.fill_w)
+    if not n:
+        return ""
+    word = "проба" if n % 10 == 1 and n % 100 != 11 else ("пробы" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14)
+                                                         else "проб")
+    rng = f", {min(st.fill_w):.1f}–{max(st.fill_w):.1f} %" if n > 1 and max(st.fill_w) - min(st.fill_w) >= 0.05 else ""
+    return f"{n} {word}{rng}"
+
+
+def _start_advice(p: mdl.DryerParams, st: LiveState, fc: LiveForecast, base: Dict, prefer: str,
+                  warn: List[str]) -> Dict:
+    """Совет на запуск (v1.7). Набор сушилки: выгрузка стоит, но пробы входа уже есть — это зерно, которым заполнена
+    шахта и которое пойдёт из того же силоса при подаче. По ним сразу подбирается режим: D и T блоков, которые
+    поставить при запуске (T — как в журнале, а если горелки ещё не включены — привычная пара). Прогрев (рециркуляция
+    после набора до подачи): D и T уже стоят — совет, какой D поставить к подаче. Проверенная зона и «Только
+    разгрузка» — как в обычном совете. Шахта при этом сохнет по кругу: первые ≈ m_шахты т при подаче выйдут суше
+    совета (transit_profile считает рециркуляцию сушкой) — по ним D не трогать."""
+    opts = regime_options(p, fc)
+    use_alt = prefer == "alt" and "alt" in opts
+    base.update(options=list(opts.values()), option=("alt" if use_alt else ("d" if opts else None)))
+    read = mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
+    if use_alt:
+        a = fc.alt
+        d_set, t_alt = a["d"], (a["t_up"], a["t_low"])
+        w_set, r_set, goal = a["w_out"], a["w_read"], a["w_goal"]
+    else:
+        d_set, t_alt = fc.d_rec, None
+        w_set, r_set, goal = fc.w_out_rec, read, fc.w_goal
+    z_warn = []
+    if fc.d_out_of_zone and not use_alt:
+        z_warn = [f"D {fc.d_rec:.0f} с — вне проверенного журналом, смотрите пробы чаще."
+                  + ("" if fc.alt else f" Проверенного D + T нет: {fc.alt_reason}.")]
+    src = f" · T блоков — {st.t_src}" if st.t_src and not t_alt else ""
+    out_line = f"Выход при подаче ≈ {w_set:.1f} % (влагомер {r_set:.1f} %) · цель {goal:.1f} %"
+    record = {"d": d_set}
+    if st.fill:
+        # всё ставится при запуске — и D, и T блоков (горелки сейчас могут быть выключены)
+        t_set = t_alt or t_pair(st)
+        record.update(t_up=t_set[0], t_low=t_set[1])
+        since = f" с {st.fill_since:%H:%M}" if st.fill_since else ""
+        rng = fill_range(st)
+        sub = [f"Набор{since}: вход ≈ {st.w_in:.1f} %" + (f" ({rng})" if rng else "") + src, out_line]
+        return dict(base, kind="change", head=f"При запуске — D = {d_set:.0f} с и T блоков {fmt_t(t_set)} °C",
+                    sub=sub, warn=z_warn + warn, go=None, d_now=None, d_rec=d_set, t_rec=t_set, record=None,
+                    phase="fill")
+    # прогрев: D и T блоков уже стоят, сушилка гоняет зерно по кругу; совет — к подаче
+    since = f" с {st.warmup_since:%H:%M}" if st.warmup_since else ""
+    rng = fill_range(st)
+    what_in = f"зерно набора ({rng})" if rng else "зерно в шахте"
+    sub = [f"Прогрев{since}: {what_in} сохнет по кругу; вход ≈ {st.w_in:.1f} %" + src, out_line]
+    d_now = st.d if st.d is not None and st.d > 0 else None
+    diff = d_set - d_now if d_now is not None else float("inf")
+    if t_alt is None and abs(diff) < D_STEP_MIN:
+        return dict(base, kind="keep", head=f"Прогрев — при подаче D не менять ({d_now:.0f} с)", sub=sub,
+                    warn=z_warn + warn, go=None, d_now=d_now, d_rec=fc.d_rec, phase="warmup", warmup=True)
+    what = (f"D = {d_set:.0f} с" if abs(diff) >= 0.5 else "") + (" и " if abs(diff) >= 0.5 and t_alt else "") + \
+        (f"T блоков {fmt_t(t_alt)} °C" if t_alt else "")
+    if t_alt:
+        record.update(t_up=t_alt[0], t_low=t_alt[1])
+    return dict(base, kind="change", head=f"Прогрев — при подаче {what}", sub=sub, warn=z_warn + warn, go=None,
+                d_now=d_now, d_rec=d_set, t_rec=t_alt, record=record, phase="warmup", warmup=True)
+
+
 def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d_try: Optional[float] = None,
                 now: Optional[datetime] = None, prefer: str = "alt") -> Dict:
     """{"kind": "change" | "keep" | "wait" | "info" | "nodata", "head": крупная строка, "sub": [короткие строки],
@@ -713,19 +840,14 @@ def live_advice(p: mdl.DryerParams, st: LiveState, fc: Optional[LiveForecast], d
                     warn=[], go=go, d_now=st.d if st.ok else None, d_rec=None)
     warn = ([fc.d_note[0].upper() + fc.d_note[1:]] if fc.d_note else []) + [w[0].upper() + w[1:] for w in fc.warnings]
     read = mdl.read_from_true(p, fc.w_out_rec, st.t_grain)
-    if st.recirc:
+    start = st.fill or st.warmup
+    if start and not d_try:
+        return _start_advice(p, st, fc, base, prefer, warn)
+    if st.recirc and not start:
         # подача закончилась: советы про D и съём прохода уже ни к чему, остаются только пределы температуры
         warn = [x for x in warn if x.startswith("T ")]
         since = f" с {st.recirc_since:%H:%M}" if st.recirc_since else ""
         w_txt = f"≈ {st.w_end:.1f} %" if st.w_end is not None else "у цели"
-        if st.warmup:
-            # рециркуляция до первой сушки прохода: сушилку заполнили и греют по кругу — проход ещё не начался
-            w_since = f" с {st.warmup_since:%H:%M}" if st.warmup_since else ""
-            return dict(base, kind="info", head="Прогрев — подачи ещё не было",
-                        sub=[f"Рециркуляция{w_since} до первой сушки прохода: зерно в шахте греется по кругу.",
-                             "Сушка начнётся с подачи — «сушим с N с.» или «сушим в N с.» в журнале; тогда здесь будет "
-                             "совет по D."],
-                        warn=warn, go=None, d_now=st.d, d_rec=None, warmup=True)
         if st.batch_end:
             return dict(base, kind="info", head="Партия высушена — идёт досушка",
                         sub=[f"Рециркуляция{since}: подача закончилась, выход к концу подачи {w_txt} — цель партии.",

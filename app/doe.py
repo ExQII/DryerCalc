@@ -88,7 +88,8 @@ def experiment_bounds(p: mdl.DryerParams, passes: Sequence[Dict]) -> Optional[Di
 
 def typical_pair(rows: Sequence[Dict]) -> Optional[Tuple[float, float]]:
     """Привычные уставки T блоков (1-я, 2-я ступень) — пара, простоявшая больше всего строк журнала. Пустая клетка
-    в журнале — прежняя уставка; одна ступень не записана ни разу — пары нет (None)."""
+    в журнале — прежняя уставка; одна ступень не записана ни разу — пары нет (None). Горелки выключены (уставка 0 —
+    набор, охлаждение) — не режим сушки, такие строки не считаются."""
     up = low = None
     cnt: Counter = Counter()
     for r in rows:
@@ -96,7 +97,7 @@ def typical_pair(rows: Sequence[Dict]) -> Optional[Tuple[float, float]]:
             up = float(r["t_up"])
         if r.get("t_low") is not None:
             low = float(r["t_low"])
-        if up is not None and low is not None:
+        if up is not None and low is not None and up > 0 and low > 0:
             cnt[(up, low)] += 1
     return cnt.most_common(1)[0][0] if cnt else None
 
