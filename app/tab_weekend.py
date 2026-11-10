@@ -95,8 +95,8 @@ class WeekendTab(QWidget):
 
         gb = QGroupBox("Зерно")
         f = QFormLayout(gb)
-        self.w0 = dspin(10, 50, float(d.get("w0", win.in_w0.value())), 1, 0.5, " %")
-        self.wk = dspin(8, 30, float(d.get("wk", win.in_wk.value())), 1, 0.5, " %")
+        self.w0 = dspin(6, 50, float(d.get("w0", win.in_w0.value())), 1, 0.5, " %")
+        self.wk = dspin(5, 30, float(d.get("wk", win.in_wk.value())), 1, 0.5, " %")
         self.already = dspin(0, 20000, 0, 0, 10, " т")
         self.already.setToolTip("Сколько зерна для этой партии уже лежит в ёмкостях — программа скажет, сколько "
                                 "домолотить.")
@@ -230,7 +230,7 @@ class WeekendTab(QWidget):
         self.lbl_opt.setWordWrap(True)
         self.lbl_opt.setTextFormat(Qt.RichText)
         self.lbl_opt.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        ov.addWidget(self.lbl_opt)
+        ov.addWidget(Collapsible("Чем варианты отличаются", self.lbl_opt))
         ov.addStretch(1)
         osc = QScrollArea()                     # на низком экране — прокрутка, а не наложение подписи на таблицу
         osc.setWidget(ow)
@@ -361,6 +361,23 @@ class WeekendTab(QWidget):
         if rh is not None:
             self.rh.setValue(rh)
         self.b_weather.setText(f"T и RH из таблицы погоды: {what}")
+
+    def _load(self) -> None:
+        """Поля раздела из базы — после смены культуры или восстановления копии (у каждой культуры свои)."""
+        d = self.win.storage.get_json("ui_weekend", {}) or {}
+        self._prog = True
+        try:
+            for key, w in (("w0", self.w0), ("wk", self.wk), ("stops", self.stops), ("bin_t", self.bin_t),
+                           ("q", self.q), ("lim", self.lim)):
+                if key in d:
+                    w.setValue(float(d[key]))
+            if "bins" in d:
+                self.bins.setValue(int(d["bins"]))
+            self.method.setCurrentIndex(1 if d.get("method") == "q" else 0)
+            self.cool.setChecked(bool(d.get("cool", True)))
+            self.npass.setValue(int(d.get("passes", 0) or 0))
+        finally:
+            self._prog = False
 
     def _save(self) -> None:
         self.win.storage.set_json("ui_weekend", {

@@ -43,7 +43,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .model import Conditions, DryerParams, grain_temp, q_at, q_at_arr
+from .model import Conditions, DryerParams, corn_equiv, from_corn_equiv, grain_temp, q_at, q_at_arr
 
 C_DM = 1.5        # теплоёмкость сухого вещества зерна, кДж/(кг·К) (профиль культуры по умолчанию)
 C_W = 4.19        # теплоёмкость воды, кДж/(кг·К)
@@ -150,10 +150,12 @@ def _dry(p: DryerParams, c: Conditions, w_in: float, t_hot: float, eta: float, k
     """Влажность (истинная, %) после t_hot часов в горячей зоне."""
     t, rh_bed = bed_air(round(c.t_proc, 3), round(c.t_amb, 3), round(c.rh, 3), round(kappa, 5))
     me = emc_db(t, rh_bed)
+    w_real = w_in
+    w_in = corn_equiv(p, w_in)          # другая культура: кинетика — по «влажности кукурузы» с той же ERH
     u0 = db(w_in)
     if u0 <= me + 1e-6:
-        return w_in
-    tg = grain_temp(p, c.t_proc, w_in)
+        return w_real
+    tg = grain_temp(p, c.t_proc, w_real)
     k_amb = 1.0
     u = u0
     for _ in range(6):
@@ -164,7 +166,7 @@ def _dry(p: DryerParams, c: Conditions, w_in: float, t_hot: float, eta: float, k
         if abs(new - k_amb) < 1e-7:
             break
         k_amb = new
-    return wb(u)
+    return from_corn_equiv(p, wb(u))
 
 
 def pass_out(p: DryerParams, c: Conditions, w_in: float, d: float, eta: Optional[float] = None,
@@ -269,7 +271,8 @@ class PhysBatch:
     def __init__(self, p: DryerParams, w_in, d, t_proc, t_amb, rh, kappa: Optional[float] = None,
                  clamp_d: bool = False):
         self.p = p
-        self.w_in = np.asarray(w_in, dtype=float)
+        self.w_real = np.asarray(w_in, dtype=float)
+        self.w_in = np.asarray(corn_equiv(p, self.w_real), dtype=float)     # см. _dry
         shape = self.w_in.shape
         t_proc, t_amb, rh = (np.broadcast_to(np.asarray(x, dtype=float), shape) for x in (t_proc, t_amb, rh))
         d = np.asarray(d, dtype=float)
@@ -280,7 +283,7 @@ class PhysBatch:
         self.me = emc_db_arr(self.t, rh_bed)
         self.u0 = 100.0 * self.w_in / (100.0 - self.w_in)
         self.dry = self.u0 <= self.me + 1e-6
-        self.tg = grain_temp(p, t_proc, self.w_in)
+        self.tg = grain_temp(p, t_proc, self.w_real)
         q = q_at_arr(p, d)
         with np.errstate(divide="ignore"):
             self.t_hot = np.where(q > 0, p.f_hot * p.m_dryer / q, 1e9)
@@ -306,7 +309,7 @@ class PhysBatch:
             k_amb = np.where(done, k_amb, new)
             if done.all():
                 break
-        return np.where(self.dry, self.w_in, 100.0 * u / (100.0 + u))
+        return np.where(self.dry, self.w_real, from_corn_equiv(p, 100.0 * u / (100.0 + u)))
 
 
 def pass_out_arr(p: DryerParams, w_in, d, t_proc, t_amb, rh, eta: Optional[float] = None,

@@ -15,7 +15,7 @@ from .doe import (DOE_STEP, explored_bounds, explored_passes, fmt_cand_t, sugges
                   typical_regime)
 from .plots import SimplePlot
 from .theme import theme_for
-from .ui_common import dspin, fnum, item, mute, scroll_wrap, size_by_current, table, with_legend
+from .ui_common import Collapsible, dspin, fnum, item, mute, scroll_wrap, size_by_current, table, with_legend
 
 if TYPE_CHECKING:
     from .gui import MainWindow
@@ -53,7 +53,7 @@ class CheckTab(QWidget):
             "предсказывает его, как было бы в жизни. Ошибка = модель − факт, п.п. съёма за проход. Честная оценка "
             "точности — колонки «прогноз»; по ним же считается допуск ± во всех прогнозах времени.")
         self.hint.setWordWrap(True)
-        lay.addWidget(self.hint)
+        lay.addWidget(Collapsible("Как читать таблицу", self.hint))
         top = QHBoxLayout()
         gb = QGroupBox("Калибровка")
         f = QFormLayout(gb)
@@ -208,7 +208,7 @@ class CheckTab(QWidget):
         lv = QVBoxLayout(left)
         gb = QGroupBox("Условия следующих проходов")
         f = QFormLayout(gb)
-        self.d_w = dspin(10, 45, 32, 1, 0.5, " %")
+        self.d_w = dspin(6, 45, 32, 1, 0.5, " %")
         self.d_lim = dspin(1, 25, 6, 1, 0.5, " п.п.")
         self.d_tmax = dspin(35, 150, 70, 0, 1, " °C")
         self.d_n = QSpinBox()
@@ -230,7 +230,7 @@ class CheckTab(QWidget):
         lv.addWidget(b)
         self.doe_hint = QLabel(self._doe_hint_text(None))
         self.doe_hint.setWordWrap(True)
-        lv.addWidget(self.doe_hint)
+        lv.addWidget(Collapsible("Зачем опыты и как их вести", self.doe_hint))
         lv.addStretch(1)
         left.setMaximumWidth(460)
         right = QSplitter(Qt.Vertical)

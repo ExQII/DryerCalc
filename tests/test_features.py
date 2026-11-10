@@ -2725,6 +2725,176 @@ def test_fitted_ambient_replaced_once_with_recalibration():
     win4.close()
 
 
+# ---------------------------------------------------------------------------
+# v1.8.0: культуры (пшеница, рапс, подсолнечник, соя, кукуруза) и упрощённый интерфейс
+# ---------------------------------------------------------------------------
+
+def test_crop_profiles_and_start_model():
+    """Стартовая модель культуры — пересчёт модели сушилки на кукурузе: тонны по насыпной плотности, влажность по
+    равной равновесной влажности воздуха, пшеница ×1,6; кукуруза считается в точности как до 1.8."""
+    from app import crops
+    from app import model as mdl
+    assert [c.key for c in crops.CROPS] == ["corn", "wheat", "rapeseed", "sunflower", "soy"]
+    assert crops.start_params(crops.get("corn")) == mdl.DryerParams() and crops.get("нет такой").key == "corn"
+    assert mdl.corn_equiv(P, 17.3) == 17.3 and mdl.is_corn_scale(P) and mdl.final_w(P) == 15.0
+    corn = replace(P, r_ref=1.41, q_table=[[10, 5.2], [100, 52.0]])
+    c = mdl.Conditions(60.0, 10.0, 70.0)
+    for crop in crops.CROPS[1:]:
+        p = crops.start_params(crop, corn)
+        kd = crop.density / 700.0
+        assert p.crop == crop.key and abs(mdl.q_full(p) - 52.0 * kd) < 0.01 and abs(p.m_dryer - 60.0 * kd) < 0.06
+        assert p.w_eq == crop.eqv8 and p.w_ref == crop.eqv22 and abs(p.r_ref - 1.41 * crop.k_speed) < 1e-9
+        assert p.calibrated and p.calib_info.startswith("стартовая") and p.rate_sigma == crops.START_SIGMA
+        assert p.t_grain_max == crop.t_grain_max and p.out_bias == 0.0 and mdl.final_w(p) == crop.w_store + 1.0
+        # та же «движущая сила» — тот же расход влаги (с множителем культуры)
+        w = 0.5 * (crop.eqv8 + crop.eqv22)
+        assert abs(mdl.water_rate(p, w, c) - crop.k_speed * mdl.water_rate(corn, 15.0, c)) < 1e-9
+        assert abs(mdl.corn_equiv(p, w) - 15.0) < 1e-9 and abs(mdl.from_corn_equiv(p, 15.0) - w) < 1e-9
+        # обе модели сушат культуру до её цели, а не до цели кукурузы; массив = скаляр
+        for kind in ("empirical", "physics"):
+            pk = replace(p, model_kind=kind)
+            r = mdl.solve_pass(pk, c, crop.w0, 100.0, 40.0)
+            assert crop.eqv8 < r.w_out < crop.w0, (crop.key, kind, r.w_out)
+            arr, _q = mdl.solve_out_arr(pk, [crop.w0], [40.0], [60.0], [10.0], [70.0])
+            assert abs(float(arr[0]) - r.w_out) < 1e-6
+        pl = mdl.plan_by_passes(p, c, 300.0, crop.w0, crop.w_store, 1)
+        assert pl.reaches_target and pl.verdict(max(crop.soft, crop.w0 - crop.w_store), 25.0)[0] <= 1
+    # рапс 10 % хранится как кукуруза 15 %: срок сырого зерна — по таблице кукурузы для равной ERH
+    from app.weekend import allowable_storage_days
+    rape = crops.start_params(crops.get("rapeseed"), corn)
+    assert allowable_storage_days(mdl.corn_equiv(rape, 8.0), 10.0)[0] is None            # 8 % — сухой
+    d_r = allowable_storage_days(mdl.corn_equiv(rape, 14.0), 10.0)[0]
+    assert d_r is not None and d_r < allowable_storage_days(17.0, 10.0)[0]
+
+
+def test_storage_keeps_each_crop_separately():
+    """У культуры свои журнал, модель, партии и поля ввода; база прежней версии — это кукуруза, без переноса."""
+    from app import crops
+    db = _tmp("crops.db")
+    if os.path.exists(db):
+        os.remove(db)
+    st = Storage(db)
+    rows = _sample_rows()
+    st.replace_journal(rows)
+    st.save_params(replace(P, r_ref=1.41))
+    st.set_list("batches", [{"name": "К-1"}])
+    st.set_json("ui_mode", {"mode": "engineer"})
+    assert st.crop == "corn" and st.set_crop("wheat") is True and st.crop == "wheat"
+    assert st.load_journal() == [] and st.get_list("batches") == []
+    pw = st.load_params()
+    assert pw.crop == "wheat" and abs(pw.r_ref - 1.41 * 1.6) < 1e-9 and st.get_json("ui")["wk"] == 14.0
+    assert st.get_json("ui_mode") == {"mode": "engineer"}                              # общее — не по культурам
+    st.replace_journal(rows[:5])
+    st.set_list("batches", [{"name": "П-1"}])
+    st.save_params(replace(pw, r_ref=3.0))
+    assert st.set_crop("wheat") is False and st.set_crop("corn") is False
+    assert len(st.load_journal()) == len(rows) and st.get_list("batches") == [{"name": "К-1"}]
+    assert st.load_params().r_ref == 1.41 and st.params_of("wheat").r_ref == 3.0
+    info = st.crop_summary()
+    assert info["corn"]["rows"] == len(rows) and info["wheat"]["rows"] == 5 and not info["soy"]["opened"]
+    assert info["soy"]["params"].calib_info.startswith("стартовая: оценка для сои")
+    st.set_crop("wheat")
+    st.close()
+    st = Storage(db)                                                                   # культура помнится
+    assert st.crop == "wheat" and len(st.load_journal()) == 5
+    try:
+        st.set_crop("овёс")
+        raise AssertionError("неизвестная культура принята")
+    except ValueError:
+        pass
+    st.close()
+
+
+def test_switch_crop_in_window():
+    """Раздел «Культура»: переключение сохраняет всё по текущей культуре и открывает данные новой; культура видна в
+    меню, под названием программы и в заголовке окна; рециркуляция у цели культуры — конец партии."""
+    app = _qapp()
+    from app import pages as pgs
+    from app.gui import MainWindow
+    from app.live import live_state
+    db = _tmp("crops_win.db")
+    if os.path.exists(db):
+        os.remove(db)
+    st = Storage(db)
+    st.replace_journal(_sample_rows())
+    st.close()
+    win = MainWindow(Storage(db))
+    nav = win.tabs
+    i_crop = nav.indexOfText(pgs.CROP)
+    assert i_crop == 0 and nav.tabText(nav.currentIndex()) == pgs.JOURNAL          # работа начинается с журнала
+    assert nav._pages[i_crop]["item"].text() == "Культура: кукуруза" and nav.lbl_app_sub.text() == "сушка кукурузы"
+    n_corn = win.tbl_j.rowCount()
+    win.in_mass.setValue(777.0)
+    assert win.switch_crop("corn") is False and win.switch_crop("rapeseed") is True
+    assert win.tbl_j.rowCount() == 0 and win.params.crop == "rapeseed" and win.params.w_eq == 4.4
+    assert win.in_wk.value() == 8.0 and win.in_w0.value() == 12.0 and win.tab_live.wk_final.value() == 8.0
+    assert win.tab_recirc.wk.value() == 8.0 and abs(win.tab_recirc.mass.value() - win.params.m_dryer) < 0.06
+    assert "рапса" in win.windowTitle() and nav._pages[i_crop]["item"].text() == "Культура: рапс"
+    assert "Стартовая калибровка" in win.banner.text() and "рапса" in win.banner.text()
+    assert win.plans and all(pl.w_target == 8.0 for pl in win.plans)
+    card = win.tab_crop.cards["rapeseed"]
+    assert card.lbl_now.isVisibleTo(win.tab_crop) and not card.btn.isVisibleTo(win.tab_crop)
+    assert win.tab_crop.cards["corn"].btn.isVisibleTo(win.tab_crop)
+    assert f"В журнале {n_corn} строк" in win.tab_crop.cards["corn"].lbl_state.text()
+    # журнал рапса: проход 12 → 8,5 %, рециркуляция у цели — досушка и конец партии (для кукурузы 8,5 % — тоже)
+    rows = []
+    for k in range(14):
+        rows.append({"ts": f"10.08.26 {8 + k // 2:02d}:{30 * (k % 2):02d}", "w_in": 12.0, "w_out": 8.6, "t_up": 60.0,
+                     "t_low": 60.0, "d": 35.0, "note": "", "batch": "Р1", "pass_no": 1})
+    rows.append({"ts": "10.08.26 15:00", "t_up": 60.0, "t_low": 60.0, "d": 35.0, "note": "Рециркуляция",
+                 "batch": "Р1", "pass_no": 1})
+    win.replace_journal_rows(rows)
+    s = live_state(win.journal_rows(), win.params)
+    assert s.ok and s.recirc
+    from app.calibration import journal_passes, prepare
+    jp = journal_passes(prepare(win.journal_rows())[0], win.params)
+    assert jp[-1]["batch_end"] is True
+    assert journal_passes(prepare(win.journal_rows())[0], replace(win.params, w_store=6.0))[-1]["batch_end"] is False
+    # назад к кукурузе: её журнал и поля на месте, журнал рапса — в базе
+    assert win.switch_crop("corn") is True and win.tbl_j.rowCount() == n_corn and win.in_mass.value() == 777.0
+    assert win.params.crop == "corn" and win.in_wk.value() == 14.0
+    assert win.storage.crop_summary()["rapeseed"]["rows"] == len(rows)
+    # сушильщик не видит раздел «Культура», но видит, что сушит
+    from app import pilot
+    win.apply_mode(pilot.OPERATOR, save=False, log=False)
+    assert not nav.isTabVisible(i_crop) and nav.lbl_app_sub.text() == "сушка кукурузы"
+    win.close()
+
+
+def test_long_texts_are_collapsed():
+    """Длинные пояснения свёрнуты и открываются щелчком; отчёт калибровки раскрывается, когда появился."""
+    app = _qapp()
+    from app.gui import MainWindow
+    from app.ui_common import Collapsible
+    db = _tmp("simple_ui.db")
+    if os.path.exists(db):
+        os.remove(db)
+    win = MainWindow(Storage(db))
+    boxes = win.findChildren(Collapsible)
+    assert len(boxes) >= 14 and not any(b.is_expanded() for b in boxes)
+    from PySide6.QtWidgets import QLabel
+    for lb in win.findChildren(QLabel):          # ни одной видимой надписи длиннее трёх строк текста
+        if len(lb.text()) > 330 and not lb.isHidden():
+            par, hidden = lb.parentWidget(), False
+            while par is not None and not hidden:
+                hidden = isinstance(par, Collapsible) and not par.is_expanded()
+                par = par.parentWidget()
+            assert hidden or lb.objectName() == "qt_msgbox_label", lb.text()[:60]
+    assert not win.j_report.is_expanded() and not win.qe_hint.isVisibleTo(win) and not win.plan_more.is_expanded()
+    win.report.setPlainText("Калибровка: строк 40")
+    assert win.j_report.is_expanded()
+    win.in_manual.setText("40,35")
+    win._save_ui_state()
+    win._load_ui_state()
+    assert win.plan_more.is_expanded()
+    win.recalc()
+    assert "σ" in win.plan_sigma.text() or "допуск" in win.plan_sigma.text().lower()
+    win.tab_recirc.w0.setValue(17.0)
+    win.tab_recirc.recalc()
+    assert win.tab_recirc.summary.text().count("<br>") <= 1 and "Испарится" in win.tab_recirc.more.text()
+    win.close()
+
+
 def _cleanup_windows():
     """Окна прошлых тестов удаляются: каждое новое окно ставит оформление на всё приложение и перерисовывает все
     живые окна — без уборки тесты с окнами замедляются квадратично (в программе окно одно)."""

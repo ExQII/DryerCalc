@@ -118,7 +118,7 @@ def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: floa
     пробу выхода не с чем сравнивать (рециркуляция, прогрев, набор, охлаждение, первые τ часов прохода).
     plan — (масса партии, W₀) из «План сушки партии»: при «авто» масса на входе прохода считается, как в разделе."""
     from .live import live_forecast, live_state, pass_mass
-    st = live_state(rows, p, now=now, weather=weather, final_w=float(ui_live.get("wk", 14.0)) + 1.0)
+    st = live_state(rows, p, now=now, weather=weather, final_w=float(ui_live.get("wk", p.w_store)) + 1.0)
     if not st.ok:
         return None, None
     if st.recirc or st.fill or st.warmup:     # подача кончилась или ещё не начиналась: выход сравнивать не с чем
@@ -129,7 +129,7 @@ def live_numbers(rows: List[Dict], p: mdl.DryerParams, ui_live: Dict, soft: floa
     if plan is not None and ui_live.get("m_auto", True):
         m_auto, _how = pass_mass(plan[0], plan[1], st.batch_passes)
         m_pass = m_auto if m_auto is not None else m_pass
-    fc = live_forecast(p, c, st, m_pass, w_target, float(ui_live.get("wk", 14.0)),
+    fc = live_forecast(p, c, st, m_pass, w_target, float(ui_live.get("wk", p.w_store)),
                        soft, hard, use_corr=bool(ui_live.get("corr", False)) and ui_live.get("corr_v") == 2, now=now,
                        silo=bool(ui_live.get("silo", True)), silo_lim=float(ui_live.get("silo_lim", 1.0)))
     # первые τ часов прохода на выходе — зерно, вошедшее до его начала (прогрев, прошлый проход): с целью не сравнивать

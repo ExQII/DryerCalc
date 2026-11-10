@@ -265,7 +265,11 @@ def weekend_mass(p: mdl.DryerParams, c: mdl.Conditions, inp: WeekendInput) -> We
     if res.plan.passes:
         res.wet_wait_h = res.plan.passes[0].time_h + max(inp.stops_h, 0.0)   # остановки — с запасом внутри 1-го
         res.pass1_end = inp.start + timedelta(hours=res.wet_wait_h)
-        days, flag = allowable_storage_days(inp.w0, c.t_amb)
+        # таблица — для кукурузы; другая культура — по влажности кукурузы с той же равновесной влажностью
+        # воздуха (порчу определяет она, а не процент влажности): рапс 10 % хранится как кукуруза 15 %
+        days, flag = allowable_storage_days(mdl.corn_equiv(p, inp.w0), c.t_amb)
+        if not mdl.is_corn_scale(p):
+            flag = (flag + "; " if flag else "") + "оценка по таблице кукурузы для равной равновесной влажности воздуха"
         res.storage_days, res.storage_flag = days, flag
         if days is not None:
             frac = res.wet_wait_h / 24.0 / days

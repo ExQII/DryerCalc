@@ -2,6 +2,7 @@
 
 Старые названия вкладок (до 0.9) — в OLD_NAMES: по ним разбираются замечания пилота, записанные раньше.
 """
+CROP = "Культура"
 JOURNAL = "Журнал проб"
 LIVE = "Текущий проход"
 RECIRC = "Досушка"
@@ -20,6 +21,7 @@ MODEL = "Модель и данные"
 
 # (название, раздел меню, строка о назначении под заголовком страницы)
 PAGES = (
+    (CROP, None, "С каким зерном работает сушилка. У каждой культуры свои журнал, модель и партии."),
     (JOURNAL, SHIFT, "Пробы каждые 30 минут, события и смена режима. Всё, что программа знает о сушке, — отсюда."),
     (LIVE, SHIFT, "Какой режим поставить сейчас и когда закончатся проход и партия — по свежим пробам журнала."),
     (RECIRC, SHIFT, "Рециркуляция: сколько часов досушивать зерно, оставшееся в шахте, без подачи из силоса."),
@@ -36,7 +38,7 @@ PAGES = (
 OPERATOR_PAGES = (JOURNAL, LIVE, RECIRC, HELP)
 
 # иконки разделов в меню (icons.py)
-ICONS = {JOURNAL: "journal", LIVE: "live", RECIRC: "recirc", PLAN: "plan", WEEKEND: "weekend", QUICK: "quick",
+ICONS = {CROP: "kernel", JOURNAL: "journal", LIVE: "live", RECIRC: "recirc", PLAN: "plan", WEEKEND: "weekend", QUICK: "quick",
          BATCHES: "batches", DATA: "data", CHECK: "check", SETTINGS: "settings", HELP: "help"}
 
 OLD_NAMES = {

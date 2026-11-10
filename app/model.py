@@ -101,6 +101,11 @@ class DryerParams:
     unc_lev: float = 0.0      # типичная дисперсия ln R по строкам журнала — её уже покрывает rate_sigma
     struct_base: float = 0.08  # типичное относит. расхождение эмпирической и физической моделей на проходах журнала
     explored: Optional[dict] = None   # изученные диапазоны журнала: {"d": [мин, макс], "t": [...], "w": [...]}
+    # --- v1.8: культура (crops.py). У кукурузы — значения по умолчанию, расчёты те же, что до 1.8 ---
+    crop: str = "corn"
+    w_store: float = 14.0     # влажность хранения культуры, %; рециркуляция при выходе ≤ w_store + 1 — конец партии
+    eqv8: float = 8.0         # влажность культуры с той же равновесной влажностью воздуха, что у кукурузы при 8 %
+    eqv22: float = 22.0       # … и при 22 % (кинетика тонкого слоя и T зерна считаются по «влажности кукурузы»)
 
     @classmethod
     def from_dict(cls, d: dict) -> "DryerParams":
@@ -241,9 +246,10 @@ class Plan:
         if not self.reaches_target:
             return 2, f"не достигает цели ({self.w_final:.1f} %)"
         mx = self.max_dw
-        if mx <= soft + 1e-9:
+        tol = 5e-3                  # съём ровно в лимите (13 → 7 % при лимите 6) — в лимите, а не «6,0 > 6»
+        if mx <= soft + tol:
             level, text = 0, f"в лимите (≤{soft:g} п.п.)"
-        elif mx <= hard + 1e-9:
+        elif mx <= hard + tol:
             level, text = 1, f"съём до {mx:.1f} п.п."
         else:
             return 2, f"съём {mx:.1f} п.п. > {hard:g}"
@@ -321,9 +327,33 @@ def read_from_true(p: DryerParams, w_true: float, t_grain: Optional[float] = Non
     return (w_true + p.out_bias - p.out_kw * W_REF_METER + tt) / k
 
 
+def is_corn_scale(p: DryerParams) -> bool:
+    return p.eqv8 == 8.0 and p.eqv22 == 22.0
+
+
+def corn_equiv(p: DryerParams, w):
+    """Влажность культуры → влажность кукурузы с той же равновесной влажностью воздуха (crops.py); число или массив.
+    У кукурузы — без изменений."""
+    if is_corn_scale(p):
+        return w
+    return 8.0 + (w - p.eqv8) * 14.0 / max(p.eqv22 - p.eqv8, 0.1)
+
+
+def from_corn_equiv(p: DryerParams, w):
+    """Обратное corn_equiv."""
+    if is_corn_scale(p):
+        return w
+    return p.eqv8 + (w - 8.0) * (p.eqv22 - p.eqv8) / 14.0
+
+
+def final_w(p: Optional[DryerParams]) -> float:
+    """Выход ниже этой влажности при рециркуляции — досушка и конец партии (влажность хранения + 1 п.п.)."""
+    return (p.w_store if p is not None else 14.0) + 1.0
+
+
 def grain_temp(p: DryerParams, t_proc: float, w_in: float) -> float:
     """Ожидаемая температура зерна в сушилке (средняя по двум датчикам), °C — регрессия по журналу."""
-    return p.tg_a + p.tg_b * t_proc + p.tg_c * (w_in - 22.0)
+    return p.tg_a + p.tg_b * t_proc + p.tg_c * (corn_equiv(p, w_in) - 22.0)
 
 
 def _clamp_d(d: float) -> float:

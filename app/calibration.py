@@ -544,7 +544,8 @@ def pass_of_segment(prep: List[Dict]) -> Dict[int, int]:
     return out
 
 
-def journal_passes(prep: List[Dict], p: Optional[DryerParams] = None, final_w: float = FINAL_W) -> List[Dict]:
+def journal_passes(prep: List[Dict], p: Optional[DryerParams] = None, final_w: Optional[float] = None
+                   ) -> List[Dict]:
     """Проходы журнала по порядку. Для каждого:
     pass — номер в prepare; segs — его участки; start / end — первая и последняя строка со временем;
     batch — «Партия» из журнала (если вписана в строках прохода, иначе ""); batch_no — номер партии по счёту;
@@ -554,6 +555,9 @@ def journal_passes(prep: List[Dict], p: Optional[DryerParams] = None, final_w: f
     w_end — истинная влажность выхода в конце подачи (медиана трёх последних проб до рециркуляции / охлаждения);
     batch_end — партия на этом проходе закончена: охлаждение; рециркуляция, когда выход уже ≤ final_w
       (досушка); или следующий проход — другой «Партии»."""
+    if final_w is None:                 # влажность хранения культуры + 1 п.п. (у кукурузы — FINAL_W)
+        from .model import final_w as _fw
+        final_w = _fw(p)
     p = p or DryerParams()
     groups: Dict[int, List[Dict]] = {}
     order: List[int] = []

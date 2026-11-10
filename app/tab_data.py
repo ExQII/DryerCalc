@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QHBoxL
 from .analysis import batch_meter_points, combine_meter, meter_bias, meter_coverage
 from .plots import SimplePlot
 from .theme import theme_for
-from .ui_common import mute, set_role, size_by_current, to_num, with_legend
+from .ui_common import Collapsible, mute, set_role, size_by_current, to_num, with_legend
 from .weather import WeatherSeries, merge_points, parse_dt, read_weather
 
 if TYPE_CHECKING:
@@ -51,7 +51,7 @@ class DataTab(QWidget):
             "журнала по времени (интерполяция между замерами не дальше 6 ч друг от друга, иначе ближайший в "
             "пределах 3 ч) и учитываются при калибровке и в «Текущем проходе».")
         self.w_hint.setWordWrap(True)
-        lay.addWidget(self.w_hint)
+        lay.addWidget(Collapsible("Откуда взять погоду без интернета", self.w_hint))
         bar = QHBoxLayout()
         bar.setSpacing(6)
         for text, slot in (("Импорт файла…", self._w_import), ("Добавить замер", self._w_add),
@@ -229,7 +229,7 @@ class DataTab(QWidget):
             "записи пробы в журнал отберите ту же пробу, дайте остыть (или отнесите в лабораторию) и запишите оба "
             "числа. Точность поправки ≈ 2·разброс/√n: при разбросе ±1 п.п. 20 пар дают ±0,45 п.п., 50 пар — ±0,3.")
         self.m_hint.setWordWrap(True)
-        lay.addWidget(self.m_hint)
+        lay.addWidget(Collapsible("Зачем поправка и как набирать пары", self.m_hint))
         bar = QHBoxLayout()
         bar.setSpacing(6)
         for text, slot in (("Добавить пару", self._m_add), ("Удалить выделенные", self._m_del),

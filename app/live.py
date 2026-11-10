@@ -91,9 +91,9 @@ class LiveState:
 def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = None, weather=None,
                corr_window: int = 6, final_w: Optional[float] = None, live_cap_h: float = 1.5) -> LiveState:
     """final_w — выше какой влажности выхода (истинной) рециркуляция — конец прохода, а не досушка партии
-    (по умолчанию calibration.FINAL_W = 15 %; раздел «Текущий проход» передаёт Wк + 1 п.п.).
+    (по умолчанию влажность хранения культуры + 1: у кукурузы 15 %; раздел «Текущий проход» передаёт Wк + 1 п.п.).
     now — считать выгрузку до этого момента (реальное время), но не дальше live_cap_h после последней записи."""
-    from .calibration import FINAL_W, _t_proc, journal_passes, observe_all, pass_of_segment, prepare
+    from .calibration import _t_proc, journal_passes, observe_all, pass_of_segment, prepare
     st = LiveState()
     if weather is not None:
         rows = weather.fill_rows(rows)
@@ -117,7 +117,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.message = "У последнего прохода нет времени проб."
         return st
     st.seg = pass_of[seg]
-    jp = journal_passes(prep, p, FINAL_W if final_w is None else final_w)
+    jp = journal_passes(prep, p, final_w)          # None — влажность хранения культуры + 1 п.п.
     info = next((x for x in jp if seg in x["segs"]), None)
     if info is not None:
         # проходы этой партии до текущего: средняя влажность на входе (подача — то, что вышло с прошлого прохода)

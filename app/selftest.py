@@ -498,6 +498,22 @@ def run(out_path: str) -> int:
               and not win._has_fitted_amb(),
               f"T нар в каждой строке, меняется с проходом: b_нар = {_p11.b_amb:+.2f} (физическая оценка), "
               f"R₀ = {_p11.r_ref:.2f}")
+        # --- v1.8: культуры — своя модель и свой журнал у каждой; длинные пояснения свёрнуты ---
+        from . import crops as _crops
+        from .ui_common import Collapsible as _Coll
+        _n_corn, _p_corn = len(win.storage.load_journal()), win.params
+        win.switch_crop("wheat")
+        _pw = win.params
+        _wheat_ok = (_pw.crop == "wheat" and len(win.storage.load_journal()) == 0 and _pw.rate_sigma == 0.25
+                     and abs(_pw.r_ref - 1.6 * _crops.start_params(_crops.get("corn"), _p_corn).r_ref) < 1e-9
+                     and abs(mdl.corn_equiv(_pw, 21.3) - 22.0) < 1e-6 and (_pw.t_grain_max, _pw.t_agent_max) == (50.0, 140.0)
+                     and "пшеницы" in win.windowTitle())
+        win.switch_crop("corn")
+        _boxes = win.findChildren(_Coll)
+        check(_wheat_ok and win.params.crop == "corn" and len(win.storage.load_journal()) == _n_corn
+              and win.params.r_ref == _p_corn.r_ref and len(_boxes) >= 14,
+              f"культуры: пшеница — стартовая оценка (R₀ ×1,6, T зерна ≤ {_pw.t_grain_max:g} °C, в шахте {_pw.m_dryer:g} т), "
+              f"журнал кукурузы на месте ({_n_corn} строк); сворачиваемых пояснений {len(_boxes)}")
         from . import backup as bkp
         bk = os.path.join(tmp, "copy.db")
         bkp.copy_db(win.storage.conn, bk)

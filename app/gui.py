@@ -35,6 +35,7 @@ from . import pages as pg
 from .storage import Storage, default_dir
 from .tab_batches import BatchesTab
 from .tab_check import CheckTab
+from .tab_crop import CropTab
 from .tab_data import DataTab
 from .tab_help import HelpTab
 from .tab_live import LiveTab
@@ -42,7 +43,7 @@ from .tab_recirc import RecircTab
 from .tab_weekend import WeekendTab
 from .reminders import ReminderCfg, check as reminders_check, live_numbers
 from . import pilot
-from . import design, icons
+from . import crops, design, icons
 from .theme import theme_for
 from .weather import WeatherSeries
 
@@ -74,6 +75,8 @@ def migrate_params(storage) -> mdl.DryerParams:
     """Параметры из базы с однократными переводами старых настроек. v1.7.2: пределы T блоков и T зерна не заданы
     (0 — «не задано», так было по умолчанию) — ставятся 75 и 75 °C; после этого — как выставил инженер (0 тоже)."""
     p = storage.load_params()
+    if storage.crop != crops.DEFAULT:          # у другой культуры пределы — из её профиля (crops.py)
+        return p
     mig = storage.get_json("migrations", {}) or {}
     if not mig.get("limits_v1"):
         if not p.t_agent_max and not p.t_grain_max:
@@ -101,7 +104,8 @@ class MainWindow(QMainWindow):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(1000)
         self._save_timer.timeout.connect(self._save_journal)
-        self.setWindowTitle(f"Расчёт времени сушки зерна — шахтная зерносушилка  v{__version__}")
+        self.mode = pilot.ENGINEER
+        self._window_title()
         icon = resource_path("assets/dryer.png")
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
@@ -129,13 +133,16 @@ class MainWindow(QMainWindow):
         self.tab_check = built[pg.CHECK] = CheckTab(self)
         built[pg.SETTINGS] = self._build_settings_tab()
         self.tab_help = built[pg.HELP] = HelpTab()
+        self.tab_crop = built[pg.CROP] = CropTab(self)
         tabs = NavPanel("DryerCalc", "шахтная зерносушилка")
         tabs.backdrop = False              # фон рисует окно целиком — без шва у строки состояния
         self.tabs = tabs
         self.setCentralWidget(tabs)
         for name, section, sub in pg.PAGES:
             tabs.addTab(built[name], name, section, sub, icon=pg.ICONS.get(name))
+        tabs.setCurrentIndex(tabs.indexOfText(pg.JOURNAL))      # работа начинается с журнала, а не с выбора культуры
         tabs.currentChanged.connect(self._tab_changed)
+        self._crop_ui()
 
         self._load_ui_state()
         self._load_simple_state()
@@ -216,6 +223,9 @@ class MainWindow(QMainWindow):
         b_нар, подобранный по журналу версией до 1.7.3, физической оценкой (с перекалибровкой); иначе — дополнить
         допуски модели прошлой версии."""
         if not shiboken6.isValid(self):              # окно удалено раньше, чем сработал отложенный вызов
+            return
+        if self.storage.crop != crops.DEFAULT:       # прежние версии знали только кукурузу — переводить нечего
+            self._upgrade_model()
             return
         if self._has_photo_bias():
             self._drop_photo_bias()
@@ -476,6 +486,52 @@ class MainWindow(QMainWindow):
         self._save_journal()
         self._qe_prefill()
 
+    # ------------------------------------------------------------------
+    # Культура
+    # ------------------------------------------------------------------
+    def crop(self) -> crops.Crop:
+        return crops.get(self.storage.crop)
+
+    def _window_title(self) -> None:
+        self.setWindowTitle(f"DryerCalc — сушка {self.crop().gen}, шахтная зерносушилка  v{__version__}"
+                            + ("  — режим сушильщика" if getattr(self, "mode", "") == pilot.OPERATOR else ""))
+
+    def _crop_ui(self) -> None:
+        """Культура видна всегда: в меню («Культура: рапс»), под названием программы и в заголовке окна."""
+        c = self.crop()
+        self.tabs.setTabLabel(self.tabs.indexOfText(pg.CROP), f"Культура: {c.name.lower()}")
+        self.tabs.lbl_app_sub.setText(f"сушка {c.gen}")
+        self.tab_recirc.mass.setValue(self.params.m_dryer)
+        self.tab_recirc.wk.setValue(self.params.w_store)
+        self._window_title()
+        self.tab_crop.refresh()
+
+    def switch_crop(self, key: str) -> bool:
+        """Перейти на другую культуру: всё по текущей сохраняется, открываются журнал, модель, партии и поля ввода
+        новой. Впервые открытая культура получает стартовую модель (crops.start_params)."""
+        if key == self.storage.crop or key not in crops.BY_KEY:
+            return False
+        if getattr(self, "_cal_job", None) is not None or getattr(self, "_upg_job", None) is not None:
+            QMessageBox.information(self, "Культура", "Идёт калибровка модели — переключите культуру через минуту.")
+            return False
+        old, new = self.crop(), crops.get(key)
+        self._save_timer.stop()
+        self._auto_timer.stop()
+        self._save_journal()
+        self._auto_timer.stop()
+        self._save_ui_state()
+        self._save_simple_state()
+        self.tab_live._save()
+        self.tab_weekend._save()
+        first = self.storage.set_crop(key)
+        self._reload_all()
+        self.storage.log_event("crop", {"from": old.key, "to": new.key, "first": first})
+        self.statusBar().showMessage(
+            f"Культура: {new.name.lower()}. " + (
+                "Журнал пуст, модель — стартовая оценка по вашей сушилке; после 12 проб нажмите «Калибровать модель»."
+                if first else f"Открыты её журнал, модель и партии; данные {old.gen} сохранены."), 20000)
+        return True
+
     def _tab_changed(self, idx: int) -> None:
         wdg = self.tabs.widget(idx)
         fn = getattr(wdg, "on_show", None)
@@ -494,8 +550,8 @@ class MainWindow(QMainWindow):
         gb = QGroupBox("Партия")
         f = QFormLayout(gb)
         self.sm_mass = dspin(1, 20000, 500, 0, 10, " т")
-        self.sm_w0 = dspin(10, 50, 34, 1, 0.5, " %")
-        self.sm_wk = dspin(8, 30, 14, 1, 0.5, " %")
+        self.sm_w0 = dspin(6, 50, 34, 1, 0.5, " %")
+        self.sm_wk = dspin(5, 30, 14, 1, 0.5, " %")
         self.sm_start = QDateTimeEdit(QDateTime.currentDateTime())
         self.sm_start.setCalendarPopup(True)
         self.sm_start.setDisplayFormat("dd.MM.yyyy HH:mm")
@@ -536,7 +592,7 @@ class MainWindow(QMainWindow):
                               "проходами поровну. Модель сушилки и журнал не нужны. Накладные: загрузка, прогрев "
                               "горелок, переключение силосов (по журналу около 1 ч на проход).")
         self.sm_note.setWordWrap(True)
-        lv.addWidget(self.sm_note)
+        lv.addWidget(Collapsible("Как считается", self.sm_note))
         self.sm_status = QLabel()
         self.sm_status.setWordWrap(True)
         lv.addWidget(self.sm_status)
@@ -715,8 +771,8 @@ class MainWindow(QMainWindow):
         gb = QGroupBox("Партия")
         f = QFormLayout(gb)
         self.in_mass = dspin(1, 20000, 500, 0, 10, " т")
-        self.in_w0 = dspin(10, 50, 34, 1, 0.5, " %")
-        self.in_wk = dspin(8, 30, 14, 1, 0.5, " %")
+        self.in_w0 = dspin(6, 50, 34, 1, 0.5, " %")
+        self.in_wk = dspin(5, 30, 14, 1, 0.5, " %")
         self.in_start = QDateTimeEdit(QDateTime.currentDateTime())
         self.in_start.setCalendarPopup(True)
         self.in_start.setDisplayFormat("dd.MM.yyyy HH:mm")
@@ -735,7 +791,6 @@ class MainWindow(QMainWindow):
         self.in_tamb = dspin(-40, 45, 10, 1, 1, " °C")
         self.in_rh = dspin(10, 100, 70, 0, 5, " %")
         f.addRow(self.lbl_tproc, self.in_tproc)
-        f.addRow("T по проходам", self.in_tlist)
         f.addRow("Наружный воздух, T", self.in_tamb)
         f.addRow("Наружный воздух, RH", self.in_rh)
         self.btn_calc_w = set_role(QPushButton("T и RH: среднее за 3 сут из таблицы погоды"), "link")
@@ -744,7 +799,7 @@ class MainWindow(QMainWindow):
         f.addRow(self.btn_calc_w)
         lv.addWidget(gb)
 
-        gb = QGroupBox("Ограничения качества и привычный режим")
+        gb = QGroupBox("Съём влаги за проход")
         f = QFormLayout(gb)
         self.in_soft = dspin(1, 20, 6, 1, 0.5, " п.п.")
         self.in_hard = dspin(1, 25, 10, 1, 0.5, " п.п.")
@@ -761,15 +816,23 @@ class MainWindow(QMainWindow):
                                  "Этот сценарий станет ★ рекомендованным, даже если съём больше желаемого; цвет "
                                  "строки по-прежнему покажет, в каком он лимите. «Авто» — наименьшее число проходов в "
                                  "желаемом лимите съёма.")
-        f.addRow("Желаемый съём за проход ≤", self.in_soft)
-        f.addRow("Допустимый съём за проход ≤", self.in_hard)
+        f.addRow("Желаемый ≤", self.in_soft)
+        f.addRow("Допустимый ≤", self.in_hard)
         f.addRow("Число проходов", self.in_npass)
-        f.addRow("Привычная разгрузка D", self.in_dfix)
-        f.addRow("D по проходам (с), ручной", self.in_manual)
         f.addRow(self.in_cool)
         lv.addWidget(gb)
 
-        gb = QGroupBox("Топливо (необязательно)")
+        # редкое — свёрнуто: свой режим по проходам и топливо
+        more = QWidget()
+        mv = QVBoxLayout(more)
+        mv.setContentsMargins(0, 0, 0, 0)
+        gb = QGroupBox("Свой режим")
+        f = QFormLayout(gb)
+        f.addRow("T блоков по проходам", self.in_tlist)
+        f.addRow("Привычная разгрузка D", self.in_dfix)
+        f.addRow("D по проходам, с", self.in_manual)
+        mv.addWidget(gb)
+        gb = QGroupBox("Топливо")
         f = QFormLayout(gb)
         self.in_fuel_unit = QLineEdit("м³")
         self.in_fuel = dspin(0, 100000, 0, 1, 1)
@@ -782,7 +845,9 @@ class MainWindow(QMainWindow):
         self.in_lhv.setToolTip("Теплота сгорания топлива для теплового КПД: природный газ ≈ 33–35 МДж/м³, "
                                "дизель ≈ 42,6 МДж/кг (≈ 35,8 МДж/л), пропан-бутан ≈ 46 МДж/кг")
         f.addRow("Теплота сгорания (для КПД)", self.in_lhv)
-        lv.addWidget(gb)
+        mv.addWidget(gb)
+        self.plan_more = Collapsible("Дополнительно: свой режим, топливо", more)
+        lv.addWidget(self.plan_more)
 
         self.btn_calc = set_role(QPushButton("Рассчитать"), "primary")
         self.btn_calc.clicked.connect(self.recalc)
@@ -790,6 +855,9 @@ class MainWindow(QMainWindow):
         self.status = QLabel()
         self.status.setWordWrap(True)
         lv.addWidget(self.status)
+        self.plan_sigma = mute(QLabel())            # из чего сложен допуск времени выбранного сценария
+        self.plan_sigma.setWordWrap(True)
+        lv.addWidget(Collapsible("Откуда допуск времени", self.plan_sigma))
         lv.addStretch(1)
         split.addWidget(scroll_wrap(left))
 
@@ -982,8 +1050,8 @@ class MainWindow(QMainWindow):
         rng = self.plan_ranges[rows[0].row()] if rows[0].row() < len(getattr(self, "plan_ranges", [])) else None
         sig = getattr(self, "plan_sigmas", [])
         if rows[0].row() < len(sig):
-            note = getattr(self, "_npass_note", "")
-            self.status.setText((note + "\n\n" if note else "") + mdl.sigma_text(sig[rows[0].row()][1]) + ".")
+            self.status.setText(getattr(self, "_npass_note", ""))
+            self.plan_sigma.setText(mdl.sigma_text(sig[rows[0].row()][1]) + ".")
         self.tbl_det.setRowCount(len(pl.passes))
         for i, ps in enumerate(pl.passes):
             read = mdl.read_from_true(self.params, ps.w_out, ps.t_grain or None)
@@ -1016,7 +1084,7 @@ class MainWindow(QMainWindow):
             "Время можно вводить как «08:30» (дата и переход через полночь определятся сами) или «21.10.26 08:30».<br>"
             "Проходы делит рециркуляция: подача из силосов кончилась — «рециркуляция», следующая подача («сушим с "
             "N с.») — новый проход. Переключение силоса внутри прохода («Закончился 2 с., сушим с 1 с.»), остановки "
-            "и перерывы проход не делят. Рециркуляция, когда выход уже у цели партии (13–14 %), — досушка и конец "
+            "и перерывы проход не делят. Рециркуляция, когда выход уже у цели партии, — досушка и конец "
             "партии.<br>"
             "Быстрый ввод: время — последняя проба + 30 мин; T наружная, T блоков, D, партия и проход — из последней "
             "записи (исправили в таблице — быстрый ввод возьмёт исправленное). T наружная переносится, если записана "
@@ -1120,8 +1188,8 @@ class MainWindow(QMainWindow):
         hint = QLabel("T наружная, режим и метки — с прошлой записи; меняйте, только когда меняются.")
         hint.setWordWrap(True)
         self.qe_hint = hint
-        line1.addSpacing(12)
-        line1.addWidget(hint, 1, Qt.AlignBottom)
+        hint.setVisible(False)                 # то же сказано в подсказке группы и в «Как вести журнал»
+        line1.addStretch(1)
         b = QPushButton("Изменить режим…")
         b.setToolTip("Поменяли D или T блоков между пробами — запишите изменение отдельной строкой с его временем: "
                      "пробы до него останутся со старым режимом, после — с новым.")
@@ -1143,7 +1211,6 @@ class MainWindow(QMainWindow):
         self.order_bar.setVisible(False)
         lay.addWidget(self.order_bar)
 
-        split = QSplitter(Qt.Vertical)
         self.tbl_j = QTableWidget(0, len(FIELDS))
         self.tbl_j.setHorizontalHeaderLabels([HEADERS_RU[f] for f in FIELDS])
         self.tbl_j.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -1154,7 +1221,7 @@ class MainWindow(QMainWindow):
         jm = self.tbl_j.model()
         for sig in (jm.dataChanged, jm.rowsInserted, jm.rowsRemoved, jm.rowsMoved, jm.modelReset, jm.layoutChanged):
             sig.connect(self._invalidate_rows)
-        split.addWidget(self.tbl_j)
+        lay.addWidget(self.tbl_j, 1)
 
         bottom = QSplitter(Qt.Horizontal)
         self.report = QPlainTextEdit()
@@ -1169,10 +1236,13 @@ class MainWindow(QMainWindow):
         self.plot_cal.include_zero(x=True, y=True)
         bottom.addWidget(self.plot_cal)
         bottom.setSizes([760, 420])
-        split.addWidget(bottom)
-        split.setSizes([430, 300])
+        bottom.setMinimumHeight(250)
+        bottom.setMaximumHeight(320)
         self.j_bottom = bottom
-        lay.addWidget(split, 1)
+        # отчёт нужен после калибровки — до неё не занимает треть страницы; появился текст — раскрывается сам
+        self.j_report = Collapsible("Отчёт калибровки", bottom)
+        self.report.textChanged.connect(lambda: self.report.toPlainText().strip() and self.j_report.set_expanded(True))
+        lay.addWidget(self.j_report)
         return w
 
     def _load_journal_into_table(self) -> None:
@@ -1623,7 +1693,7 @@ class MainWindow(QMainWindow):
             self._apply_theme()       # сводки с размером шрифта от текущего
         for name in ("Импорт CSV/XLSX…", "Сохранить шаблон…", "Сохранить пример…", "Калибровать модель"):
             self.j_buttons[name].setVisible(not op)
-        self.j_bottom.setVisible(not op)
+        self.j_report.setVisible(not op)
         k = 1.35 if op else 1.0
         for le in self.qe.values():
             bw = le.property("base_width") or 0
@@ -1637,8 +1707,7 @@ class MainWindow(QMainWindow):
         self.tabs.apply_theme()           # ширина меню и заголовок — под размер шрифта режима
         QTimer.singleShot(0, lambda sz=size_before: self._relayout(sz))
         self.lbl_mode.setText("Режим сушильщика" if op else "Режим инженера")
-        self.setWindowTitle(f"Расчёт времени сушки зерна — шахтная зерносушилка  v{__version__}"
-                            + ("  — режим сушильщика" if op else ""))
+        self._window_title()
         if save:
             cfg = self.storage.get_json("ui_mode", {}) or {}
             cfg["mode"] = mode
@@ -1652,6 +1721,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QLayout
         for lay in self.findChildren(QLayout):
             lay.invalidate()
+        self.tabs._fit_width()      # меню мерило нижние кнопки до пересчёта раскладок — ширина осталась от крупного шрифта
         self.updateGeometry()
         if self.isMaximized() or self.isFullScreen() or size_before is None:
             return
@@ -1942,12 +2012,14 @@ class MainWindow(QMainWindow):
         gb = QGroupBox("Производительность выгрузки Q(D)")
         gb.setMaximumWidth(380)
         gv = QVBoxLayout(gb)
-        gv.addWidget(mute(QLabel("т/ч по листу пересчёта сушилки (по умолчанию — натура 0,65 т/м³)")))
+        lb = mute(QLabel("т/ч по листу пересчёта сушилки; для другой культуры — по её плотности"))
+        lb.setWordWrap(True)
+        gv.addWidget(lb)
         self.s_qtbl = QTableWidget(0, 2)
         self.s_qtbl.setHorizontalHeaderLabels(["Разгрузка D, с", "Q, т/ч"])
         self.s_qtbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         gv.addWidget(self.s_qtbl)
-        b = QPushButton("Сбросить таблицу (Q = 0,52 · D)")
+        b = QPushButton("Сбросить таблицу (по листу пересчёта)")
         b.clicked.connect(self._reset_qtable)
         gv.addWidget(b)
         left.addWidget(gb)
@@ -1994,18 +2066,31 @@ class MainWindow(QMainWindow):
         self.s_tgmax = dspin(0, 100, 0, 0, 1, " °C")
         self.s_tgmax.setSpecialValueText("не задано")
 
-        gb = QGroupBox("Сушилка")
+        gb = QGroupBox("Сушилка и зерно")
         f = QFormLayout(gb)
         f.addRow("Вместимость сушилки", self.s_mdryer)
         f.addRow("Накладные на каждый проход", self.s_overhead)
-        f.addRow("Поправка влагомера на выходе, a\n(показание − после охлаждения)", self.s_bias)
-        f.addRow("  + k_w · (показание − 20)", self.s_kw)
-        f.addRow("  + k_t · (T зерна по датчикам − 30)", self.s_kt)
-        f.addRow("Ошибка скорости сушки σ\n(для допусков ± в прогнозах)", self.s_sigma)
-        f.addRow("Лаг выхода: доля времени пребывания", self.s_lag)
+        f.addRow("Поправка влагомера на выходе\n(показание − после охлаждения)", self.s_bias)
+        f.addRow("Предел T блоков (каждая ступень)", self.s_tagmax)
+        f.addRow("Предел нагрева зерна", self.s_tgmax)
+        for wdg in (self.s_tagmax, self.s_tgmax):
+            wdg.setToolTip("По инструкции для культуры и назначения зерна: семенное и сильная пшеница — ниже. План и "
+                           "«Текущий проход» не советуют режим выше предела. 0 — не задано.")
+        right.addWidget(gb)
+
+        # коэффициенты моделей меняет калибровка — руками их трогают редко, поэтому свёрнуты
+        coef = QWidget()
+        cv = QVBoxLayout(coef)
+        cv.setContentsMargins(0, 0, 0, 0)
+        gb = QGroupBox("Общее")
+        f = QFormLayout(gb)
         f.addRow("Температура в модели", self.s_src)
         f.addRow("Модель для расчётов", self.s_model)
-        right.addWidget(gb)
+        f.addRow("Поправка влагомера: + k_w · (показание − 20)", self.s_kw)
+        f.addRow("  + k_t · (T зерна по датчикам − 30)", self.s_kt)
+        f.addRow("Ошибка скорости сушки σ (для допусков ±)", self.s_sigma)
+        f.addRow("Лаг выхода: доля времени пребывания", self.s_lag)
+        cv.addWidget(gb)
 
         gb = QGroupBox("Эмпирическая модель: R = R_ref · x_w^b_w · x_T^b_dt · e^(b_нар·ΔT_нар/10) · e^(b_rh·ΔRH/30)")
         f = QFormLayout(gb)
@@ -2022,16 +2107,16 @@ class MainWindow(QMainWindow):
                                "холодного зерна). По журналу не подбирается: в узком диапазоне погоды его не\n"
                                "отделить от различий между проходами. Калибровка оставляет значение отсюда.")
         f.addRow("Коэффициент по RH b_rh (на 30 %)", self.s_brh)
-        right.addWidget(gb)
+        cv.addWidget(gb)
 
         gb = QGroupBox("Физическая модель (Thompson, 1968: тонкий слой зерна) — см. «Справка»")
         f = QFormLayout(gb)
         f.addRow("КПД слоя η (калибруется по журналу)", self.s_eta)
         f.addRow("Доля горячей зоны в объёме сушилки", self.s_fhot)
         f.addRow("κ — доля перепада T агента − T мокр. в слое (1 = T агента)", self.s_kappa)
-        right.addWidget(gb)
+        cv.addWidget(gb)
 
-        gb = QGroupBox("Температура зерна и ограничения")
+        gb = QGroupBox("Температура зерна по T блоков")
         f = QFormLayout(gb)
         f.addRow("T зерна ≈ a + b · T блоков + c · (W вх − 22):  a", self.s_tga)
         f.addRow("  b", self.s_tgb)
@@ -2039,9 +2124,9 @@ class MainWindow(QMainWindow):
         b = QPushButton("Подобрать a, b, c по журналу (датчики T зерна)")
         b.clicked.connect(self._fit_grain_temp)
         f.addRow(b)
-        f.addRow("Предел T блоков (агента), каждая ступень — по инструкции для назначения зерна", self.s_tagmax)
-        f.addRow("Предел нагрева зерна", self.s_tgmax)
-        right.addWidget(gb)
+        cv.addWidget(gb)
+        self.s_coef = Collapsible("Коэффициенты моделей (их подбирает калибровка)", coef)
+        right.addWidget(self.s_coef)
 
         bar = QHBoxLayout()
         b1 = QPushButton("Применить и сохранить")
@@ -2076,9 +2161,10 @@ class MainWindow(QMainWindow):
         for wdg in (self.r_sample, self.r_grace, self.r_lead, self.r_dev):
             wdg.valueChanged.connect(self._save_reminders)
         self.r_on.stateChanged.connect(self._save_reminders)
-        right.addWidget(gb)
+        gb.setTitle("Уведомление Windows у часов, пока программа открыта")
+        right.addWidget(Collapsible("Напоминания сушильщику", gb))
 
-        gb = QGroupBox("Режим сушильщика и пилотный запуск")
+        gb = QGroupBox("")
         f = QFormLayout(gb)
         lab = QLabel("Режим сушильщика (переключатель внизу меню слева) оставляет только раздел «Смена» (журнал "
                      "проб, текущий проход, досушка) и «Справку», крупным шрифтом. PIN защищает от случайного перехода "
@@ -2102,10 +2188,10 @@ class MainWindow(QMainWindow):
         bb = QPushButton("Статистика и замечания пилота…")
         bb.clicked.connect(self._pilot_dialog)
         f.addRow(bb)
-        right.addWidget(gb)
+        right.addWidget(Collapsible("Режим сушильщика, PIN и замечания", gb))
         self._update_pin_info()
 
-        gb = QGroupBox("Резервные копии (журнал, погода, партии, настройки — всё в одном файле базы)")
+        gb = QGroupBox("Резервные копии базы")
         gv = QVBoxLayout(gb)
         self.s_backup_info = QLabel()
         self.s_backup_info.setWordWrap(True)
@@ -2193,6 +2279,7 @@ class MainWindow(QMainWindow):
 
     def _reload_all(self) -> None:
         self._ready = False
+        self.storage.load_crop()                 # после восстановления копии активная культура — из неё
         self.params = migrate_params(self.storage)
         self.tbl_j.setRowCount(0)
         self._load_journal_into_table()
@@ -2203,6 +2290,12 @@ class MainWindow(QMainWindow):
         self.tab_data._load()
         self.tab_batches._load()
         self.tab_live._load()
+        self.tab_weekend._load()
+        self.report.clear()
+        self.plot_cal.clear()
+        self._rem_state.clear()
+        self.sm_over.setValue(self.params.overhead_h)
+        self._crop_ui()
         self._ready = True
         self._update_banner()
         self._update_backup_info()
@@ -2223,7 +2316,7 @@ class MainWindow(QMainWindow):
         for r in prep:
             if None in (r.get("t_a1"), r.get("t_a2"), r.get("t_up_f"), r.get("t_low_f"), r.get("w_in")):
                 continue
-            xs.append((1.0, 0.5 * (r["t_up_f"] + r["t_low_f"]), r["w_in"] - 22.0))
+            xs.append((1.0, 0.5 * (r["t_up_f"] + r["t_low_f"]), mdl.corn_equiv(self.params, r["w_in"]) - 22.0))
             ys.append(0.5 * (r["t_a1"] + r["t_a2"]))
         if len(xs) < 10:
             QMessageBox.information(self, "T зерна", f"Строк с T зерна, T блоков и влагой на входе: {len(xs)} (нужно ≥ 10).")
@@ -2245,14 +2338,17 @@ class MainWindow(QMainWindow):
                                                  f"Нажмите «Применить и сохранить».")
 
     def _fill_qtable(self, table: Optional[List[List[float]]]) -> None:
-        pts = table or [[d, round(0.52 * d, 2)] for d in range(10, 101, 5)]
+        pts = table or [[d, round(self.params.q100 / 100.0 * d, 2)] for d in range(10, 101, 5)]
         self.s_qtbl.setRowCount(len(pts))
         for i, (d, q) in enumerate(pts):
             self.s_qtbl.setItem(i, 0, QTableWidgetItem(f"{d:g}"))
             self.s_qtbl.setItem(i, 1, QTableWidgetItem(f"{q:g}"))
 
     def _reset_qtable(self) -> None:
-        self._fill_qtable(None)
+        """Линейная таблица по листу пересчёта: 0,52 т/ч на секунду D для кукурузы, для другой культуры — по её
+        насыпной плотности."""
+        k = 0.52 * self.crop().density / crops.get(crops.DEFAULT).density
+        self._fill_qtable([[d, round(k * d, 2)] for d in range(10, 101, 5)])
 
     def _read_qtable(self) -> Optional[List[List[float]]]:
         pts: List[List[float]] = []
@@ -2335,6 +2431,7 @@ class MainWindow(QMainWindow):
                               # данные для допусков описывают журнал, а не поля формы — переносим как есть
                               unc_feats=old.unc_feats, unc_cov=old.unc_cov, unc_lev=old.unc_lev,
                               struct_base=old.struct_base, explored=old.explored,
+                              crop=old.crop, w_store=old.w_store, eqv8=old.eqv8, eqv22=old.eqv22,
                               **vals)
         q_changed = any(abs(mdl.q_at(new, d) - mdl.q_at(old, d)) > 1e-6 for d in (20, 35, 60, 100))
         if q_changed or any(getattr(new, k) != getattr(old, k) for k in self._MODEL_KEYS):
@@ -2353,7 +2450,8 @@ class MainWindow(QMainWindow):
     def _reset_settings(self) -> None:
         if QMessageBox.question(self, "Сброс", "Вернуть параметры модели к стартовым значениям "
                                 "(ваша калибровка будет потеряна)?") == QMessageBox.Yes:
-            self.set_params(mdl.DryerParams())
+            self.set_params(crops.start_params(self.crop(), self.storage.params_of(crops.DEFAULT)
+                                               if self.storage.crop != crops.DEFAULT else None))
 
     def _update_banner(self) -> None:
         p = self.params
@@ -2485,6 +2583,9 @@ class MainWindow(QMainWindow):
         if "cool" in d:
             self.in_cool.setChecked(bool(d["cool"]))
         self.in_npass.setValue(int(d.get("npass", 0) or 0))
+        # «Дополнительно» раскрыто, только если там что-то задано
+        self.plan_more.set_expanded(bool(self.in_manual.text().strip() or self.in_tlist.text().strip()
+                                         or self.in_fuel.value() > 0))
 
     def closeEvent(self, event) -> None:  # noqa: N802
         try:

@@ -16,7 +16,7 @@ from .batches import (BATCH_FIELDS, BATCH_HEADERS, BATCH_TEXT, QUALITY_NAMES, RE
                       schedule, season_meter_shift)
 from .plots import SimplePlot
 from .theme import mix as mix_color, theme_for
-from .ui_common import (dspin, fmt_hours, fnum, item, menu_button, mute, set_role, size_by_current, table,
+from .ui_common import (Collapsible, dspin, fmt_hours, fnum, item, menu_button, mute, set_role, size_by_current, table,
                         to_num)
 
 if TYPE_CHECKING:
@@ -147,7 +147,7 @@ class BatchesTab(QWidget):
             "Массы — по весовой, влажность — лабораторная или после охлаждения. Топливо — сколько израсходовано за "
             "партию (по счётчику или накладным), в той же единице, что в «Плане сушки партии».")
         hint.setWordWrap(True)
-        lay.addWidget(hint)
+        lay.addWidget(Collapsible("Как заполнять партии", hint))
         self.b_hint = hint
         bar = QHBoxLayout()
         bar.setSpacing(6)
@@ -420,7 +420,7 @@ class BatchesTab(QWidget):
             "будет обосновать или поправить по своим данным. Связь (r) — не доказательство причины: сравнивайте "
             "партии одного гибрида и назначения.")
         self.q_hint.setWordWrap(True)
-        lay.addWidget(self.q_hint)
+        lay.addWidget(Collapsible("Что показывает эта вкладка", self.q_hint))
         hb = QHBoxLayout()
         hb.addWidget(QLabel("По оси Y:"))
         self.q_y = QComboBox()

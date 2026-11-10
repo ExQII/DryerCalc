@@ -228,6 +228,13 @@ class NavPanel(_Root):
         self._fit_width()
         return idx
 
+    def setTabLabel(self, i: int, label: str) -> None:  # noqa: N802
+        """Подпись пункта в меню (например, «Культура: рапс»); название страницы и tabText не меняются."""
+        if 0 <= i < len(self._pages):
+            self._pages[i]["label"] = label
+            self._pages[i]["item"].setText(label)
+            self._fit_width()
+
     def count(self) -> int:
         return len(self._pages)
 
@@ -318,7 +325,7 @@ class NavPanel(_Root):
     def _fit_width(self) -> None:
         """Ширина меню — по самому длинному названию раздела (+ иконка и поля) и по нижним кнопкам."""
         fm = QFontMetrics(self.list.font())
-        text_w = max((fm.horizontalAdvance(pg["text"]) for pg in self._pages), default=150)
+        text_w = max((fm.horizontalAdvance(pg.get("label") or pg["text"]) for pg in self._pages), default=150)
         inner = text_w + fm.height() * 1.15 + fm.height() * 2.2 + 12
         bottom = self.bottom.minimumSize().width() if self.bottom.count() else 0
         l, _t, r, _b = self.side.shadow_margins()

@@ -28,8 +28,8 @@ class RecircTab(QWidget):
         gb = QGroupBox("Что в сушилке")
         f = QFormLayout(gb)
         self.mass = dspin(1, 500, win.params.m_dryer, 1, 1, " т")
-        self.w0 = dspin(8, 45, 17, 1, 0.5, " %")
-        self.wk = dspin(8, 30, 14, 1, 0.5, " %")
+        self.w0 = dspin(5, 45, 17, 1, 0.5, " %")
+        self.wk = dspin(5, 30, 14, 1, 0.5, " %")
         self.tproc = dspin(20, 150, 60, 1, 5, " °C")
         self.tamb = dspin(-40, 45, 10, 1, 1, " °C")
         self.rh = dspin(5, 100, 70, 0, 5, " %")
@@ -78,6 +78,11 @@ class RecircTab(QWidget):
         self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.RichText)
         tv.addWidget(self.summary)
+        self.more = mute(QLabel())
+        self.more.setWordWrap(True)
+        self.more.setTextFormat(Qt.RichText)
+        self.more_box = Collapsible("Подробнее: вторая модель, вода, показание влагомера", self.more)
+        tv.addWidget(self.more_box)
         self.tbl = table(["Время", "Часов", "W эмпир., %", "W физ., %", "Влагомер покажет (эмпир.), %"])
         tv.addWidget(self.tbl)
         right.addWidget(top)
@@ -135,6 +140,7 @@ class RecircTab(QWidget):
         start: datetime = self.start.dateTime().toPython()
         self.tbl.setRowCount(0)
         self.plot.clear()
+        self.more_box.setVisible(False)
         if w0 <= wk:
             self.summary.setText("Влажность уже не выше цели — досушивать не нужно.")
             return
@@ -156,6 +162,7 @@ class RecircTab(QWidget):
             lo_hi.append(r.hours)
         cool_h = (main.m_end / mdl.q_full(p)) if self.cool.isChecked() and mdl.q_full(p) > 0 else 0.0
         lines = []
+        more: list = []                       # второстепенное — под «Подробнее», чтобы итог читался с одного взгляда
         name = {"empirical": "эмпирической", "physics": "физической"}
         other = "physics" if active == "empirical" else "empirical"
         if main.hours is None:
@@ -169,15 +176,17 @@ class RecircTab(QWidget):
                          f"к <b>{end:%d.%m %H:%M}</b>.")
             self.summary.setToolTip(mdl.sigma_text(self.sigma_info))
             oh = res[other].hours
-            lines.append(f"По {name[other]} модели: " + (fmt_hours(oh) if oh is not None else "не досушить за 48 ч") + ".")
-            lines.append(f"Испарится ≈ {main.water:.1f} т воды; масса станет {main.m_end:.1f} т "
-                         f"(влагомер на выходе покажет ≈ {mdl.read_from_true(p, wk):.1f} %).")
+            more.append(f"По {name[other]} модели: " + (fmt_hours(oh) if oh is not None else "не досушить за 48 ч") + ".")
+            more.append(f"Испарится ≈ {main.water:.1f} т воды; масса станет {main.m_end:.1f} т.")
+            more.append(f"Влагомер на выходе покажет ≈ {mdl.read_from_true(p, wk):.1f} %.")
             if cool_h:
                 lines.append(f"Затем охлаждение ≈ {cool_h:.1f} ч (D = 100, горелки выкл.) — готово к "
                              f"<b>{end + timedelta(hours=cool_h):%d.%m %H:%M}</b>.")
         if main.note and main.hours is not None:
             lines.append(f"<span style='color:{th.error}'>⚠ {main.note}.</span>")
         self.summary.setText("<br>".join(lines))
+        self.more.setText("<br>".join(more))
+        self.more_box.setVisible(bool(more))
         # таблица по часам
         horizon = max([r.points[-1][0] for r in res.values()] + [1.0])
         hours = [h * 0.5 for h in range(0, int(horizon / 0.5) + 2)]
