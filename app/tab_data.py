@@ -4,11 +4,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Dict, List
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
                                QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from .analysis import batch_meter_points, combine_meter, meter_bias, meter_coverage
+from .entry import pair_doubt
 from .plots import SimplePlot
 from .theme import theme_for
 from .ui_common import Collapsible, mute, set_role, size_by_current, to_num, with_legend
@@ -29,6 +30,7 @@ class DataTab(QWidget):
         super().__init__()
         self.win = win
         self._loading = False
+        self._m_asked: set = set()
         tabs = QTabWidget()
         QVBoxLayout(self).addWidget(tabs)
         tabs.addTab(self._build_weather(), "Погода (наружный воздух)")
@@ -306,12 +308,42 @@ class DataTab(QWidget):
             self._loading = False
         self._m_stats()
 
-    def _m_edited(self, *_a) -> None:
+    def _m_edited(self, *a) -> None:
         if self._loading:
             return
         pairs = self._pairs()
+        it = a[0] if a else None
+        row = it.row() if it is not None and hasattr(it, "row") else -1
+        if 0 <= row < len(pairs) and it.column() in (1, 2):
+            self._m_check(pairs, row)
         self.win.storage.set_list("meter_pairs", pairs)
         self._fill_m(pairs)
+
+    def _m_check(self, pairs: List[Dict], row: int) -> None:
+        """Пара далеко от остальных (entry.pair_doubt) — переспросить один раз: опечатка в паре сдвигает поправку
+        влагомера, а на ней стоят все расчёты выхода. «Исправлю» возвращает курсор в ячейку показания."""
+        pr = pairs[row]
+        key = (row, pr.get("reading"), pr.get("ref"))
+        why = pair_doubt(pairs, pr)
+        if not why or key in self._m_asked:
+            return
+        self._m_asked.add(key)
+        if not self._ask_pair(f"Пара {pr['reading']:g} % / {pr['ref']:g} %".replace(".", ",") + f": {why}."):
+            QTimer.singleShot(0, lambda: (self.tbl_m.setCurrentCell(row, 1), self.tbl_m.editItem(self.tbl_m.item(row, 1))))
+
+    def _ask_pair(self, text: str) -> bool:
+        """True — оставить пару как есть."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Проверьте пару")
+        box.setText(text)
+        box.setInformativeText("Если это опечатка — исправьте число. Если пара и правда такая — оставьте: сильно "
+                               "выбивающиеся пары программа в поправку не берёт, но показывает на графике.")
+        fix = box.addButton("Исправлю", QMessageBox.NoRole)
+        keep = box.addButton("Оставить как есть", QMessageBox.YesRole)
+        box.setDefaultButton(fix)
+        box.exec()
+        return box.clickedButton() is keep
 
     def _m_add(self) -> None:
         pairs = self._pairs()

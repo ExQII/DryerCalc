@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDateTim
 
 from .batches import (BATCH_FIELDS, BATCH_HEADERS, BATCH_TEXT, QUALITY_NAMES, REGIME_NAMES, QueueEntry,
                       batches_from_journal, correlation, fuel_rate_from_batches, mix, quality_findings, quality_table,
-                      schedule, season_meter_shift)
+                      q_check, q_check_all, scale_q, schedule, season_meter_shift)
 from .plots import SimplePlot
 from .theme import mix as mix_color, theme_for
 from .ui_common import (Collapsible, dspin, fmt_hours, fnum, item, menu_button, mute, set_role, size_by_current, table,
@@ -164,6 +164,12 @@ class BatchesTab(QWidget):
                                               ("Сводка сезона XLSX…", self._season_xlsx)),
                                    "Отчёт по выбранной партии (PDF или Excel) и сводка сезона по всем партиям.")
         bar.addWidget(b_rep)
+        b = QPushButton("Поправить Q(D) по весовой…")
+        b.setToolTip("Сравнить «выгружено» по журналу с массой партий по весовой и, если таблица Q(D) расходится с "
+                     "весовой, умножить её на поправку.")
+        b.clicked.connect(self._q_fix)
+        bar.addWidget(b)
+        self.b_qfix = b
         b = QPushButton("Перенести расход топлива в план")
         b.setToolTip("Удельный расход топлива на 1 т испарённой воды по всем партиям — в «План сушки партии».")
         b.clicked.connect(self._fuel_to_calc)
@@ -330,6 +336,23 @@ class BatchesTab(QWidget):
         if q or b.get("purpose"):
             lines.append("Качество: " + (f"{b.get('purpose')}; " if b.get("purpose") else "") +
                          ", ".join(f"{n} {v:g}" for n, v in q))
+        qc = q_check(b, self.win.journal_rows(), self.win.params)
+        if qc["passes"]:
+            parts = []
+            for r in qc["passes"]:
+                if r["k"] is None:
+                    continue
+                txt = (f"{r['no']}-й проход — выгружено {r['unloaded']:.0f} т, "
+                       + ("по весовой " if r.get("by_scale") else "ожидалось ") + f"{r['expected']:.0f} т")
+                parts.append(txt + (f" (×{r['k']:.2f})".replace(".", ",") if r["used"] else f" — {r['why']}, в сверку не идёт"))
+            if parts:
+                lines.append("Выгрузка по Q(D): " + "; ".join(parts) + ".")
+            if qc["k"] is not None:
+                lines.append(f"<b>{qc['text']}.</b>" + (
+                    " Кнопка «Поправить Q(D) по весовой…» — вверху." if abs(qc["k"] - 1.0) >= 0.02 else
+                    " Расхождение в пределах точности сверки."))
+        elif qc["text"] and bal:
+            lines.append(qc["text"])
         if js.get("passes"):
             mx = max((x["dw"] for x in js["passes"] if x.get("dw") is not None), default=None)
             lines.append(f"По журналу: проходов {len(js['passes'])}, работы {fmt_hours(js['hours'])}"
@@ -392,6 +415,49 @@ class BatchesTab(QWidget):
             from .reports import season_xlsx
             season_xlsx(path, self._batches(), self.win.fuel_unit(), self.win.fuel_lhv())
             _open_hint(self, path)
+
+    def _q_fix(self) -> None:
+        """Поправка таблицы Q(D) по весовой (batches.q_check_all): предложить множитель и, если инженер согласен,
+        применить его к Q(D) текущей культуры вместе с R₀ и η (batches.scale_q)."""
+        p = self.win.params
+        res = q_check_all(self._batches(), self.win.journal_rows(), p)
+        title = "Q(D) по весовой"
+        if res["k"] is None:
+            QMessageBox.information(
+                self, title, "Сверять пока не с чем. Нужна партия с массой и влажностью до сушки, временем начала и "
+                             "хотя бы одним законченным проходом в журнале, на котором через сушилку прошла вся партия.")
+            return
+        k = res["k"]
+        rows = "\n".join(f"• проход с {r['start']:%d.%m %H:%M}: выгружено {r['unloaded']:.0f} т, "
+                         f"{'по весовой' if r.get('by_scale') else 'ожидалось'} {r['expected']:.0f} т (×{r['k']:.3f})"
+                         for r in res["passes"])
+        head = (f"По {res['n']} прох.: таблица Q(D) " + ("завышает" if k < 1 else "занижает")
+                + f" выгрузку на {abs(1 - k) * 100:.1f} %.\n\n{rows}\n\n")
+        if not res["ok"]:
+            why = ("нужно не меньше двух проходов" if res["n"] < 2 else
+                   f"проходы расходятся между собой на {res['spread'] * 100:.0f} % — сначала разберитесь, почему"
+                   if res["spread"] > 0.06 else "расхождение меньше 2 % — это точность самой сверки")
+            QMessageBox.information(self, title, head + "Поправку программа не предлагает: " + why + ".")
+            return
+        q = QMessageBox(self)
+        q.setIcon(QMessageBox.Question)
+        q.setWindowTitle(title)
+        q.setText(head + f"Умножить Q(D) на {k:.3f}?".replace(".", ","))
+        q.setInformativeText(
+            f"Q при D = 100 с: {p.q100:g} → {p.q100 * k:.2f} т/ч. Вместе с таблицей на тот же множитель меняются "
+            "коэффициенты скорости сушки, поэтому прогноз влажности при каждом D останется прежним — изменятся тонны "
+            "в час, время проходов и «выгружено». Отменить можно в «Настройках сушилки» (таблица Q(D)).")
+        yes = q.addButton("Умножить", QMessageBox.YesRole)
+        q.addButton("Не менять", QMessageBox.NoRole)
+        q.exec()
+        if q.clickedButton() is yes:
+            self.apply_q_scale(k)
+
+    def apply_q_scale(self, k: float) -> None:
+        self.win.set_params(scale_q(self.win.params, k))
+        self.win.storage.log_event("q_scale", {"k": round(k, 4)})
+        self.win.statusBar().showMessage(f"Q(D) умножена на {k:.3f} по весовой.".replace(".", ",", 1), 15000)
+        self._show_batch()
 
     def _fuel_to_calc(self) -> None:
         rate, n = fuel_rate_from_batches(self._batches())

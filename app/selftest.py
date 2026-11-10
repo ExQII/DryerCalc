@@ -213,6 +213,8 @@ def run(out_path: str) -> int:
               and _trap("Сушим в 1 силос") is None and _trap("Закончился 2 силос, рециркуляция") is None,
               "слова-ловушки в примечании распознаются, обычные записи о силосах — нет")
         from PySide6.QtCore import QDateTime as _QDT
+        _asked9: list = []                        # окно «Проверьте пробу» в самопроверке не показываем
+        win._confirm_sample = lambda _d: _asked9.append(_d) or True
         n_before = win.tbl_j.rowCount()
         last_ts = win.tbl_j.item(n_before - 1, 0).text()
         mid_ts = win.tbl_j.item(n_before // 2, 0).text()
@@ -498,6 +500,22 @@ def run(out_path: str) -> int:
               and not win._has_fitted_amb(),
               f"T нар в каждой строке, меняется с проходом: b_нар = {_p11.b_amb:+.2f} (физическая оценка), "
               f"R₀ = {_p11.r_ref:.2f}")
+        # --- v1.9: проверка пробы и пары при вводе, две пробы, Q(D) по весовой, накладные по журналу ---
+        from . import entry as _entry
+        from .batches import overhead_from_journal as _ovj, scale_q as _scale_q
+        _hist = [{"ts": f"02.11.26 {8 + k // 2:02d}:{30 * (k % 2):02d}", "w_in": 21.0 + 0.2 * (k % 3), "w_out": 14.0,
+                  "note": "", "batch": "1", "pass_no": 1} for k in range(6)]
+        _new = {"ts": "02.11.26 11:00", "w_in": 31.2, "w_out": 14.1, "note": "", "batch": "1", "pass_no": 1}
+        _p2 = _scale_q(win.params, 0.96)
+        _c9 = mdl.Conditions(60.0, 10.0, 70.0)
+        check(len(_entry.sample_doubt(_hist, _new)) == 1 and not _entry.sample_doubt(_hist, dict(_new, w_in=21.3))
+              and _entry.parse_moisture("31,2 30,6")[0] == 30.9
+              and _entry.pair_doubt([{"reading": 14.0, "ref": 14.8}] * 5, {"reading": 14.0, "ref": 18.8}) is not None
+              and abs(mdl.solve_pass(_p2, _c9, 24.0, 1.0, 35.0).w_out - mdl.solve_pass(win.params, _c9, 24.0, 1.0, 35.0).w_out) < 1e-6
+              and abs(mdl.q_at(_p2, 35.0) - 0.96 * mdl.q_at(win.params, 35.0)) < 0.01
+              and isinstance(_ovj(rows, win.params)["values"], list),
+              "ввод: опечатка 31,2 при пробах 21,0–21,4 переспрошена, две пробы → среднее 30,9; Q(D) × 0,96 не "
+              "меняет прогноз влажности")
         # --- v1.8.1: вход модели — среднее проб входа за ±2 ч ---
         import app.calibration as _cal
         from .calibration import observe_all as _oa, predict_out as _po

@@ -207,6 +207,146 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
     return {"passes": passes, "hours": sum(x["hours"] for x in passes)}
 
 
+# ----------------------------------------------------------------------------
+# Сверка Q(D) по весовой и накладные на проход по журналу
+# ----------------------------------------------------------------------------
+
+Q_CHECK_TOL = 0.15          # проход, где «выгружено» расходится с ожидаемой массой сильнее, в сверку не идёт
+Q_CHECK_MIN = 0.02          # поправку меньше 2 % не предлагать: это точность самой сверки
+
+
+def q_check(b: Dict, rows: List[Dict], p: mdl.DryerParams) -> Dict:
+    """Сверка таблицы Q(D) с весовой по партии b.
+
+    Q(D) — тонны в час на выходе сушилки; «выгружено» за проход — её интеграл по журналу. С другой стороны, сколько
+    зерна должно выйти за проход, известно из весовой: сухое вещество партии не меняется, поэтому после прохода с
+    выходом W масса = m_до · (100 − W_до) / (100 − W). Для последнего прохода, если вписана масса после сушки, —
+    берётся она сама. Отношение «ожидалось / выгружено» — множитель к Q(D).
+
+    В сверку не идут: проход, который ещё идёт; проход, где расхождение больше 15 % — значит, через сушилку прошла
+    не вся партия (журнал начат позже, подмешано другое зерно, часть прохода — рециркуляцией через силос).
+    Возвращает {"passes": [{no, start, unloaded, expected, k, used, why}], "k", "n", "spread", "text"}; k — None,
+    когда сверять нечем."""
+    from .calibration import journal_passes, prepare
+    res: Dict = {"passes": [], "k": None, "n": 0, "spread": None, "text": ""}
+    bal = balance(b)
+    start, end = parse_when(b.get("start") or ""), parse_when(b.get("end") or "")
+    if not bal or (start is None and end is None):
+        res["text"] = "Для сверки Q(D) нужны масса и влажность партии до сушки и время её начала."
+        return res
+    js = journal_summary(rows, p, start, end)
+    prep, _ok = prepare(rows)
+    kinds = {x["pass"]: x for x in journal_passes(prep, p)}
+    passes = js.get("passes", [])
+    label = passes[0]["batch"] if passes else ""
+    m_out = _f(b.get("m_out"))
+    own = [x for x in passes if x["batch"] == label]
+    for i, x in enumerate(own):
+        jp = kinds.get(x["seg"], {})
+        row = {"no": i + 1, "start": x["start"], "unloaded": x["unloaded"], "expected": None, "k": None,
+               "used": False, "why": ""}
+        res["passes"].append(row)
+        last = i == len(own) - 1
+        if x.get("w_out") is None or x["unloaded"] <= 0:
+            row["why"] = "нет проб выхода"
+            continue
+        if last and m_out:
+            row["expected"], row["by_scale"] = m_out, True
+        else:
+            row["expected"] = bal["dm"] * 100.0 / (100.0 - x["w_out"])
+        row["k"] = row["expected"] / x["unloaded"]
+        if jp.get("end_kind") is None and x is passes[-1]:
+            row["why"] = "проход ещё идёт"
+        elif abs(row["k"] - 1.0) > Q_CHECK_TOL:
+            row["why"] = "прошла не вся партия или журнал неполный"
+        else:
+            row["used"] = True
+    used = [r for r in res["passes"] if r["used"]]
+    if not used:
+        res["text"] = "Сверить Q(D) пока не с чем: нет законченного прохода, где через сушилку прошла вся партия."
+        return res
+    k = sum(r["expected"] for r in used) / sum(r["unloaded"] for r in used)
+    res.update({"k": k, "n": len(used), "spread": max(r["k"] for r in used) - min(r["k"] for r in used)})
+    res["text"] = (f"Сверка Q(D) по {len(used)} прох.: выгружено по журналу {sum(r['unloaded'] for r in used):.0f} т, "
+                   f"по весовой ожидалось {sum(r['expected'] for r in used):.0f} т — Q(D) "
+                   + ("завышена" if k < 1 else "занижена") + f" на {abs(1 - k) * 100:.1f} %".replace(".", ","))
+    return res
+
+
+def q_check_all(batches: Sequence[Dict], rows: List[Dict], p: mdl.DryerParams) -> Dict:
+    """Сверка Q(D) по всем партиям: общий множитель (сумма ожидаемых масс к сумме выгруженных) и разброс проходов.
+    "ok" — поправку стоит предложить: не меньше двух проходов, они согласны между собой (разброс ≤ 6 %), а поправка
+    больше 2 %."""
+    used = [r for b in batches for r in q_check(b, rows, p)["passes"] if r["used"]]
+    res: Dict = {"k": None, "n": len(used), "spread": None, "ok": False, "passes": used}
+    if not used:
+        return res
+    k = sum(r["expected"] for r in used) / sum(r["unloaded"] for r in used)
+    spread = max(r["k"] for r in used) - min(r["k"] for r in used)
+    res.update({"k": k, "spread": spread,
+                "ok": len(used) >= 2 and spread <= 0.06 and abs(k - 1.0) >= Q_CHECK_MIN})
+    return res
+
+
+def scale_q(p: mdl.DryerParams, k: float) -> mdl.DryerParams:
+    """Q(D) × k. Вместе с ней на k умножаются R₀ и η: модель откалибрована по «расход × съём», и прогноз влажности
+    при каждом D остаётся прежним — меняются тонны в час, время проходов и «выгружено»."""
+    from dataclasses import replace
+    table = [[float(d), round(float(q) * k, 3)] for d, q in p.q_table] if p.q_table else None
+    return replace(p, q100=round(p.q100 * k, 3), q_table=table, r_ref=p.r_ref * k, eta=p.eta * k)
+
+
+def overhead_from_journal(rows: List[Dict], p: mdl.DryerParams) -> Dict:
+    """Накладные на проход по журналу: сколько часов за проход сушилка работала, но зерно прохода из силоса не шло —
+    набор сушилки, рециркуляция (в конце прохода досушивается зерно, оставшееся в шахте, — около 3 ч на 60 т),
+    рециркуляция через силос, работа без горелок. Это то, что план прибавляет к «масса / Q» на каждый проход.
+
+    Считаются законченные проходы: за которыми идёт следующий проход той же партии, и последний проход партии — до
+    охлаждения (охлаждение в плане отдельно). Остановки и перерывы в записях длиннее 1,5 ч не считаются: это
+    простой, а не накладные. Возвращает {"values": [ч по проходам], "median", "n"}; median — None, если законченных
+    проходов нет. На журнале ноября 2026: 4,8; 6,2 и 2,5 ч (в настройках стоял 1 ч) — план двух проходов с 1 ч
+    отставал от факта на 10,8 ч, с медианой 4,75 ч и Q(D) по весовой расходится с ним на 1 ч."""
+    from .calibration import journal_passes, prepare
+    prep, ok = prepare(rows)
+    res: Dict = {"values": [], "median": None, "n": 0}
+    if not ok:
+        return res
+    jp = journal_passes(prep, p)
+    by_pass: Dict[int, List[Dict]] = {}
+    for r in prep:
+        if r.get("dt") is not None:
+            by_pass.setdefault(r.get("pass", 0), []).append(r)
+    for k, a in enumerate(jp):
+        nxt = jp[k + 1] if k + 1 < len(jp) else None
+        if a["start"] is None:
+            continue
+        if a["batch_end"]:
+            if a["end_kind"] != "cool":
+                continue                     # партия кончилась досушкой или сменой партии — конец прохода не виден
+            stop = None                      # последний проход: всё до охлаждения
+        elif nxt is not None and nxt["start"] is not None and nxt["batch_no"] == a["batch_no"]:
+            stop = nxt["start"]
+        else:
+            continue                         # проход ещё идёт
+        lst = by_pass.get(a["pass"], [])
+        over = feed = 0.0
+        for x, y in zip(lst, lst[1:] + ([{"dt": stop}] if stop is not None else [])):
+            h = (y["dt"] - x["dt"]).total_seconds() / 3600.0
+            if x.get("stopped") or x.get("cool") or not 0.0 < h <= 1.5:
+                continue
+            if x.get("fill") or x.get("recirc") or x.get("loop") or x.get("burner_off"):
+                over += h
+            else:
+                feed += h
+        if feed > 0:
+            res["values"].append(over)
+    if res["values"]:
+        v = sorted(res["values"])
+        res["median"] = v[len(v) // 2] if len(v) % 2 else 0.5 * (v[len(v) // 2 - 1] + v[len(v) // 2])
+        res["n"] = len(v)
+    return res
+
+
 def batches_from_journal(rows: List[Dict]) -> List[Dict]:
     """Черновики партий по колонке «Партия» журнала: имя, начало и конец по времени строк."""
     from .calibration import assign_times

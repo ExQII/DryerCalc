@@ -2900,6 +2900,183 @@ def test_inlet_is_mean_of_samples_over_two_hours():
     assert "По влажности входа: до 20 %" in rep and "выше 27 %" in rep and "среднее проб за ±2 ч" in rep
 
 
+def _window(name: str = "win19.db", rows=None):
+    """Окно на новой базе (журнал rows — через базу, как при запуске программы)."""
+    _qapp()
+    from app.gui import MainWindow
+    db = _tmp(name)
+    if os.path.exists(db):
+        os.remove(db)
+    st = Storage(db)
+    if rows:
+        st.replace_journal(rows)
+    st.close()
+    return MainWindow(Storage(db))
+
+
+def _two_pass_journal():
+    """Партия в два прохода: набор, 10 ч подачи, рециркуляция 3 ч; подача из 2-го силоса 9 ч, рециркуляция 2 ч,
+    охлаждение. Пробы каждые 30 мин, D = 35 с."""
+    t = datetime(2026, 11, 2, 0, 0)
+    rows = []
+
+    def add(note="", w_in=None, w_out=None, d=35.0, t_up=60.0):
+        nonlocal t
+        rows.append({"ts": t.strftime("%d.%m.%y %H:%M"), "w_in": w_in, "w_out": w_out, "t_a1": 30.0, "t_a2": 28.0,
+                     "t_up": t_up, "t_low": t_up, "t_amb": 5.0, "d": d, "batch": "1", "pass_no": None, "note": note})
+        t += timedelta(minutes=30)
+    add("Запуск, сушим с 1 с.", 30.0, None)
+    for _ in range(20):
+        add("", 30.0, 24.0)
+    add("Закончился 1 с., рециркуляция", None, 24.0)
+    for _ in range(5):
+        add("", None, 23.5)
+    add("сушим с 2 с.", 24.0, 20.0)
+    for _ in range(18):
+        add("", 24.0, 19.0)
+    add("Закончился 2 с., рециркуляция", None, 19.0)
+    for _ in range(3):
+        add("", None, 18.5)
+    add("Охлаждение", None, None, 100.0, 0.0)
+    add("", None, None, 100.0, 0.0)
+    return rows
+
+
+def test_q_check_by_weighbridge_and_overhead_from_journal():
+    """1.9: «выгружено» по Q(D) сверяется с весовой — множитель к Q(D), прогноз влажности при этом не меняется;
+    накладные на проход считаются по журналу (набор, рециркуляция; без охлаждения и остановок)."""
+    from app.batches import journal_summary, overhead_from_journal, q_check, q_check_all, scale_q
+    from app.model import Conditions, q_at, solve_pass
+    from app import physics
+    rows = _two_pass_journal()
+    js = journal_summary(rows, P, None, None)["passes"]
+    assert len(js) == 2 and js[0]["unloaded"] > 150 and js[1]["unloaded"] > 150
+    ov = overhead_from_journal(rows, P)
+    assert ov["n"] == 2 and abs(ov["values"][0] - 3.0) < 0.01 and abs(ov["values"][1] - 2.0) < 0.01     # без охлаждения
+    assert abs(ov["median"] - 2.5) < 0.01
+    assert overhead_from_journal(rows[:15], P)["median"] is None                # проход ещё идёт
+    # весовая: сухое вещество такое, что после каждого прохода масса = 0,95 от «выгружено»
+    w1 = js[0]["w_out"]
+    m_in = 0.95 * js[0]["unloaded"] * (100.0 - w1) / (100.0 - 30.0)
+    b = {"name": "Партия 1", "start": "02.11.2026 00:00", "end": "", "m_in": m_in, "w_in": 30.0}
+    qc = q_check(b, rows, P)
+    assert qc["n"] >= 1 and qc["passes"][0]["used"] and abs(qc["passes"][0]["k"] - 0.95) < 1e-6
+    allq = q_check_all([b], rows, P)
+    assert allq["k"] is not None and abs(allq["k"] - 0.95) < 0.03
+    # масса после сушки по весовой — последний проход сверяется с ней
+    b2 = dict(b, m_out=0.95 * js[1]["unloaded"])
+    qc2 = q_check(b2, rows, P)
+    assert qc2["passes"][1].get("by_scale") and abs(qc2["passes"][1]["k"] - 0.95) < 1e-6 and abs(qc2["k"] - 0.95) < 1e-6
+    ok = q_check_all([b2], rows, P)
+    assert ok["ok"] and ok["n"] == 2 and ok["spread"] < 1e-6
+    # журнал начат с середины прохода / расхождение больше 15 % — проход в сверку не идёт
+    far = q_check(dict(b, m_in=2.0 * m_in), rows, P)
+    assert far["k"] is None and "не вся партия" in far["passes"][0]["why"]
+    assert q_check({"name": "x"}, rows, P)["k"] is None
+    # множитель: Q(D) × k, R₀ и η × k — влажность при каждом D та же, тонны в час меньше; сверка сходится
+    p2 = scale_q(P, qc2["k"])
+    c = Conditions(60.0, 5.0, 70.0)
+    for d in (30.0, 40.0):
+        assert abs(q_at(p2, d) - 0.95 * q_at(P, d)) < 0.01
+        assert abs(solve_pass(p2, c, 24.0, 1.0, d).w_out - solve_pass(P, c, 24.0, 1.0, d).w_out) < 1e-6
+        assert abs(physics.pass_out(p2, c, 24.0, d) - physics.pass_out(P, c, 24.0, d)) < 1e-6
+    after = q_check_all([b2], rows, p2)
+    assert abs(after["k"] - 1.0) < 2e-3 and not after["ok"]
+
+
+def test_entry_checks_typos_and_double_samples():
+    """1.9: проба далеко от последних проб потока — переспрос; две пробы через пробел — среднее; пара влагомера,
+    выбивающаяся из остальных, — переспрос."""
+    from app import entry
+    assert entry.parse_moisture("31,2") == (31.2, [31.2])
+    assert entry.parse_moisture("31,2 30,6") == (30.9, [31.2, 30.6]) and entry.parse_moisture("31.2/30.6")[0] == 30.9
+    assert entry.parse_moisture("абв") == (None, []) and entry.parse_moisture("") == (None, [])
+    assert entry.parse_moisture("30 31 32 33") == (None, [])
+    t0 = datetime(2026, 11, 2, 8, 0)
+
+    def row(k, w_in=None, w_out=None, note=""):
+        return {"ts": (t0 + timedelta(minutes=30 * k)).strftime("%d.%m.%y %H:%M"), "w_in": w_in, "w_out": w_out,
+                "note": note, "batch": "1", "pass_no": 1}
+    hist = [row(k, 21.0 + 0.3 * (k % 3), 14.0 + 0.1 * (k % 2)) for k in range(6)]
+    assert entry.sample_doubt(hist, row(6, 21.4, 14.2)) == []
+    d = entry.sample_doubt(hist, row(6, 31.4, 14.2))
+    assert len(d) == 1 and "входа 31,4 %" in d[0] and "последние 5 проб" in d[0]
+    assert len(entry.sample_doubt(hist, row(6, 21.4, 41.2))) == 1 and len(entry.sample_doubt(hist, row(6, 12.4, 1.4))) == 2
+    assert entry.sample_doubt(hist, row(6, 31.4, None, "Закончился 2 с., сушим с 1 с.")) == []      # сменили силос
+    assert entry.sample_doubt(hist[:2], row(2, 31.4)) == []                                         # истории ещё нет
+    assert "вне 4–45 %" in entry.sample_doubt([], row(0, 214.0))[0]
+    assert entry.sample_doubt(hist + [row(6, None, None, "Остановка")], row(7, 31.4)) == []         # поток прерван
+    assert entry.sample_doubt(hist + [row(6, None, None, "Режим: D 35→40 с")], row(7, 31.4)) != []
+    assert "разошлись на 3,1" in entry.sample_doubt(hist, row(6, 22.5), {"w_in": [21.0, 24.1]})[0]
+    assert entry.wet_hint(30.0) and not entry.wet_hint(22.0) and not entry.wet_hint(None)
+    pairs = [{"reading": 14.0 + 0.2 * k, "ref": 14.7 + 0.2 * k + 0.1 * (k % 3)} for k in range(8)]
+    assert entry.pair_doubt(pairs, {"reading": 14.5, "ref": 15.3}) is None
+    assert "около" in entry.pair_doubt(pairs, {"reading": 14.5, "ref": 18.3})
+    assert entry.pair_doubt(pairs[:2], {"reading": 14.5, "ref": 16.3}) is None and entry.pair_doubt([], {"reading": 14.5, "ref": 19.3})
+    assert "вне 4–45 %" in entry.pair_doubt(pairs, {"reading": 145.0, "ref": 15.3})
+    # окно: опечатка → переспрос; «Исправлю» — строка не добавлена; две пробы — в журнал среднее; подсказка сырого зерна
+    full = [dict({f: None for f in ("t_a1", "t_a2", "t_up", "t_low", "t_amb", "d")}, **r, d=35.0, t_up=60.0, t_low=60.0)
+            for r in hist]
+    win = _window("entry19.db", full)
+    asked = []
+    win._confirm_sample = lambda doubts: asked.append(doubts) or False
+    n0 = len(win._table_to_rows())
+    win._qe_prefill(after_add=True)
+    win.qe["w_in"].setText("31,4")
+    win.qe["w_out"].setText("14,2")
+    win._qe_add()
+    assert len(asked) == 1 and len(win._table_to_rows()) == n0 and win.qe["w_in"].text() == "31,4"
+    win.qe["w_in"].setText("21,2 21,6")
+    win._qe_add()
+    last = win._table_to_rows()[-1]
+    assert len(asked) == 1 and len(win._table_to_rows()) == n0 + 1 and last["w_in"] == 21.4 and last["w_out"] == 14.2
+    assert not win.qe_hint.isVisibleTo(win.qe_box)
+    win._confirm_sample = lambda doubts: True
+    win.qe["w_in"].setText("30,5")
+    win._qe_add()
+    assert win._table_to_rows()[-1]["w_in"] == 30.5 and win.qe_hint.isVisibleTo(win.qe_box)       # вход выше 27 %
+    # пара влагомера: переспрос один раз на пару
+    tab = win.tab_data
+    seen = []
+    tab._ask_pair = lambda text: seen.append(text) or True
+    good = [{"dt": "", "reading": p["reading"], "ref": p["ref"], "note": ""} for p in pairs]
+    tab._fill_m(good + [{"dt": "", "reading": 14.5, "ref": 18.3, "note": ""}])
+    tab._m_edited(tab.tbl_m.item(len(good), 2))
+    tab._m_edited(tab.tbl_m.item(len(good), 2))
+    tab._m_edited(tab.tbl_m.item(0, 2))
+    assert len(seen) == 1 and "14,5" in seen[0]
+    win.close()
+
+
+def test_q_fix_and_overhead_buttons_in_window():
+    """1.9: «Поправить Q(D) по весовой…» меняет Q(D) текущей культуры; «По журналу: … ч» подставляет накладные."""
+    from app.batches import journal_summary, q_check_all
+    from app.model import q_at
+    from app import pages
+    rows = _two_pass_journal()
+    win = _window("qfix19.db", rows)
+    p0 = win.params
+    js = journal_summary(rows, p0, None, None)["passes"]
+    m_in = 0.95 * js[0]["unloaded"] * (100.0 - js[0]["w_out"]) / 70.0
+    tab = win.tab_batches
+    tab._fill_batches([{"name": "Партия 1", "start": "02.11.2026 00:00", "end": "", "m_in": round(m_in, 3), "w_in": 30.0,
+                        "m_out": round(0.95 * js[1]["unloaded"], 3)}])
+    tab._save_batches()
+    tab.tbl_b.selectRow(0)
+    tab._show_batch()
+    txt = tab.b_detail.text()
+    assert "Выгрузка по Q(D)" in txt and "Q(D) завышена на 5,0 %" in txt
+    k = q_check_all(tab._batches(), win.journal_rows(), p0)["k"]
+    tab.apply_q_scale(k)
+    assert abs(q_at(win.params, 35.0) - k * q_at(p0, 35.0)) < 0.01 and abs(win.params.r_ref - k * p0.r_ref) < 1e-9
+    assert "в пределах точности" in tab.b_detail.text()
+    win.tabs.setCurrentIndex(win.tabs.indexOfText(pages.SETTINGS))
+    assert win.s_over_btn.isVisibleTo(win) and "2,5 ч" in win.s_over_btn.text()
+    win.s_over_btn.click()
+    assert win.s_overhead.value() == 2.5 and not win.s_over_btn.isVisibleTo(win)
+    win.close()
+
+
 def test_long_texts_are_collapsed():
     """Длинные пояснения свёрнуты и открываются щелчком; отчёт калибровки раскрывается, когда появился."""
     app = _qapp()

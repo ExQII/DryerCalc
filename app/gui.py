@@ -43,7 +43,7 @@ from .tab_recirc import RecircTab
 from .tab_weekend import WeekendTab
 from .reminders import ReminderCfg, check as reminders_check, live_numbers
 from . import pilot
-from . import crops, design, icons
+from . import crops, design, entry, icons
 from .theme import theme_for
 from .weather import WeatherSeries
 
@@ -1157,7 +1157,7 @@ class MainWindow(QMainWindow):
         self.qe: Dict[str, QLineEdit] = {}
         self._qe_caps: Dict[str, str] = {}               # подписи полей — для сообщения «Не число: …»
         for line, key, cap, ph, width in (
-                (line1, "w_in", "Влага вход, %", "%", 76), (line1, "w_out", "Влага выход, %", "%", 76),
+                (line1, "w_in", "Влага вход, %", "%", 96), (line1, "w_out", "Влага выход, %", "%", 96),
                 (line1, "t_a1", "T зерна низ", "°C", 64), (line1, "t_a2", "T зерна верх", "°C", 64),
                 (line1, "t_amb", "T наружная", "°C", 64),
                 (line2, "t_up", "T блока 1", "°C", 64), (line2, "t_low", "T блока 2", "°C", 64),
@@ -1168,7 +1168,9 @@ class MainWindow(QMainWindow):
             le = QLineEdit()
             self._qe_caps[key] = cap
             le.setPlaceholderText(ph)
-            le.setToolTip(cap if key != "t_amb" else
+            le.setToolTip("Одна проба — одно число. Взяли две пробы подряд — введите обе через пробел (31,2 30,6): "
+                          "в журнал пойдёт среднее. На сыром зерне (выше 27 %) две пробы заметно точнее одной."
+                          if key in ("w_in", "w_out") else cap if key != "t_amb" else
                           "Наружный воздух, °C (можно с минусом: −5). Переносится с прошлой записи, если она не "
                           "старше 3 ч, — меняйте, когда изменилась. Пусто — строка без T наружной: калибровка возьмёт "
                           "таблицу погоды, «Текущий проход» — последнюю записанную.")
@@ -1185,10 +1187,11 @@ class MainWindow(QMainWindow):
         b.clicked.connect(self._qe_add)
         field(line1, " ", b)
         self.qe_add_btn = b
-        hint = QLabel("T наружная, режим и метки — с прошлой записи; меняйте, только когда меняются.")
+        hint = QLabel("Зерно сырое — проба шумит на ±0,7–0,9 п.п. Берите две пробы подряд и вводите обе через пробел "
+                      "(31,2 30,6): запишется среднее.")
         hint.setWordWrap(True)
-        self.qe_hint = hint
-        hint.setVisible(False)                 # то же сказано в подсказке группы и в «Как вести журнал»
+        self.qe_hint = hint                    # показывается, пока вход выше 27 % (entry.wet_hint)
+        hint.setVisible(False)
         line1.addStretch(1)
         b = QPushButton("Изменить режим…")
         b.setToolTip("Поменяли D или T блоков между пробами — запишите изменение отдельной строкой с его временем: "
@@ -1196,6 +1199,7 @@ class MainWindow(QMainWindow):
         b.clicked.connect(self._regime_button)
         field(line2, " ", b)
         self.qe_regime_btn = b
+        qv.addWidget(hint)
         self.qe_box = qe
         lay.addWidget(qe)
 
@@ -1295,6 +1299,8 @@ class MainWindow(QMainWindow):
             self._qe_auto_time = None
         if changed and getattr(self, "_ready", False):
             self.statusBar().showMessage("Быстрый ввод взял из журнала: " + ", ".join(changed) + ".", 15000)
+        last_in = next((r["w_in"] for r in reversed(rows) if r.get("w_in") is not None), None)
+        self.qe_hint.setVisible(entry.wet_hint(mdl.corn_equiv(self.params, last_in) if last_in is not None else None))
         return changed
 
     def _qe_add(self) -> None:
@@ -1307,11 +1313,15 @@ class MainWindow(QMainWindow):
             row[f] = ""
         row["ts"] = self.qe_time.dateTime().toString("dd.MM.yy HH:mm")
         bad = []
+        parts: Dict[str, List[float]] = {}
         for key, txt in vals.items():
             if key in ("batch", "note"):
                 row[key] = txt
             elif txt:
-                v = to_float(txt)
+                if key in ("w_in", "w_out"):            # две пробы через пробел — в журнал идёт среднее
+                    v, parts[key] = entry.parse_moisture(txt)
+                else:
+                    v = to_float(txt)
                 if v is None:
                     bad.append(self._qe_caps.get(key, key))    # «T зерна низ», а не «°C», как было
                 row[key] = v
@@ -1330,6 +1340,17 @@ class MainWindow(QMainWindow):
             return
         rows_now = self._table_to_rows()
         pos = insert_position(rows_now, row["ts"])
+        doubts = entry.sample_doubt(rows_now[:pos], row, parts)
+        if doubts and not self._confirm_sample(doubts):
+            key = "w_in" if "входа" in doubts[0] else "w_out"
+            self.qe[key].setFocus()
+            self.qe[key].selectAll()
+            return
+        mean_msg = "; ".join(
+            f"{'вход' if k == 'w_in' else 'выход'} — среднее {len(v)} проб ({', '.join(fmt_num(x) for x in v)}) = "
+            f"{fmt_num(row[k])} %" for k, v in parts.items() if len(v) > 1)
+        if mean_msg:
+            self.statusBar().showMessage("Записано: " + mean_msg + ".", 15000)
         if pos < len(rows_now):
             self._insert_rows(pos, [row])
             self.statusBar().showMessage(
@@ -1346,6 +1367,23 @@ class MainWindow(QMainWindow):
             self.qe[key].clear()
         self._qe_prefill(after_add=True)
         self.qe["w_in"].setFocus()
+
+    def _confirm_sample(self, doubts: List[str]) -> bool:
+        """Проба далеко от последних проб того же потока (entry.sample_doubt) — переспросить: опечатка или так и есть."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Проверьте пробу")
+        box.setText("\n".join(doubts))
+        box.setInformativeText(
+            "Если это опечатка — исправьте число. Если проба и правда такая (сменили силос, пошло другое зерно) — "
+            "запишите как есть; при смене силоса добавьте примечание «Закончился 2 с., сушим с 1 с.».\n\n"
+            "Вход в расчётах — среднее проб за 2 часа, поэтому опечатка сдвигает совет по D надолго.")
+        fix = box.addButton("Исправлю", QMessageBox.NoRole)
+        ok = box.addButton("Записать как есть", QMessageBox.YesRole)
+        box.setDefaultButton(fix)
+        box.exec()
+        self.storage.log_event("sample_doubt", {"text": doubts[0], "kept": box.clickedButton() is ok})
+        return box.clickedButton() is ok
 
     def _confirm_note(self, note: str) -> bool:
         """Примечание со словом-командой не по образцу события — переспросить (слова-ловушки)."""
@@ -2069,7 +2107,19 @@ class MainWindow(QMainWindow):
         gb = QGroupBox("Сушилка и зерно")
         f = QFormLayout(gb)
         f.addRow("Вместимость сушилки", self.s_mdryer)
-        f.addRow("Накладные на каждый проход", self.s_overhead)
+        ov = QHBoxLayout()
+        ov.setSpacing(8)
+        ov.addWidget(self.s_overhead)
+        self.s_over_btn = QPushButton()
+        self.s_over_btn.setVisible(False)          # появляется, когда в журнале есть законченные проходы
+        self.s_over_btn.clicked.connect(self._overhead_from_journal)
+        ov.addWidget(self.s_over_btn)
+        ov.addStretch(1)
+        f.addRow("Накладные на каждый проход", ov)
+        self.s_overhead.setToolTip(
+            "Сколько часов за проход сушилка работает, а зерно прохода из силоса не идёт: набор сушилки, рециркуляция "
+            "в конце прохода (досушивается зерно, оставшееся в шахте), рециркуляция через силос. План прибавляет их к "
+            "«масса / Q» на каждый проход.")
         f.addRow("Поправка влагомера на выходе\n(показание − после охлаждения)", self.s_bias)
         f.addRow("Предел T блоков (каждая ступень)", self.s_tagmax)
         f.addRow("Предел нагрева зерна", self.s_tgmax)
@@ -2213,7 +2263,33 @@ class MainWindow(QMainWindow):
         sc.setWidget(inner)
         lay.addWidget(sc, 2)
         self._update_backup_info()
+        w.on_show = self._settings_shown
         return w
+
+    def _settings_shown(self) -> None:
+        """Накладные на проход по журналу (batches.overhead_from_journal) — кнопкой рядом с полем; решает инженер."""
+        from .batches import overhead_from_journal
+        ov = overhead_from_journal(self._table_to_rows(), self.params)
+        self._over_journal = ov
+        if not ov["median"]:                 # 0 — в журнале не записаны ни набор, ни рециркуляция: подсказывать нечего
+            self.s_over_btn.setVisible(False)
+            return
+        val = round(ov["median"] * 4.0) / 4.0
+        self.s_over_btn.setText(f"По журналу: {fmt_num(val)} ч")
+        self.s_over_btn.setToolTip(
+            f"По {ov['n']} законченным проходам журнала: " + ", ".join(fmt_num(round(v, 1)) for v in ov["values"])
+            + " ч на проход (набор сушилки, рециркуляция, рециркуляция через силос; остановки не считаются). "
+              "Нажмите, чтобы подставить, затем «Применить настройки».")
+        self.s_over_btn.setVisible(abs(val - self.s_overhead.value()) >= 0.25)
+
+    def _overhead_from_journal(self) -> None:
+        ov = getattr(self, "_over_journal", None)
+        if not ov or not ov["median"]:
+            return
+        self.s_overhead.setValue(round(ov["median"] * 4.0) / 4.0)
+        self.s_over_btn.setVisible(False)
+        self.statusBar().showMessage("Накладные на проход взяты из журнала — нажмите «Применить», чтобы план и "
+                                     "«Текущий проход» считали с ними.", 15000)
 
     def _save_reminders(self, *_a) -> None:
         cfg = ReminderCfg(enabled=self.r_on.isChecked(), sample_min=self.r_sample.value(), grace_min=self.r_grace.value(),
