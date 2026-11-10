@@ -104,7 +104,7 @@ def start_params(crop: Crop, corn: Optional[mdl.DryerParams] = None) -> mdl.Drye
         return base
     kd = crop.density / BY_KEY[DEFAULT].density
     info = (f"стартовая: оценка для {crop.gen} по модели сушилки на кукурузе (равная равновесная влажность воздуха"
-            + (f", скорость ×{crop.k_speed:g} по нормам" if crop.k_speed != 1.0 else "")
+            + (f", скорость ×{crop.k_speed:g} по нормам".replace(".", ",") if crop.k_speed != 1.0 else "")
             + "), ±30 % — уточнится калибровкой по журналу")
     return replace(
         base, crop=crop.key, w_store=crop.w_store, eqv8=crop.eqv8, eqv22=crop.eqv22,
