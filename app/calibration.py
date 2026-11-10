@@ -38,7 +38,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .model import DryerParams, d_at, pass_rate_arr, q_at, solve_out_arr, true_from_read
+from .model import (DryerParams, corn_equiv, d_at, is_corn_scale, pass_rate_arr, q_at, solve_out_arr,
+                    true_from_read)
 
 FIELDS = ["ts", "w_in", "w_out", "t_a1", "t_a2", "t_up", "t_low", "d", "note", "batch", "pass_no", "t_amb", "rh"]
 TEXT_FIELDS = {"ts", "batch", "note"}
@@ -736,6 +737,36 @@ def _inlet_series(prep: List[Dict]) -> Dict[int, List[Tuple[float, float]]]:
     return ser
 
 
+INLET_SMOOTH_H = 2.0
+
+
+def smooth_inlet(points: List[Tuple], h: Optional[float] = None) -> List[Tuple]:
+    """Пробы входа [(время, W)] → те же моменты, но W — среднее проб в окне ±h (часы или timedelta — как время в
+    points). h=None — INLET_SMOOTH_H.
+
+    Зачем. Проба входа — горсть зерна из потока: её шум ±0,3 п.п. при 18 % и ±0,7–0,9 при 31–33 % (соседние пробы
+    журнала ноября 2026), а сам поток из силоса меняется медленно. Одна проба на входе модели переносит этот шум в
+    прогноз выхода почти целиком (dW_вых/dW_вх ≈ 0,8) и в подбор коэффициентов. Среднее по окну ±2 ч (до 9 проб)
+    шум убирает. Проверка вне обучения (без одного прохода / вперёд по времени), ошибка w_вых по строкам:
+    ноябрь 0,63 → 0,54 / 0,54 → 0,45 п.п.; октябрь 0,51 → 0,44 / 0,55 → 0,48. Окно 1,5–3 ч даёт близкий результат.
+    Не лучше (проверено): не переходить окном через смену силоса-источника; медиана; треугольные веса; окно,
+    симметрично сжатое у краёв ряда; локальная прямая вместо среднего. Цена — быстрые настоящие изменения входа сглаживаются (у начала ряда окно
+    одностороннее), на журналах она меньше выигрыша."""
+    h = INLET_SMOOTH_H if h is None else h
+    if not points or not h:
+        return list(points)
+    out = []
+    lo = hi = 0
+    n = len(points)
+    for t, _w in points:
+        while points[lo][0] < t - h:
+            lo += 1
+        while hi < n and points[hi][0] <= t + h:
+            hi += 1
+        out.append((t, sum(x[1] for x in points[lo:hi]) / (hi - lo)))
+    return out
+
+
 def _regime_timeline(prep: List[Dict], p: DryerParams) -> Dict[int, List[Tuple]]:
     """Режим по участкам журнала: [(t, Q, T, горелки выключены, D)] — от строки до следующей строки (D и T блоков в
     строке действуют с момента записи и дальше, пустая клетка — прежнее значение)."""
@@ -812,7 +843,7 @@ def observe_all(rows: List[Dict], p: DryerParams, use_lag: Optional[bool] = None
     """Журнал -> список наблюдений. Возвращает (наблюдения, отброшено по причинам, использован ли лаг)."""
     prep, reliable = prepare(rows)
     lag = reliable if use_lag is None else (use_lag and reliable)
-    series = _inlet_series(prep)
+    series = {s: smooth_inlet(pts) for s, pts in _inlet_series(prep).items()}     # вход — среднее проб за ±2 ч
     m_eff = p.lag_k * p.m_dryer
     timeline = _regime_timeline(prep, p) if lag and m_eff > 0 else {}
     obs: List[Dict] = []
@@ -1138,6 +1169,23 @@ def tolerance_for(rows: List[Dict], p: DryerParams, lam: float = 3.0, half_life_
     return replace(p, **unc), text
 
 
+def _error_by_moisture(par: DryerParams, used: List[Dict], arr: Dict[str, np.ndarray]) -> str:
+    """Ошибка w_вых по группам влажности входа (в «кукурузной» шкале: до 20, 20–27, выше 27 %). Общая ошибка зависит
+    от того, какого зерна в журнале больше: проба сырого зерна шумит в 2–3 раза сильнее пробы подсохшего, поэтому
+    журнал, пополненный первым проходом, показывает большую общую ошибку при той же модели."""
+    err = np.abs(predict_out(par, used, arr)[0] - arr["w_out"])
+    wc = np.array([corn_equiv(par, float(w)) for w in arr["w_in"]])
+    parts = []
+    for name, m in (("до 20 %", wc < 20.0), ("20–27 %", (wc >= 20.0) & (wc < 27.0)), ("выше 27 %", wc >= 27.0)):
+        if int(m.sum()) >= 5:
+            parts.append(f"{name} — ±{float(err[m].mean()):.2f} п.п. ({int(m.sum())} строк)")
+    if len(parts) < 2:
+        return "Вход — среднее проб за ±2 ч (одна проба шумит на ±0,3–0,9 п.п.)."
+    return ("По влажности входа" + (" (в пересчёте на кукурузу)" if not is_corn_scale(par) else "") + ": "
+            + "; ".join(parts) + ". Сырое зерно шумит сильнее — общая ошибка зависит от состава журнала. "
+            "Вход — среднее проб за ±2 ч.")
+
+
 def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_days: float = 0.0,
                   skipped: Optional[Dict[str, int]] = None, lag: bool = True, n_rows: Optional[int] = None,
                   report: bool = True) -> Tuple[DryerParams, Dict]:
@@ -1256,6 +1304,7 @@ def calibrate_obs(obs: List[Dict], p: DryerParams, lam: float = 3.0, half_life_d
         f"Ошибка прогноза w_вых по строкам: было ±{mae_old:.2f} п.п. (смещение {bias_old:+.2f}) → стало ±{mae:.2f} п.п. "
         f"(смещение {bias:+.2f}, максимум {mx:.2f})",
         f"Разброс R: ±{(math.exp(rmse_ln) - 1) * 100:.0f} %",
+        _error_by_moisture(emp, used, used_arr),
         "",
         "ФИЗИЧЕСКАЯ МОДЕЛЬ (тонкий слой Thompson + КПД слоя)" + (" (используется в расчётах)" if p.model_kind == "physics" else ""),
         f"КПД слоя η: {p.eta:.2f} → {eta:.2f} (κ = {kappa:.2f} задан вручную)"

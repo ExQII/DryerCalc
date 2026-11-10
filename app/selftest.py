@@ -498,6 +498,20 @@ def run(out_path: str) -> int:
               and not win._has_fitted_amb(),
               f"T нар в каждой строке, меняется с проходом: b_нар = {_p11.b_amb:+.2f} (физическая оценка), "
               f"R₀ = {_p11.r_ref:.2f}")
+        # --- v1.8.1: вход модели — среднее проб входа за ±2 ч ---
+        import app.calibration as _cal
+        from .calibration import observe_all as _oa, predict_out as _po
+
+        def _mae_h(_h: float) -> float:
+            _old, _cal.INLET_SMOOTH_H = _cal.INLET_SMOOTH_H, _h
+            try:
+                _o, _sk, _lg = _oa(rows, win.params)
+            finally:
+                _cal.INLET_SMOOTH_H = _old
+            _w = _po(win.params, _o)[0]
+            return sum(abs(float(a) - o["w_out"]) for a, o in zip(_w, _o)) / len(_o)
+        _m0, _m2 = _mae_h(0.0), _mae_h(2.0)
+        check(_m2 < _m0, f"вход — среднее проб за ±2 ч: ошибка w_вых по строкам примера ±{_m0:.2f} → ±{_m2:.2f} п.п.")
         # --- v1.8: культуры — своя модель и свой журнал у каждой; длинные пояснения свёрнуты ---
         from . import crops as _crops
         from .ui_common import Collapsible as _Coll

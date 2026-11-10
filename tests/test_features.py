@@ -1158,7 +1158,9 @@ def test_residence_follows_all_regimes_in_the_shaft():
     obs, _sk, _ = observe_all(jr, truth)
     w_pred, _ = predict_out(truth, obs)
     errs = [abs(float(a) - o["w_out"]) for a, o in zip(w_pred, obs)]
-    assert len(obs) >= 18 and max(errs) < 0.15
+    # вход — среднее проб за ±2 ч (calibration.smooth_inlet): синусоида входа ±2 п.п. сглажена на 7 %, а у начала
+    # ряда окно одностороннее — первые две пробы до 0,5 п.п.
+    assert len(obs) >= 18 and max(errs) < 0.5 and max(errs[2:]) < 0.25
     assert any(o["mixed"] for o in obs) and all(o["d_now"] == 50 for o in obs if o["mixed"])
     # чистая функция: постоянный D — как раньше (t − M/Q); смена D — время в шахте другое; охлаждение — нельзя
     tl = [(0.0, 20.0, 60.0, False, 35), (2.0, 30.0, 70.0, False, 50)]
@@ -1190,7 +1192,9 @@ def test_transit_profile_predicts_outlet_of_grain_in_shaft():
         real = truth_at(st.last + timedelta(hours=h))
         new_err.append(abs(float(np.interp(h, hs, prof["w"])) - real))
         old_err.append(abs(old - real))
-    assert prof["known"].all() and max(new_err) < 0.2 and max(old_err) > 1.0
+    # вход — среднее проб за ±2 ч, у «сейчас» окно одностороннее: на входе-синусоиде без шума проб (0,67 п.п./ч)
+    # это до 0,5 п.п.; на журналах с шумом проб прогноз шахты со средним точнее (README, v1.8.1)
+    assert prof["known"].all() and max(new_err) < 0.55 and sum(new_err) < sum(old_err)
 
 
 # ---------------------------------------------------------------------------
@@ -1524,7 +1528,7 @@ def test_sample_journal_passes_unchanged():
     assert [(x["batch"], x["pass_no"], x["end_kind"], x["batch_end"]) for x in ps] == [
         ("A", 3, "cool", True), ("B", 2, None, False), ("B", 3, "cool", True), ("C", 1, None, False)]
     p, rep = calibrate(rows, P)
-    assert rep["n_used"] == 120
+    assert rep["n_used"] == 121
 
 
 def test_startup_with_saved_settings_raises_nothing():
@@ -1791,7 +1795,7 @@ def test_default_start_model_is_calibrated_without_meter_bias():
     больше: показание выше истинной — съём меньше)."""
     rows, _ = read_journal(SAMPLE)
     p, rep = calibrate(rows, P)
-    assert P.out_bias == 0.0 and rep["n_used"] == 120
+    assert P.out_bias == 0.0 and rep["n_used"] == 121
     for k in ("r_ref", "b_w", "b_dt", "eta"):
         assert abs(getattr(p, k) - getattr(P, k)) < 0.01, k
     with_bias, _ = calibrate(rows, replace(P, out_bias=0.8))
@@ -2859,6 +2863,41 @@ def test_switch_crop_in_window():
     win.apply_mode(pilot.OPERATOR, save=False, log=False)
     assert not nav.isTabVisible(i_crop) and nav.lbl_app_sub.text() == "сушка кукурузы"
     win.close()
+
+
+def test_inlet_is_mean_of_samples_over_two_hours():
+    """1.8.1: вход модели — среднее проб входа за ±2 ч (шум одной пробы не идёт в прогноз и в подбор), вход для
+    совета — среднее за последние 2 ч. На журнале с шумом проб входа ошибка по строкам меньше, чем по одной пробе."""
+    import random
+    import app.calibration as cal
+    from app.calibration import observe_all, predict_out, smooth_inlet
+    pts = [(0.0, 30.0), (0.5, 32.0), (1.0, 31.0), (2.5, 34.0), (5.0, 20.0)]
+    sm = smooth_inlet(pts)
+    assert [t for t, _ in sm] == [t for t, _ in pts]
+    assert abs(sm[0][1] - 31.0) < 1e-9 and abs(sm[3][1] - (32.0 + 31.0 + 34.0) / 3) < 1e-9 and sm[4][1] == 20.0
+    assert smooth_inlet(pts, 0.0) == pts and smooth_inlet([]) == []
+    t0 = datetime(2026, 11, 2, 0, 0)
+    tp = [(t0 + timedelta(hours=h), w) for h, w in pts]                 # время — datetime, окно — timedelta
+    assert [round(w, 6) for _, w in smooth_inlet(tp, timedelta(hours=2))] == [round(w, 6) for _, w in sm]
+    truth, _ = calibrate(_sample_rows(), P)
+    jr, _truth_at, _ = _plug_flow_journal(truth, change_d=(99.0, 35), change_t=(99.0, 60))
+    rnd = random.Random(7)
+    noisy = [dict(r, w_in=(round(r["w_in"] + rnd.gauss(0.0, 0.8), 1) if r["w_in"] is not None else None)) for r in jr]
+
+    def mae(h):
+        old, cal.INLET_SMOOTH_H = cal.INLET_SMOOTH_H, h
+        try:
+            obs, _sk, _ = observe_all(noisy, truth)
+        finally:
+            cal.INLET_SMOOTH_H = old
+        w_pred, _ = predict_out(truth, obs)
+        return sum(abs(float(a) - o["w_out"]) for a, o in zip(w_pred, obs)) / len(obs)
+    assert mae(2.0) < 0.75 * mae(0.0)
+    st = live_state(noisy, truth)
+    last5 = [r["w_in"] for r in noisy if r["w_in"] is not None][-5:]
+    assert st.w_in_n == 5 and abs(st.w_in - sum(last5) / 5) < 1e-9 and st.w_in_last == last5[-1]
+    rep = calibrate(_sample_rows(), P)[1]["text"]
+    assert "По влажности входа: до 20 %" in rep and "выше 27 %" in rep and "среднее проб за ±2 ч" in rep
 
 
 def test_long_texts_are_collapsed():

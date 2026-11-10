@@ -2045,7 +2045,7 @@ class MainWindow(QMainWindow):
         for cb in (self.s_src, self.s_model):         # длинные пункты не раздувают ширину страницы
             cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             cb.setMinimumContentsLength(18)
-        self.s_rref = dspin(0.05, 100, 1.57, 3, 0.1, " т воды/ч")
+        self.s_rref = dspin(0.05, 100, 1.53, 3, 0.1, " т воды/ч")
         self.s_wref = dspin(10, 50, 22, 1, 1, " %")
         self.s_tref = dspin(20, 150, 60, 1, 0.5, " °C")
         self.s_tambref = dspin(-40, 45, 10, 1, 1, " °C")

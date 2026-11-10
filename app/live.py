@@ -42,7 +42,9 @@ class LiveState:
     seg: int = -1
     start: Optional[datetime] = None
     last: Optional[datetime] = None
-    w_in: Optional[float] = None
+    w_in: Optional[float] = None        # вход для расчётов: среднее проб входа за последние 2 ч
+    w_in_last: Optional[float] = None   # последняя проба входа как записана
+    w_in_n: int = 1                     # сколько проб в среднем
     w_out_read: Optional[float] = None
     d: Optional[float] = None
     t_proc: Optional[float] = None
@@ -93,7 +95,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
     """final_w — выше какой влажности выхода (истинной) рециркуляция — конец прохода, а не досушка партии
     (по умолчанию влажность хранения культуры + 1: у кукурузы 15 %; раздел «Текущий проход» передаёт Wк + 1 п.п.).
     now — считать выгрузку до этого момента (реальное время), но не дальше live_cap_h после последней записи."""
-    from .calibration import _t_proc, journal_passes, observe_all, pass_of_segment, prepare
+    from .calibration import INLET_SMOOTH_H, _t_proc, journal_passes, observe_all, pass_of_segment, prepare
     st = LiveState()
     if weather is not None:
         rows = weather.fill_rows(rows)
@@ -183,6 +185,16 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         elif st.fill_since is not None and st.fill_end is None:
             st.fill_end = r["dt"]
         st.series.append((r["dt"], r.get("w_in"), r.get("w_out")))
+    # Вход для совета — среднее проб входа за последние 2 ч (а не одна последняя проба): шум пробы ±0,3–0,9 п.п.
+    # иначе целиком уходит в совет. Повтор «как программа» по журналу ноября 2026: «Выход ≈» против пробы через τ —
+    # ±0,56 → ±0,44 п.п., совет D от пробы к пробе прыгал в среднем на 6,2 с → 2,5 с; октябрь — ±0,51 → ±0,48.
+    # Обрывать окно на смене силоса-источника — не лучше (проверено), пробы набора сушилки в среднее не идут.
+    st.w_in_last = st.w_in
+    if not rs[-1].get("fill"):
+        ins = [(r["dt"], r["w_in"]) for r in rs if r.get("w_in") is not None and not r.get("recirc") and not r.get("fill")]
+        if ins:
+            v = [w for t, w in ins if (ins[-1][0] - t).total_seconds() <= INLET_SMOOTH_H * 3600.0 + 1]
+            st.w_in, st.w_in_n = sum(v) / len(v), len(v)
     end = st.last
     if now is not None and now > st.last:
         gap_h = (now - st.last).total_seconds() / 3600.0
@@ -293,9 +305,9 @@ def _journal_regime(prep: List[Dict], p: mdl.DryerParams) -> Tuple[List[Tuple], 
         после рециркуляции конца прохода 06.11 — RMS 3,8 → 0,4;
       "fill" — набор сушилки: шахту заполняют, выгрузки нет (_walk_back берёт порции из зерна набора);
       "idle" — остановка, охлаждение, рециркуляция без горелок, нет D: зерно стоит, время не считается."""
-    from .calibration import _t_proc
+    from .calibration import INLET_SMOOTH_H, _t_proc, smooth_inlet
     tl: List[Tuple] = []
-    inlet: List[Tuple[datetime, float]] = []
+    by_pass: Dict[int, List[Tuple[datetime, float]]] = {}
     for r in prep:
         if r.get("dt") is None:
             continue
@@ -313,7 +325,11 @@ def _journal_regime(prep: List[Dict], p: mdl.DryerParams) -> Tuple[List[Tuple], 
             kind = "idle"
         tl.append((r["dt"], mdl.q_at(p, d) if ok else None, temp, kind == "run", d if ok else None, kind))
         if r.get("w_in") is not None and not r.get("recirc"):
-            inlet.append((r["dt"], r["w_in"]))
+            by_pass.setdefault((r.get("pass", 0), bool(r.get("fill"))), []).append((r["dt"], r["w_in"]))
+    # вход — среднее проб за ±2 ч в пределах прохода, как при калибровке (calibration.smooth_inlet); пробы набора
+    # сушилки — как записаны: по ним восстанавливается, какое зерно где лежит в шахте (_walk_back)
+    inlet = sorted(x for k, pts in by_pass.items()
+                   for x in (pts if k[1] else smooth_inlet(pts, timedelta(hours=INLET_SMOOTH_H))))
     return tl, inlet
 
 

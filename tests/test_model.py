@@ -96,7 +96,7 @@ def test_pass_time_is_mass_out_over_q():
 def test_single_pass_is_rejected_by_quality_limit():
     plan = plan_by_passes(P, C, 500.0, 34.0, 14.0, 1)
     assert plan.reaches_target
-    assert abs(plan.max_dw - 20.0) < 1.0
+    assert abs(plan.max_dw - 20.0) < 1.5         # D — целые секунды: у нижнего предела D = 10 съём с запасом
     assert plan.verdict(6, 10)[0] == 2
 
 

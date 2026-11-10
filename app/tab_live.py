@@ -529,7 +529,9 @@ class LiveTab(QWidget):
                       else f"{st.batch or '—'}"),
             "start": f"{st.start:%d.%m %H:%M}" if ok else "—",
             "last": (f"{st.last:%d.%m %H:%M}, через {fmt_hours(st.hours)}" if ok and st.last else "—"),
-            "w_in": f"{fnum(st.w_in)} %", "w_out": f"{fnum(st.w_out_read)} %",
+            "w_in": (f"{fnum(st.w_in)} % — среднее {st.w_in_n} проб за 2 ч (последняя {fnum(st.w_in_last)} %)"
+                     if st.w_in is not None and st.w_in_n > 1 and st.w_in_last is not None else f"{fnum(st.w_in)} %"),
+            "w_out": f"{fnum(st.w_out_read)} %",
             "d": (f"{fnum(st.d, 0)} с, Q = {fnum(q)} т/ч" if st.d else "—"),
             "t": f"{tp} °C, зерно {tg} °C", "unl": f"{fnum(st.unloaded, 0)} т",
             "silo": (f"{st.silo_w:.1f} % (влагомер {st.silo_w_read:.1f} %)" if st.silo_w is not None else "—"),
