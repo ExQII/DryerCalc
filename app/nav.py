@@ -11,9 +11,10 @@ currentIndex, setCurrentIndex, currentWidget, indexOf, isTabVisible, setTabVisib
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QModelIndex, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QModelIndex, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QSizePolicy,
                                QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QVBoxLayout, QWidget)
@@ -24,6 +25,9 @@ from .widgets import Glass
 
 PAGE_ROLE = Qt.UserRole + 1          # номер страницы у пункта меню (у заголовка раздела и отступа — -1)
 ICON_ROLE = Qt.UserRole + 2          # имя иконки (icons.py)
+
+
+_WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 
 
 class _NavDelegate(QStyledItemDelegate):
@@ -184,7 +188,21 @@ class NavPanel(_Root):
         self.lbl_sub = QLabel()
         self.lbl_sub.setObjectName("navSub")
         self.lbl_sub.setWordWrap(True)
-        rv.addWidget(self.lbl_title)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.addWidget(self.lbl_title)
+        head.addStretch(1)
+        # часы — на страницах, где записывают и смотрят «сейчас» (set_clock_pages): время пробы сверяют с ними
+        self.lbl_clock = QLabel()
+        self.lbl_clock.setObjectName("navClock")
+        self.lbl_clock.setToolTip("Время компьютера. По нему программа ставит время следующей пробы и считает «сейчас».")
+        self.lbl_clock.setVisible(False)
+        head.addWidget(self.lbl_clock, 0, Qt.AlignVCenter)
+        self._clock_pages: set = set()
+        self._clock_timer = QTimer(self)
+        self._clock_timer.setInterval(1000)
+        self._clock_timer.timeout.connect(self._tick_clock)
+        rv.addLayout(head)
         rv.addWidget(self.lbl_sub)
         rv.addSpacing(8)
         self.stack = QStackedWidget()
@@ -227,6 +245,26 @@ class NavPanel(_Root):
             self.setCurrentIndex(0)
         self._fit_width()
         return idx
+
+    def set_clock_pages(self, texts) -> None:
+        """На каких страницах показывать часы (дата и время компьютера) справа от заголовка."""
+        self._clock_pages = set(texts)
+        if 0 <= self._cur < len(self._pages):
+            self._show_clock(self._pages[self._cur]["text"] in self._clock_pages)
+
+    def _show_clock(self, on: bool) -> None:
+        self.lbl_clock.setVisible(on)
+        if on:
+            self._tick_clock()
+            self._clock_timer.start()
+        else:
+            self._clock_timer.stop()
+
+    def _tick_clock(self) -> None:
+        now = datetime.now()
+        txt = f"{_WEEKDAYS[now.weekday()]}, {now:%d.%m.%Y}   {now:%H:%M}"
+        if txt != self.lbl_clock.text():
+            self.lbl_clock.setText(txt)
 
     def setTabLabel(self, i: int, label: str) -> None:  # noqa: N802
         """Подпись пункта в меню (например, «Культура: рапс»); название страницы и tabText не меняются."""
@@ -274,6 +312,7 @@ class NavPanel(_Root):
         self.lbl_title.setText(pg["text"])
         self.lbl_sub.setText(pg["sub"])
         self.lbl_sub.setVisible(bool(pg["sub"]))
+        self._show_clock(pg["text"] in self._clock_pages)
         if self.list.currentItem() is not pg["item"]:
             self.list.blockSignals(True)
             self.list.setCurrentItem(pg["item"])

@@ -164,6 +164,7 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
     prep, reliable = prepare(rows)
     if not reliable:
         return {"passes": [], "hours": 0.0, "note": "в журнале не распознано время"}
+    nat_k = mdl.natura_k(p)
     pass_of = pass_of_segment(prep)
     sel = [r for r in prep if r.get("dt") is not None and (start is None or r["dt"] >= start)
            and (end is None or r["dt"] <= end)]
@@ -190,7 +191,8 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
         for a, b in zip(span, span[1:]):
             if (a.get("d_f") is not None and not a.get("stopped") and not a.get("fill") and not a.get("recirc")
                     and not a.get("loop")):
-                unloaded += mdl.q_at(p, a["d_f"]) * max((b["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
+                unloaded += (mdl.q_at(p, a["d_f"]) * nat_k(a["dt"])
+                             * max((b["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0)
         w_in_avg = sum(win) / len(win) if win else None
         w_out_avg = sum(wout) / len(wout) if wout else None
         tgs = [0.5 * (r["t_a1"] + r["t_a2"]) for r in dry if r.get("t_a1") is not None and r.get("t_a2") is not None]

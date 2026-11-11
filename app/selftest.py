@@ -500,6 +500,17 @@ def run(out_path: str) -> int:
               and not win._has_fitted_amb(),
               f"T нар в каждой строке, меняется с проходом: b_нар = {_p11.b_amb:+.2f} (физическая оценка), "
               f"R₀ = {_p11.r_ref:.2f}")
+        # --- v1.9.2: часы, натура зерна, номер прохода из журнала ---
+        from datetime import datetime as _dt92
+        _pn = mdl.set_natura(win.params, win.params.natura * 1.1, _dt92(2030, 1, 1))
+        _c92 = mdl.Conditions(60.0, 10.0, 70.0)
+        win.tabs.setCurrentIndex(win.tabs.indexOfText(_pages.JOURNAL))
+        check(abs(mdl.q_at(_pn, 35.0) - 1.1 * mdl.q_at(win.params, 35.0)) < 0.01 and _pn.r_ref == win.params.r_ref
+              and mdl.solve_pass(_pn, _c92, 24.0, 1.0, 35.0).w_out > mdl.solve_pass(win.params, _c92, 24.0, 1.0, 35.0).w_out
+              and abs(mdl.natura_k(_pn)(_dt92(2029, 1, 1)) - 1 / 1.1) < 1e-9 and win.s_natura.value() == win.params.natura
+              and bool(win.tabs.lbl_clock.text()) and bool(win.storage.get_json("pass_label_from")),
+              f"натура {win.params.natura:g} → {_pn.natura:g} г/л: Q(D) × 1,1, расход влаги тот же; прежние строки — "
+              f"с прежней натурой; часы в журнале: {win.tabs.lbl_clock.text()}")
         # --- v1.9.1: выключенные горелки проход не заканчивают, конец прохода — рециркуляция ---
         from .calibration import journal_passes as _jp91f, prepare as _prep91f
 

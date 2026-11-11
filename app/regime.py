@@ -18,7 +18,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from .calibration import FIELDS, TEXT_FIELDS, assign_times, insert_position, parse_ts, prepare
+from .calibration import FIELDS, TEXT_FIELDS, assign_times, insert_position, journal_passes, parse_ts, prepare
 
 QE_CARRY = ("t_amb", "t_up", "t_low", "d", "batch", "pass_no")   # что строка быстрого ввода переносит с прошлой записи
 AMB_CARRY_H = 3.0         # T наружная переносится, если записана не раньше чем за 3 ч до следующей пробы
@@ -51,6 +51,12 @@ def journal_carry(rows: List[Dict], interval_min: float = 30.0) -> Tuple[Dict[st
     last = prep[-1]
     vals: Dict[str, object] = {"t_up": last.get("t_up_f"), "t_low": last.get("t_low_f"), "d": last.get("d_f"),
                                "pass_no": last.get("pass_no"), "batch": (last.get("batch") or None)}
+    if vals["pass_no"] is not None:
+        # проход начат событием (подача после рециркуляции), а в журнале ещё прежний номер — предложить номер по
+        # счёту: сушильщик видит его в поле и либо оставляет, либо исправляет (тогда главнее журнал, см. prepare)
+        jp = journal_passes(prep)
+        if jp and jp[-1]["pass_auto"] and jp[-1]["pass"] == last.get("pass"):
+            vals["pass_no"] = float(jp[-1]["pass_no"])
     amb = next((r for r in reversed(prep) if r.get("t_amb") is not None), None)
     vals["t_amb"] = amb["t_amb"] if amb is not None else None
     if not reliable:

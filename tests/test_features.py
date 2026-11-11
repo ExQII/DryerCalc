@@ -2745,7 +2745,7 @@ def test_crop_profiles_and_start_model():
     c = mdl.Conditions(60.0, 10.0, 70.0)
     for crop in crops.CROPS[1:]:
         p = crops.start_params(crop, corn)
-        kd = crop.density / 700.0
+        kd = crop.density / 650.0            # натура культуры к натуре кукурузы, для которой записана Q(D)
         assert p.crop == crop.key and abs(mdl.q_full(p) - 52.0 * kd) < 0.01 and abs(p.m_dryer - 60.0 * kd) < 0.06
         assert p.w_eq == crop.eqv8 and p.w_ref == crop.eqv22 and abs(p.r_ref - 1.41 * crop.k_speed) < 1e-9
         assert p.calibrated and p.calib_info.startswith("стартовая") and p.rate_sigma == crops.START_SIGMA
@@ -3137,6 +3137,122 @@ def test_burners_off_do_not_end_pass_only_recirculation_does():
              "pass_no": 1, "note": ""}]
     prep, _ = prepare(fill)
     assert prep[-1]["fill"] and not prep[-1]["burner_off"]
+
+
+def test_natura_scales_throughput_and_keeps_history():
+    """1.9.2: натура зерна — Q(D) и вместимость × отношение натур, расход влаги не меняется (на лёгком зерне тот же
+    D сушит сильнее); строки журнала до смены натуры считаются с прежней."""
+    from app import crops
+    from app import model as mdl
+    from app.batches import journal_summary
+    from app.calibration import observe_all
+    assert P.natura == 650.0 and P.natura_log is None and mdl.natura_k(P)(datetime(2026, 11, 1)) == 1.0
+    assert mdl.set_natura(P, 650.0, datetime(2026, 11, 3)) is P
+    when = datetime(2026, 11, 2, 12, 0)
+    p2 = mdl.set_natura(P, 715.0, when)
+    k = 715.0 / 650.0
+    assert p2.natura == 715.0 and abs(q_at(p2, 35.0) - k * q_at(P, 35.0)) < 0.01 and abs(p2.m_dryer - 60.0 * k) < 0.06
+    assert p2.r_ref == P.r_ref and p2.eta == P.eta and p2.calibrated == P.calibrated
+    assert p2.natura_log == [["", 650.0], [when.isoformat(), 715.0]]
+    c = Conditions(60.0, 5.0, 70.0)
+    assert solve_pass(p2, c, 24.0, 1.0, 35.0).w_out > solve_pass(P, c, 24.0, 1.0, 35.0).w_out + 0.2   # тяжелее — съём меньше
+    assert abs(solve_pass(p2, c, 24.0, 1.0, mdl.d_at(p2, q_at(P, 35.0))).w_out - solve_pass(P, c, 24.0, 1.0, 35.0).w_out) < 1e-6
+    nk = mdl.natura_k(p2)
+    assert abs(nk(datetime(2026, 11, 2, 11, 59)) - 1 / k) < 1e-12 and nk(when) == 1.0 and nk(None) == 1.0
+    p3 = mdl.set_natura(p2, 650.0, datetime(2026, 11, 5))                 # вернули — таблица прежняя
+    assert abs(q_at(p3, 35.0) - q_at(P, 35.0)) < 0.01 and len(p3.natura_log) == 3
+    # журнал: проход 1 записан до смены натуры, проход 2 — после
+    rows = _two_pass_journal()                                            # 02.11 00:00 … ; проход 2 с 13:30
+    js0 = journal_summary(rows, P, None, None)["passes"]
+    js2 = journal_summary(rows, p2, None, None)["passes"]
+    assert abs(js0[0]["unloaded"] - q_at(P, 35.0) * 10.5) < 0.5           # проход 1: 10,5 ч подачи, до 12:00
+    assert abs(js2[0]["unloaded"] - js0[0]["unloaded"]) < 0.05            # до смены натуры — те же тонны
+    assert abs(js2[1]["unloaded"] - k * js0[1]["unloaded"]) < 0.05        # после — по новой натуре
+    o0, _s0, _ = observe_all(rows, P)
+    o2, _s2, _ = observe_all(rows, p2)
+    early0 = [o for o in o0 if o["dt"] < when]
+    early2 = [o for o in o2 if o["dt"] < when]
+    assert early0 and len(early0) == len(early2)
+    for a, b in zip(early0, early2):                                      # прежние строки: тот же расход и тот же R
+        assert abs(q_at(P, a["d"]) - q_at(p2, b["d"])) < 1e-6 and abs(a["r"] - b["r"]) < 1e-9
+    # культуры: стартовая модель — по натуре культуры к натуре кукурузы
+    pw = crops.start_params(crops.get("wheat"), p2)
+    assert pw.natura == 750.0 and pw.natura_log is None and abs(q_at(pw, 35.0) - q_at(p2, 35.0) * 750.0 / 715.0) < 0.01
+    # окно: поле «Натура зерна» в настройках
+    win = _window("natura19.db")
+    assert win.s_natura.value() == 650.0
+    q0, m0, r0 = q_at(win.params, 35.0), win.params.m_dryer, win.params.r_ref
+    win.s_natura.setValue(700.0)
+    win._apply_settings()
+    pn = win.params
+    assert pn.natura == 700.0 and abs(q_at(pn, 35.0) - q0 * 700 / 650) < 0.01 and abs(pn.m_dryer - m0 * 700 / 650) < 0.06
+    assert pn.r_ref == r0 and pn.calibrated and len(pn.natura_log) == 2 and abs(win.s_mdryer.value() - round(pn.m_dryer)) < 1
+    win._apply_settings()                                                 # повторное «Применить» ничего не множит
+    assert abs(q_at(win.params, 35.0) - q_at(pn, 35.0)) < 1e-9 and len(win.params.natura_log) == 2
+    win.close()
+
+
+def test_pass_number_from_journal_beats_count_by_recirculation():
+    """1.9.2: после рециркуляции и подачи программа считает новый проход и предлагает его номер в быстром вводе; если
+    в журнале (в строках после события) вписан прежний номер — главнее журнал: проход тот же."""
+    import app.calibration as cal
+    from app.calibration import journal_passes, prepare
+    from app.regime import journal_carry
+    t0 = datetime(2026, 12, 1, 0, 0)
+
+    def row(k, note="", w_in=30.0, w_out=24.0, no=1.0):
+        return {"ts": (t0 + timedelta(minutes=30 * k)).strftime("%d.%m.%y %H:%M"), "w_in": w_in, "w_out": w_out,
+                "t_up": 60.0, "t_low": 60.0, "d": 35.0, "batch": "7", "pass_no": no, "note": note}
+    head = ([row(0, "Запуск, сушим с 1 с.", w_out=None)] + [row(k) for k in range(1, 8)]
+            + [row(8, "Рециркуляция", None, 23.0), row(9, "", None, 22.5), row(10, "Сушим с 2 с.", 29.0, 23.0)])
+    old = cal.LABEL_FROM
+    try:
+        cal.LABEL_FROM = datetime(2026, 11, 30)
+        # событие начало проход 2; номер в журнале ещё 1 — быстрый ввод предлагает 2
+        jp = journal_passes(prepare(head)[0], P)
+        assert [(x["pass_no"], x["pass_auto"]) for x in jp] == [(1.0, False), (2, True)]
+        assert journal_carry(head)[0]["pass_no"] == 2.0
+        # сушильщик согласился (вписано 2) — два прохода
+        ok = head + [row(11, no=2.0), row(12, no=2.0)]
+        jp = journal_passes(prepare(ok)[0], P)
+        assert [(x["pass_no"], x["pass_auto"]) for x in jp] == [(1.0, False), (2.0, False)]
+        assert journal_carry(ok)[0]["pass_no"] == 2.0
+        # сушильщик исправил на 1 — это тот же проход: один проход, «выгружено» с его начала
+        fixed = head + [row(11, no=1.0), row(12, no=1.0)]
+        prep, _ = prepare(fixed)
+        jp = journal_passes(prep, P)
+        assert len(jp) == 1 and jp[0]["pass_no"] == 1.0 and not jp[0]["pass_auto"] and len({r["pass"] for r in prep}) == 1
+        assert journal_carry(fixed)[0]["pass_no"] == 1.0
+        st = live_state(fixed, P)
+        assert st.pass_no == 1.0 and st.start == t0 and st.unloaded > q_at(P, 35.0) * 4.5
+        # пустая клетка «Проход» — не исправление: счёт по рециркуляции остаётся
+        blank = head + [row(11, no=None), row(12, no=None)]
+        assert [x["pass_no"] for x in journal_passes(prepare(blank)[0], P)] == [1.0, 2]
+        # позже номер сменили на 2 — новый проход начинается с этой строки
+        later = fixed + [row(13, "Рециркуляция", None, 18.0), row(14, "Сушим с 1 с.", 24.0, 19.0), row(15, no=2.0)]
+        assert [x["pass_no"] for x in journal_passes(prepare(later)[0], P)] == [1.0, 2.0]
+        # журнал, который вели до этого правила (строки раньше LABEL_FROM): номер «отстал» — считаем сами, как раньше
+        cal.LABEL_FROM = datetime(2026, 12, 31)
+        assert [x["pass_no"] for x in journal_passes(prepare(fixed)[0], P)] == [1.0, 2]
+        cal.LABEL_FROM = None
+        assert [x["pass_no"] for x in journal_passes(prepare(fixed)[0], P)] == [1.0, 2]
+    finally:
+        cal.LABEL_FROM = old
+
+
+def test_clock_on_journal_and_live_pages():
+    """1.9.2: часы (дата и время компьютера) — в заголовке «Журнала проб» и «Текущего прохода», на остальных нет."""
+    from app import pages
+    win = _window("clock19.db")
+    win.show()
+    for name in (pages.JOURNAL, pages.LIVE):
+        win.tabs.setCurrentIndex(win.tabs.indexOfText(name))
+        txt = win.tabs.lbl_clock.text()
+        assert win.tabs.lbl_clock.isVisibleTo(win) and datetime.now().strftime("%d.%m.%Y") in txt and ":" in txt[-5:]
+    win.tabs.setCurrentIndex(win.tabs.indexOfText(pages.SETTINGS))
+    assert not win.tabs.lbl_clock.isVisibleTo(win) and not win.tabs._clock_timer.isActive()
+    assert win.storage.get_json("pass_label_from")                     # момент, с которого журнал главнее счёта
+    win.close()
 
 
 def test_long_texts_are_collapsed():

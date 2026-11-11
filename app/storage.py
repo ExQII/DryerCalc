@@ -92,6 +92,8 @@ class Storage:
         except (TypeError, ValueError):
             d = None
         if isinstance(d, dict):
+            if "natura" not in d and crop != crops.DEFAULT:
+                d["natura"] = crops.get(crop).density      # модель культуры сохранена до 1.9.2 — натура её профиля
             return DryerParams.from_dict(d)
         return crops.start_params(crops.get(crop), self.params_of(crops.DEFAULT) if crop != crops.DEFAULT else None)
 

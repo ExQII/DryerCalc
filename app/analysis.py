@@ -200,6 +200,7 @@ def batch_meter_points(batches: Sequence[Dict], rows: List[Dict], p: mdl.DryerPa
         return []
     pass_of = pass_of_segment(prep)
     out: List[Dict] = []
+    nat_k = mdl.natura_k(p)
     for b in batches:
         lab = _f(b.get("w_out"))
         t0, t1 = parse_when(str(b.get("start") or "")), parse_when(str(b.get("end") or ""))
@@ -225,7 +226,7 @@ def batch_meter_points(batches: Sequence[Dict], rows: List[Dict], p: mdl.DryerPa
         for a, nb in zip(lst, lst[1:]):
             if a.get("d_f") is None or a.get("stopped") or a.get("fill") or a.get("recirc") or a.get("loop"):
                 continue
-            dm = mdl.q_at(p, a["d_f"]) * max((nb["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
+            dm = mdl.q_at(p, a["d_f"]) * nat_k(a["dt"]) * max((nb["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
             if dm <= 0:
                 continue
             ha = (a["dt"] - lst[0]["dt"]).total_seconds() / 3600.0

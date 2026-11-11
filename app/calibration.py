@@ -38,7 +38,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .model import (DryerParams, corn_equiv, d_at, is_corn_scale, pass_rate_arr, q_at, solve_out_arr,
+from .model import (DryerParams, corn_equiv, d_at, is_corn_scale, natura_k, pass_rate_arr, q_at, solve_out_arr,
                     true_from_read)
 
 FIELDS = ["ts", "w_in", "w_out", "t_a1", "t_a2", "t_up", "t_low", "d", "note", "batch", "pass_no", "t_amb", "rh"]
@@ -397,6 +397,12 @@ def assign_times(rows: List[Dict]) -> Tuple[List[Optional[datetime]], bool]:
     return out, reliable
 
 
+# С какого момента номер «Проход» в журнале главнее счёта проходов по рециркуляциям (см. prepare). None — никогда:
+# так разбираются журналы, которые вели до версии 1.9.2 (быстрый ввод тогда переносил прежний номер сам, и после
+# рециркуляции его забывали сменить). Окно программы ставит сюда момент первого запуска 1.9.2 на этой базе.
+LABEL_FROM: Optional[datetime] = None
+
+
 def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
     """Добавляет к строкам: dt, t (часы от начала), seg, pass, recirc, burner_off, cool; переносит блоки, D, «Партия»
     и «Проход» вперёд (batch_f, pass_f — пустая клетка значит «как выше»).
@@ -404,7 +410,8 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
     pass — проход. Новый начинается: со сменой «Партия» или «Проход»; или когда проход уже закончился — была
       рециркуляция после сушки (только она: выключенные горелки и «охлаждение» проход не заканчивают) — и снова
       пошла подача из силоса — «сушим с …», «открыли с …», «Запуск» — или записи возобновились после перерыва
-      больше 1,5 ч. Переключение силосов внутри прохода, остановки и перерывы
+      больше 1,5 ч. Если после такого события в строках журнала (не раньше LABEL_FROM) вписан прежний номер
+      «Проход» — журнал главнее: это тот же проход, новый не начинается. Переключение силосов внутри прохода, остановки и перерывы
       проход НЕ делят: «выгружено» и средняя влажность приёмного силоса считаются за весь проход.
     seg — участок, кусок непрерывной работы для калибровки: его режут ещё остановка / пуск, загрузка / зачистка и
       перерыв больше 1,5 ч (после остановки связь «вход τ назад — выход сейчас» начинается заново).
@@ -442,6 +449,7 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
     was_zero = False                    # обе уставки блоков были 0 (горелки выключены по режиму)
     fill = stopped = False
     lag = None                          # проход начат событием, а «Проход» в журнале ещё прежний: (партия, номер)
+    tent: Optional[int] = None          # с какой строки prep начат такой проход (пока номер не подтверждён)
     loop = False                        # рециркуляция через силос: выгрузка в тот же силос
     ended = False                       # проход закончен (рециркуляция / охлаждение): следующая подача — новый проход
     dried = False                       # в проходе уже сушили: была проба выхода вне рециркуляции и охлаждения
@@ -468,10 +476,26 @@ def prepare(rows: List[Dict]) -> Tuple[List[Dict], bool]:
         key_changed = i > 0 and key != prev_key
         if (key_changed and lag is not None and not ended and batch == lag[0] and pass_no is not None
                 and lag[1] is not None and abs(pass_no - (lag[1] + 1)) < 1e-9):
-            key_changed, lag = False, None                  # номер «Проход» догнал проход, начатый событием
+            key_changed, lag, tent = False, None, None      # номер «Проход» догнал проход, начатый событием
+        own_no = r.get("pass_no")
+        if (lag is not None and tent is not None and not key_changed and own_no is not None and lag[1] is not None
+                and batch == lag[0] and abs(own_no - lag[1]) < 1e-9
+                and LABEL_FROM is not None and dt is not None and dt >= LABEL_FROM):
+            # Проход начат событием (подача после рециркуляции), но в журнале и в следующих строках стоит ПРЕЖНИЙ
+            # номер «Проход». Журнал главнее счёта по рециркуляциям: это тот же проход — рециркуляция была посреди
+            # него. Строки, отнесённые к «новому» проходу, возвращаются в прежний. (Строка самого события не в счёт:
+            # её номер вписан до события. Быстрый ввод после события сам предлагает следующий номер — journal_carry,
+            # так что прежний номер в следующих строках — это исправление человеком.) Только для строк не раньше
+            # LABEL_FROM: в журналах, которые вели до этого правила, номер после рециркуляции просто забывали сменить.
+            for q in prep[tent:]:
+                q["pass"] = pass_idx - 1
+            pass_idx -= 1
+            lag = tent = None
+            dried = True
         new_pass = i > 0 and (key_changed or (ended and (feed or gap)) or (through and dried))
         if new_pass:
             lag = key if (not key_changed and key == prev_key) else None
+            tent = len(prep) if lag is not None else None
         warm_end = recirc and warmup and feed and not new_pass       # прогрев кончился: пошла подача — сушка
         brk = i > 0 and (new_pass or gap or warm_end or any(w in note for w in BREAK_WORDS))
         if brk:
@@ -857,6 +881,7 @@ def observe_all(rows: List[Dict], p: DryerParams, use_lag: Optional[bool] = None
     prep, reliable = prepare(rows)
     lag = reliable if use_lag is None else (use_lag and reliable)
     series = {s: smooth_inlet(pts) for s, pts in _inlet_series(prep).items()}     # вход — среднее проб за ±2 ч
+    nat_k = natura_k(p)                 # натура, действовавшая при записи строки, к нынешней (model.natura_k)
     m_eff = p.lag_k * p.m_dryer
     timeline = _regime_timeline(prep, p) if lag and m_eff > 0 else {}
     obs: List[Dict] = []
@@ -911,6 +936,12 @@ def observe_all(rows: List[Dict], p: DryerParams, use_lag: Optional[bool] = None
         if t_proc is None:
             skip("нет температуры")
             continue
+        kn = nat_k(r.get("dt"))
+        if abs(kn - 1.0) > 1e-9:
+            # строка записана при другой натуре: тонн в час тогда шло в kn раз больше, чем даёт нынешняя таблица.
+            # D в наблюдении — то, при котором нынешняя таблица даёт тот же расход (модель считает съём по Q)
+            q *= kn
+            d = d_at(p, q)
         tg = 0.5 * (r["t_a1"] + r["t_a2"]) if r.get("t_a1") is not None and r.get("t_a2") is not None else None
         w_true = true_from_read(p, w_out, tg)
         dw = w_in - w_true

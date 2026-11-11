@@ -96,6 +96,7 @@ class MainWindow(QMainWindow):
         # оформление — до того, как строятся страницы: шрифт, палитра и общий QSS (design.py)
         self.ui_theme = (self.storage.get_json("ui_theme", {}) or {}).get("mode", "system")
         design.apply(QApplication.instance(), self.ui_theme, QApplication.font().pointSizeF())
+        self._load_label_from()
         self.params: mdl.DryerParams = migrate_params(self.storage)
         self.plans: List[mdl.Plan] = []
         self._loading = False
@@ -140,6 +141,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(tabs)
         for name, section, sub in pg.PAGES:
             tabs.addTab(built[name], name, section, sub, icon=pg.ICONS.get(name))
+        tabs.set_clock_pages({pg.JOURNAL, pg.LIVE})             # часы — там, где записывают пробы и смотрят «сейчас»
         tabs.setCurrentIndex(tabs.indexOfText(pg.JOURNAL))      # работа начинается с журнала, а не с выбора культуры
         tabs.currentChanged.connect(self._tab_changed)
         self._crop_ui()
@@ -1368,6 +1370,19 @@ class MainWindow(QMainWindow):
         self._qe_prefill(after_add=True)
         self.qe["w_in"].setFocus()
 
+    def _load_label_from(self) -> None:
+        """С какого момента номер «Проход» из журнала главнее счёта по рециркуляциям (calibration.LABEL_FROM):
+        первый запуск версии с этим правилом на этой базе. Строки журнала старше разбираются по-прежнему."""
+        from . import calibration as _cal
+        v = self.storage.get_json("pass_label_from")
+        if not v:
+            v = datetime.now().replace(microsecond=0).isoformat()
+            self.storage.set_json("pass_label_from", v)
+        try:
+            _cal.LABEL_FROM = datetime.fromisoformat(v)
+        except ValueError:
+            _cal.LABEL_FROM = None
+
     def _confirm_sample(self, doubts: List[str]) -> bool:
         """Проба далеко от последних проб того же потока (entry.sample_doubt) — переспросить: опечатка или так и есть."""
         box = QMessageBox(self)
@@ -2050,7 +2065,7 @@ class MainWindow(QMainWindow):
         gb = QGroupBox("Производительность выгрузки Q(D)")
         gb.setMaximumWidth(380)
         gv = QVBoxLayout(gb)
-        lb = mute(QLabel("т/ч по листу пересчёта сушилки; для другой культуры — по её плотности"))
+        lb = mute(QLabel("т/ч по листу пересчёта сушилки — для натуры из поля «Натура зерна»"))
         lb.setWordWrap(True)
         gv.addWidget(lb)
         self.s_qtbl = QTableWidget(0, 2)
@@ -2106,6 +2121,12 @@ class MainWindow(QMainWindow):
 
         gb = QGroupBox("Сушилка и зерно")
         f = QFormLayout(gb)
+        self.s_natura = dspin(250, 900, 650, 0, 5, " г/л")
+        self.s_natura.setToolTip(
+            "Натура (масса литра зерна) партии, которую сушите. Выгрузка сушилки объёмная: при том же D тонн в час "
+            "идёт пропорционально натуре. Сменили натуру — программа умножит таблицу Q(D) и вместимость сушилки на "
+            "отношение натур; новая натура действует с момента «Применить», прежние строки журнала считаются со своей.")
+        f.addRow("Натура зерна", self.s_natura)
         f.addRow("Вместимость сушилки", self.s_mdryer)
         ov = QHBoxLayout()
         ov.setSpacing(8)
@@ -2356,6 +2377,7 @@ class MainWindow(QMainWindow):
     def _reload_all(self) -> None:
         self._ready = False
         self.storage.load_crop()                 # после восстановления копии активная культура — из неё
+        self._load_label_from()
         self.params = migrate_params(self.storage)
         self.tbl_j.setRowCount(0)
         self._load_journal_into_table()
@@ -2421,9 +2443,9 @@ class MainWindow(QMainWindow):
             self.s_qtbl.setItem(i, 1, QTableWidgetItem(f"{q:g}"))
 
     def _reset_qtable(self) -> None:
-        """Линейная таблица по листу пересчёта: 0,52 т/ч на секунду D для кукурузы, для другой культуры — по её
-        насыпной плотности."""
-        k = 0.52 * self.crop().density / crops.get(crops.DEFAULT).density
+        """Линейная таблица по листу пересчёта: 0,52 т/ч на секунду D при натуре 650 г/л, для другой натуры —
+        пропорционально."""
+        k = 0.52 * self.params.natura / 650.0
         self._fill_qtable([[d, round(k * d, 2)] for d in range(10, 101, 5)])
 
     def _read_qtable(self) -> Optional[List[List[float]]]:
@@ -2443,6 +2465,7 @@ class MainWindow(QMainWindow):
         p = self.params
         self._fill_qtable(p.q_table)
         self.s_mdryer.setValue(p.m_dryer)
+        self.s_natura.setValue(p.natura)
         self.s_overhead.setValue(p.overhead_h)
         self.s_bias.setValue(p.out_bias)
         self.s_kw.setValue(p.out_kw)
@@ -2508,6 +2531,7 @@ class MainWindow(QMainWindow):
                               unc_feats=old.unc_feats, unc_cov=old.unc_cov, unc_lev=old.unc_lev,
                               struct_base=old.struct_base, explored=old.explored,
                               crop=old.crop, w_store=old.w_store, eqv8=old.eqv8, eqv22=old.eqv22,
+                              natura=old.natura, natura_log=old.natura_log,
                               **vals)
         q_changed = any(abs(mdl.q_at(new, d) - mdl.q_at(old, d)) > 1e-6 for d in (20, 35, 60, 100))
         if q_changed or any(getattr(new, k) != getattr(old, k) for k in self._MODEL_KEYS):
@@ -2521,6 +2545,16 @@ class MainWindow(QMainWindow):
                                     "переключён на «Блоки».")
             new.temp_source = "block"
         self.sm_over.setValue(new.overhead_h)
+        nat = self.s_natura.value()
+        if abs(nat - new.natura) >= 0.5:
+            # натура — последним шагом: Q(D) и вместимость × отношение натур, калибровка остаётся (расход влаги —
+            # свойство сушилки), прежние строки журнала считаются с прежней натурой (model.set_natura)
+            k = nat / new.natura
+            new = mdl.set_natura(new, nat, datetime.now())
+            self.storage.log_event("natura", {"natura": nat, "k": round(k, 4)})
+            self.statusBar().showMessage(
+                f"Натура {fmt_num(nat)} г/л: Q(D) и вместимость сушилки умножены на {k:.3f}".replace(".", ",")
+                + f" (Q при D = 100 с — {new.q100:.1f} т/ч, в шахте {new.m_dryer:.0f} т).".replace(".", ",", 1), 20000)
         self.set_params(new)
 
     def _reset_settings(self) -> None:

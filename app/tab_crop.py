@@ -78,7 +78,8 @@ class _Card(QFrame):
             lim.append(f"блоки до {p.t_agent_max:g}{nb}°C")
         if lim:
             lines.append("Нагрев: " + ", ".join(lim))
-        lines.append(f"Выгрузка до {_num(mdl.q_full(p), 0)}{nb}т/ч  ·  в шахте {_num(p.m_dryer, 0)}{nb}т")
+        lines.append(f"Натура {_num(p.natura, 0)}{nb}г/л  ·  до {_num(mdl.q_full(p), 0)}{nb}т/ч  ·  в шахте "
+                     f"{_num(p.m_dryer, 0)}{nb}т")
         self.lbl_facts.setText("\n".join(lines))
         rows = info["rows"]
         if p.calib_info.startswith("стартовая"):

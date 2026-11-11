@@ -209,11 +209,12 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
           for r in rs if r.get("w_out") is not None and not r.get("recirc") and not r.get("loop")]
     t_rd = [(t - rs[0]["dt"]).total_seconds() / 3600.0 for t, _, _ in rd]
     unloaded = silo_sum = silo_sum_read = 0.0
+    nat_k = mdl.natura_k(p)
     for a, b in zip(rs, rs[1:] + [None]):
         t_next = b["dt"] if b is not None else end
         if (a.get("d_f") is not None and not a.get("stopped") and not a.get("fill") and not a.get("recirc")
                 and not a.get("loop")):
-            dm = mdl.q_at(p, a["d_f"]) * max((t_next - a["dt"]).total_seconds(), 0.0) / 3600.0
+            dm = mdl.q_at(p, a["d_f"]) * nat_k(a["dt"]) * max((t_next - a["dt"]).total_seconds(), 0.0) / 3600.0
             unloaded += dm
             if rd and dm > 0:
                 ha = (a["dt"] - rs[0]["dt"]).total_seconds() / 3600.0

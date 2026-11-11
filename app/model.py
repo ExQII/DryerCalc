@@ -43,7 +43,7 @@ R_ref и показатели калибруются по журналу суш�
 from __future__ import annotations
 
 from bisect import bisect_left
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timedelta
 from math import exp, log, sqrt
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -58,6 +58,8 @@ class DryerParams:
     q100: float = 52.0        # т/ч выгруженного зерна при D = 100 (лист пересчёта, натура 0,65)
     q_table: Optional[List[List[float]]] = None  # [[D, Q], ...]; None — линейно от q100
     m_dryer: float = 60.0     # т, вместимость сушилки (время пребывания зерна)
+    natura: float = 650.0     # г/л — натура зерна, для которой записаны q100 / q_table и m_dryer (set_natura)
+    natura_log: Optional[List[List]] = None   # [[ISO-время «действует с» или "", натура], …]; None — всегда natura
     r_ref: float = 1.53       # т воды/ч в опорных условиях (калибруется по журналу)
     w_ref: float = 22.0       # опорная влажность, %
     t_ref: float = 60.0       # опорная температура процесса, °C
@@ -161,6 +163,55 @@ def d_at(p: DryerParams, q: float) -> float:
 
 def q_full(p: DryerParams) -> float:
     return q_at(p, 100.0)
+
+
+# ----------------------------------------------------------------------------
+# Натура зерна. Выгрузка сушилки объёмная: за секунду D уходит один и тот же объём, а тонн — пропорционально
+# натуре (насыпной плотности). Таблица Q(D) и вместимость шахты записаны для натуры p.natura; сменили натуру —
+# они умножаются на отношение натур (set_natura). Расход влаги R (т воды/ч) при этом не трогается: это свойство
+# сушилки, поэтому на более лёгком зерне тот же D даёт больший съём, и наоборот.
+#
+# Строки журнала, записанные до смены натуры, считаются со своей натурой: natura_log хранит, с какого момента
+# действует каждое значение, natura_k(p)(dt) — множитель к Q(D) для строки со временем dt. Без этого смена натуры
+# задним числом меняла бы «выгружено» прошлых проходов и сбивала калибровку.
+# ----------------------------------------------------------------------------
+
+def set_natura(p: DryerParams, value: float, when) -> DryerParams:
+    """Новая натура value (г/л), действует с момента when (datetime): Q(D) и вместимость × value / прежняя."""
+    value = float(value)
+    if value <= 0 or abs(value - p.natura) < 1e-9:
+        return p
+    k = value / p.natura
+    log = [list(x) for x in (p.natura_log or [["", p.natura]])]
+    ts = when.replace(microsecond=0).isoformat()
+    log = [x for x in log if not x[0] or x[0] < ts] + [[ts, value]]
+    table = [[float(d), round(float(q) * k, 3)] for d, q in p.q_table] if p.q_table else None
+    return replace(p, natura=value, natura_log=log, q100=round(p.q100 * k, 3), q_table=table,
+                   m_dryer=round(p.m_dryer * k, 1))
+
+
+def natura_k(p: DryerParams):
+    """Функция dt → множитель к q_at(p, D) для строки журнала со временем dt: натура, действовавшая тогда, к
+    нынешней. Без истории натуры (или dt = None) — 1."""
+    log = p.natura_log
+    if not log or len(log) < 2 or p.natura <= 0:
+        return lambda _dt: 1.0
+    pts = []
+    for ts, val in log:
+        try:
+            pts.append((datetime.fromisoformat(ts) if ts else None, float(val)))
+        except (TypeError, ValueError):
+            continue
+
+    def k(dt) -> float:
+        if dt is None or not pts:
+            return 1.0
+        cur = pts[0][1]
+        for t0, val in pts:
+            if t0 is None or t0 <= dt:
+                cur = val
+        return cur / p.natura
+    return k
 
 
 @dataclass
