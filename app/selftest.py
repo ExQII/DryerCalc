@@ -500,6 +500,21 @@ def run(out_path: str) -> int:
               and not win._has_fitted_amb(),
               f"T нар в каждой строке, меняется с проходом: b_нар = {_p11.b_amb:+.2f} (физическая оценка), "
               f"R₀ = {_p11.r_ref:.2f}")
+        # --- v1.9.1: выключенные горелки проход не заканчивают, конец прохода — рециркуляция ---
+        from .calibration import journal_passes as _jp91f, prepare as _prep91f
+
+        def _r91(k, note="", w_in=30.0, w_out=24.0, t=None):
+            return {"ts": f"02.11.26 {k // 2:02d}:{30 * (k % 2):02d}", "w_in": w_in, "w_out": w_out, "t_up": t,
+                    "t_low": t, "d": 35.0, "batch": "1", "pass_no": None, "note": note}
+        _j91 = ([_r91(0, "Запуск, сушим с 1 с.", w_out=None, t=60.0)] + [_r91(k) for k in range(1, 6)]
+                + [_r91(6, "Охлаждение")] + [_r91(7), _r91(8, "Запуск")] + [_r91(k) for k in range(9, 14)]
+                + [_r91(14, "Рециркуляция", None, 14.5), _r91(15, "Охлаждение", None, None)])
+        _p91, _ok91 = _prep91f(_j91)
+        _jp91 = _jp91f(_p91, win.params)
+        check(len(_jp91) == 1 and _jp91[0]["end_kind"] == "cool" and _p91[7]["burner_off"] and not _p91[7]["cool"]
+              and not _p91[9]["burner_off"] and _p91[15]["cool"],
+              "горелки выключили посреди прохода и включили — проход один; конец прохода — рециркуляция, "
+              "охлаждение после неё — конец партии")
         # --- v1.9: проверка пробы и пары при вводе, две пробы, Q(D) по весовой, накладные по журналу ---
         from . import entry as _entry
         from .batches import overhead_from_journal as _ovj, scale_q as _scale_q

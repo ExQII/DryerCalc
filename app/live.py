@@ -126,7 +126,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         mine = [x for x in jp if x["batch_no"] == info["batch_no"]]
         for x in mine[: mine.index(info) + 1]:
             wins = [r["w_in"] for r in prep if r.get("pass", 0) == x["pass"] and r.get("w_in") is not None
-                    and not r.get("recirc") and not r.get("burner_off")]
+                    and not r.get("recirc")]
             st.batch_passes.append({"pass_no": x["pass_no"], "w_in": sum(wins) / len(wins) if wins else None,
                                     "n_in": len(wins), "w_end": x["w_end"], "start": x["start"]})
         st.batch, st.pass_no, st.pass_auto = info["batch"], info["pass_no"], info["pass_auto"]
@@ -212,7 +212,7 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
     for a, b in zip(rs, rs[1:] + [None]):
         t_next = b["dt"] if b is not None else end
         if (a.get("d_f") is not None and not a.get("stopped") and not a.get("fill") and not a.get("recirc")
-                and not a.get("burner_off") and not a.get("loop")):
+                and not a.get("loop")):
             dm = mdl.q_at(p, a["d_f"]) * max((t_next - a["dt"]).total_seconds(), 0.0) / 3600.0
             unloaded += dm
             if rd and dm > 0:
@@ -253,8 +253,13 @@ def live_state(rows: List[Dict], p: mdl.DryerParams, now: Optional[datetime] = N
         st.corr = sum(res) / (len(res) + 3.0)
         st.corr_n = len(res)
     if st.burner_off:
-        st.message = ("Горелки выключены (в журнале «охлаждение» / «откл. т.б.»): проход закончен, идёт охлаждение. "
-                      "Для рециркуляции — раздел «Досушка».")
+        if st.end_kind:
+            st.message = ("Горелки выключены после рециркуляции: подача прохода закончена, идёт охлаждение. "
+                          "Для рециркуляции — раздел «Досушка».")
+        else:
+            st.message = ("Горелки выключены (в журнале «охлаждение» / «откл. т.б.» или T блоков 0) — сушки нет, проход "
+                          "продолжается. Включили горелки — запишите «Запуск» или T блоков через «Изменить режим…». "
+                          "Проход закончен — запишите «Рециркуляция».")
         return st
     if start and st.w_in is None:
         st.message = ("Набор сушилки: пробы входа ещё нет — совет на запуск появится с первой пробой." if st.fill else

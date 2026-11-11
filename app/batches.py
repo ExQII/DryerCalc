@@ -180,7 +180,7 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
         for sub in sorted({r["seg"] for r in data}):
             dts = [r["dt"] for r in data if r["seg"] == sub]
             hours += (max(dts) - min(dts)).total_seconds() / 3600.0
-        dry = [r for r in data if not r.get("recirc") and not r.get("burner_off")]
+        dry = [r for r in data if not r.get("recirc")]      # с выключенными горелками подача идёт — в силос
         win = [r["w_in"] for r in dry if r.get("w_in") is not None]
         wout = [r["w_out"] for r in dry if r.get("w_out") is not None and not r.get("fill")]
         ds = [r["d_f"] for r in data if r.get("d_f") is not None]
@@ -189,7 +189,7 @@ def journal_summary(rows: List[Dict], p: mdl.DryerParams, start: Optional[dateti
         span = [r for r in lst if t0 <= r["dt"] <= t1]
         for a, b in zip(span, span[1:]):
             if (a.get("d_f") is not None and not a.get("stopped") and not a.get("fill") and not a.get("recirc")
-                    and not a.get("burner_off") and not a.get("loop")):
+                    and not a.get("loop")):
                 unloaded += mdl.q_at(p, a["d_f"]) * max((b["dt"] - a["dt"]).total_seconds(), 0.0) / 3600.0
         w_in_avg = sum(win) / len(win) if win else None
         w_out_avg = sum(wout) / len(wout) if wout else None

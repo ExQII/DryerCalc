@@ -3077,6 +3077,68 @@ def test_q_fix_and_overhead_buttons_in_window():
     win.close()
 
 
+def test_burners_off_do_not_end_pass_only_recirculation_does():
+    """1.9.1: выключенные горелки («охлаждение», «откл. т.б.», T блоков 0/0) проход не заканчивают — подача идёт,
+    проход тот же; конец прохода — рециркуляция. Охлаждение после рециркуляции — конец партии."""
+    from app.batches import journal_summary
+    from app.calibration import journal_passes, observe_all, prepare
+
+    def journal(off_note, on_note, off_t=None, on_t=None, tail=True):
+        t = datetime(2026, 11, 2, 0, 0)
+        rows = []
+
+        def add(note="", w_in=None, w_out=None, d=35.0, t_up=None):
+            nonlocal t
+            rows.append({"ts": t.strftime("%d.%m.%y %H:%M"), "w_in": w_in, "w_out": w_out, "t_a1": 30.0, "t_a2": 28.0,
+                         "t_up": t_up, "t_low": t_up, "t_amb": 5.0, "d": d, "batch": "1", "pass_no": None, "note": note})
+            t += timedelta(minutes=30)
+        add("Запуск, сушим с 1 с.", 30.0, None, t_up=60.0)
+        for _ in range(12):
+            add("", 30.0, 24.0)
+        add(off_note, 30.0, 24.5, t_up=off_t)             # горелки выключили посреди прохода, подача идёт
+        for _ in range(3):
+            add("", 30.0, 27.0)
+        add(on_note, 30.0, 27.5, t_up=on_t)               # включили
+        for _ in range(12):
+            add("", 30.0, 24.0)
+        if tail:
+            add("Закончился 1 с., рециркуляция", None, 14.5)
+            add("", None, 14.2)
+            add("Охлаждение", None, None, 100.0, 0.0)
+            add("", None, None, 100.0)
+        return rows
+
+    for off_note, on_note, off_t, on_t in (("Охлаждение", "Запуск", None, None), ("Откл. т.б.", "Вкл. т.б.", None, None),
+                                           ("Режим: Т блоков 60/60→0/0 °C", "Режим: Т блоков 0/0→60/60 °C", 0.0, 60.0)):
+        rows = journal(off_note, on_note, off_t, on_t)
+        prep, _ = prepare(rows)
+        jp = journal_passes(prep, P)
+        assert len(jp) == 1, (off_note, [(x["pass_no"], x["end_kind"]) for x in jp])      # один проход, не два
+        assert jp[0]["end_kind"] == "cool" and jp[0]["batch_end"]          # рециркуляция, потом охлаждение — конец партии
+        off = [r for r in prep if r["burner_off"] and not r["cool"]]
+        assert len(off) == 4 and not any(r["burner_off"] for r in prep[14 + 4:14 + 16])   # после включения — сушка
+        assert [r["cool"] for r in prep[-2:]] == [True, True] and not any(r["cool"] for r in prep[:-2])
+        obs, _sk, _ = observe_all(rows, P)
+        assert obs and not any(datetime(2026, 11, 2, 6, 30) <= o["dt"] <= datetime(2026, 11, 2, 8, 0) for o in obs)
+        js = journal_summary(rows, P, None, None)["passes"]
+        full = q_at(P, 35.0) * 15.0                                        # подача шла все 15 ч, с горелками и без
+        assert len(js) == 1 and abs(js[0]["unloaded"] - full) < 0.5
+    # проход ещё идёт, горелки выключены: проход не закончен, в «Текущем проходе» — об этом, а не «проход закончен»
+    rows = journal("Охлаждение", "Запуск", tail=False)[:16]
+    prep, _ = prepare(rows)
+    jp = journal_passes(prep, P)
+    assert len(jp) == 1 and jp[0]["end_kind"] is None and not jp[0]["batch_end"]
+    st = live_state(rows, P)
+    assert st.burner_off and st.end_kind is None and "проход продолжается" in st.message
+    # набор сушилки с нулевыми уставками — не «горелки выключены» (совет на запуск остаётся)
+    fill = [{"ts": "02.11.26 00:00", "w_in": 30.0, "w_out": None, "t_up": 0.0, "t_low": 0.0, "d": 0.0, "batch": "1",
+             "pass_no": 1, "note": "Остановка, набираем сушилку с 1 силоса"},
+            {"ts": "02.11.26 00:30", "w_in": 30.4, "w_out": None, "t_up": 0.0, "t_low": 0.0, "d": 0.0, "batch": "1",
+             "pass_no": 1, "note": ""}]
+    prep, _ = prepare(fill)
+    assert prep[-1]["fill"] and not prep[-1]["burner_off"]
+
+
 def test_long_texts_are_collapsed():
     """Длинные пояснения свёрнуты и открываются щелчком; отчёт калибровки раскрывается, когда появился."""
     app = _qapp()
