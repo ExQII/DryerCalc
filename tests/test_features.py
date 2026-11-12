@@ -3248,7 +3248,10 @@ def test_clock_on_journal_and_live_pages():
     for name in (pages.JOURNAL, pages.LIVE):
         win.tabs.setCurrentIndex(win.tabs.indexOfText(name))
         txt = win.tabs.lbl_clock.text()
-        assert win.tabs.lbl_clock.isVisibleTo(win) and datetime.now().strftime("%d.%m.%Y") in txt and ":" in txt[-5:]
+        assert win.tabs.lbl_clock.isVisibleTo(win) and len(txt) == 5 and txt[2] == ":"            # ЧЧ:ММ
+        assert datetime.now().strftime("%d.%m.%Y") in win.tabs.lbl_date.text()
+        # крупные: цифры часов не меньше трёх высот обычного текста — читаются издалека
+        assert win.tabs.lbl_clock.fontInfo().pointSizeF() >= 3.0 * win.tabs.lbl_date.fontInfo().pointSizeF()
     win.tabs.setCurrentIndex(win.tabs.indexOfText(pages.SETTINGS))
     assert not win.tabs.lbl_clock.isVisibleTo(win) and not win.tabs._clock_timer.isActive()
     assert win.storage.get_json("pass_label_from")                     # момент, с которого журнал главнее счёта

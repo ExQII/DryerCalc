@@ -103,7 +103,7 @@ jobs:
             dist/Правила работы DryerCalc.txt
             dist/selftest.txt
             dist/selftest_*.png
-          retention-days: 30
+          retention-days: 7
 
       # GitHub выбрасывает кириллицу из имён файлов релиза («Инструкция DryerCalc.txt» → «DryerCalc.txt»),
       # и два текстовых файла получили бы одно имя — поэтому в релиз они идут с латинскими именами.

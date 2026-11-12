@@ -190,20 +190,37 @@ class NavPanel(_Root):
         self.lbl_sub.setWordWrap(True)
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
-        head.addWidget(self.lbl_title)
-        head.addStretch(1)
-        # часы — на страницах, где записывают и смотрят «сейчас» (set_clock_pages): время пробы сверяют с ними
+        head.setSpacing(12)
+        titles = QVBoxLayout()
+        titles.setContentsMargins(0, 0, 0, 0)
+        titles.setSpacing(2)
+        titles.addWidget(self.lbl_title)
+        titles.addWidget(self.lbl_sub)
+        titles.addStretch(1)
+        head.addLayout(titles, 1)
+        # Часы — на страницах, где записывают и смотрят «сейчас» (set_clock_pages): время пробы сверяют с ними.
+        # Плитка в стиле программы: крупные ЧЧ:ММ, чтобы читались от сушилки, под ними — день и дата.
+        self.clock_box = QFrame()
+        self.clock_box.setObjectName("navClockBox")
+        self.clock_box.setToolTip("Время компьютера. По нему программа ставит время следующей пробы и считает «сейчас».")
+        cb = QVBoxLayout(self.clock_box)
+        cb.setContentsMargins(18, 6, 18, 8)
+        cb.setSpacing(0)
         self.lbl_clock = QLabel()
         self.lbl_clock.setObjectName("navClock")
-        self.lbl_clock.setToolTip("Время компьютера. По нему программа ставит время следующей пробы и считает «сейчас».")
-        self.lbl_clock.setVisible(False)
-        head.addWidget(self.lbl_clock, 0, Qt.AlignVCenter)
+        self.lbl_clock.setAlignment(Qt.AlignCenter)
+        self.lbl_date = QLabel()
+        self.lbl_date.setObjectName("navClockDate")
+        self.lbl_date.setAlignment(Qt.AlignCenter)
+        cb.addWidget(self.lbl_clock)
+        cb.addWidget(self.lbl_date)
+        self.clock_box.setVisible(False)
+        head.addWidget(self.clock_box, 0, Qt.AlignTop)
         self._clock_pages: set = set()
         self._clock_timer = QTimer(self)
         self._clock_timer.setInterval(1000)
         self._clock_timer.timeout.connect(self._tick_clock)
         rv.addLayout(head)
-        rv.addWidget(self.lbl_sub)
         rv.addSpacing(8)
         self.stack = QStackedWidget()
         rv.addWidget(self.stack, 1)
@@ -253,7 +270,7 @@ class NavPanel(_Root):
             self._show_clock(self._pages[self._cur]["text"] in self._clock_pages)
 
     def _show_clock(self, on: bool) -> None:
-        self.lbl_clock.setVisible(on)
+        self.clock_box.setVisible(on)
         if on:
             self._tick_clock()
             self._clock_timer.start()
@@ -262,9 +279,10 @@ class NavPanel(_Root):
 
     def _tick_clock(self) -> None:
         now = datetime.now()
-        txt = f"{_WEEKDAYS[now.weekday()]}, {now:%d.%m.%Y}   {now:%H:%M}"
+        txt = f"{now:%H:%M}"
         if txt != self.lbl_clock.text():
             self.lbl_clock.setText(txt)
+            self.lbl_date.setText(f"{_WEEKDAYS[now.weekday()]}, {now:%d.%m.%Y}")
 
     def setTabLabel(self, i: int, label: str) -> None:  # noqa: N802
         """Подпись пункта в меню (например, «Культура: рапс»); название страницы и tabText не меняются."""

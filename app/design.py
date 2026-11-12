@@ -411,7 +411,9 @@ QLabel#navApp {{ {num} font-size: {base_pt + 5:.1f}pt; color: {t.ink}; }}
 QLabel#navAppSub {{ color: {t.muted}; }}
 QLabel#navTitle {{ {num} font-size: {base_pt + 9:.1f}pt; color: {t.ink}; }}
 QLabel#navSub {{ color: {t.muted}; }}
-QLabel#navClock {{ {num} font-size: {base_pt + 5:.1f}pt; color: {t.ink}; }}
+QFrame#navClockBox {{ background: {t.surface}; border: 1px solid {t.line}; border-radius: 14px; }}
+QLabel#navClock {{ {num} font-size: {base_pt * 3.6:.1f}pt; color: {t.ink}; background: transparent; }}
+QLabel#navClockDate {{ font-size: {base_pt:.1f}pt; color: {t.muted}; background: transparent; }}
 QToolButton#themeButton {{ padding: 4px; border-radius: 8px; }}
 QToolButton#themeButton::menu-indicator {{ image: none; width: 0; }}
 
