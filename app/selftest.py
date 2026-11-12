@@ -500,6 +500,14 @@ def run(out_path: str) -> int:
               and not win._has_fitted_amb(),
               f"T нар в каждой строке, меняется с проходом: b_нар = {_p11.b_amb:+.2f} (физическая оценка), "
               f"R₀ = {_p11.r_ref:.2f}")
+        # --- v1.10: размещение по оперативным силосам ---
+        from .silos import Silo as _Silo, plan_silos as _plan_silos
+        _sl = [_Silo(f"С{i + 1}", 600.0, 0.0, 0, i < 2) for i in range(4)]
+        _sp = _plan_silos(_sl, 1100.0, 3, [0.93, 0.93, 0.93], rates=[18.0, 20.0, 22.0], overhead_h=2.0)
+        check(_sp.ok and len(_sp.steps) == 6 and _sp.final[2][0] < 0.05 and _sp.final[3][0] < 0.05
+              and not _plan_silos(_sl, 2400.0, 3, [0.93] * 3).ok and hasattr(win, "tab_silos"),
+              f"силосы: 1100 т, 3 прохода, в конце в С1 и С2 — {len(_sp.steps)} переключений, {_sp.hours:.0f} ч; "
+              "все четыре заняты — сушить некуда")
         # --- v1.9.2: часы, натура зерна, номер прохода из журнала ---
         from datetime import datetime as _dt92
         _pn = mdl.set_natura(win.params, win.params.natura * 1.1, _dt92(2030, 1, 1))

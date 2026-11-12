@@ -8,6 +8,7 @@ LIVE = "Текущий проход"
 RECIRC = "Досушка"
 PLAN = "План сушки партии"
 WEEKEND = "Масса на выходные"
+SILOS = "Размещение по силосам"
 QUICK = "Быстрая оценка"
 BATCHES = "Партии и очередь"
 DATA = "Погода и влагомер"
@@ -27,6 +28,7 @@ PAGES = (
     (RECIRC, SHIFT, "Рециркуляция: сколько часов досушивать зерно, оставшееся в шахте, без подачи из силоса."),
     (PLAN, PLANNING, "Сколько проходов и часов нужно партии и с какой разгрузкой D — по модели вашей сушилки."),
     (WEEKEND, PLANNING, "Сколько намолотить к выходным, чтобы сушилка работала до выхода хозяйства на работу."),
+    (SILOS, PLANNING, "Куда принять сырое зерно и как гонять его между оперативными силосами за проходы сушки."),
     (QUICK, PLANNING, "Время сушки по производительности выгрузки, без модели: масса ÷ т/ч по проходам."),
     (BATCHES, PLANNING, "Учёт партий: весовая, лаборатория, топливо, качество, отчёты; очередь сушки."),
     (DATA, MODEL, "Наружный воздух для расчётов и поправка выходного влагомера по лаборатории."),
@@ -38,7 +40,8 @@ PAGES = (
 OPERATOR_PAGES = (JOURNAL, LIVE, RECIRC, HELP)
 
 # иконки разделов в меню (icons.py)
-ICONS = {CROP: "kernel", JOURNAL: "journal", LIVE: "live", RECIRC: "recirc", PLAN: "plan", WEEKEND: "weekend", QUICK: "quick",
+ICONS = {CROP: "kernel", JOURNAL: "journal", LIVE: "live", RECIRC: "recirc", PLAN: "plan", WEEKEND: "weekend", SILOS: "silos",
+         QUICK: "quick",
          BATCHES: "batches", DATA: "data", CHECK: "check", SETTINGS: "settings", HELP: "help"}
 
 OLD_NAMES = {

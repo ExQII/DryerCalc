@@ -3258,6 +3258,100 @@ def test_clock_on_journal_and_live_pages():
     win.close()
 
 
+def test_silo_plan_moves_grain_between_silos_without_mixing():
+    """1.10: план размещения по оперативным силосам — куда принять сырое и как гонять зерно за проходы, чтобы в конце
+    оно лежало в отмеченных силосах; сыпать только в пустой силос или к зерну того же прохода."""
+    from app.silos import EPS, Silo, plan_silos
+
+    def silos(caps, targets, masses=(0, 0, 0, 0), done=(0, 0, 0, 0), intake=None):
+        return [Silo(f"С{i + 1}", caps[i], masses[i], done[i], (i + 1) in targets, intake == i + 1) for i in range(4)]
+
+    def check(sl, new, n, res, f):
+        """Правила: приёмник пуст или с зерном того же прохода; масса сходится; проходы идут по порядку."""
+        st = [(s.mass, s.done) for s in sl]
+        for i, put in res.placement:
+            assert st[i][0] <= EPS or st[i][1] == 0
+            st[i] = (st[i][0] + put, 0)
+        assert abs(sum(m for _i, m in res.placement) - new) < 0.01
+        last = 0
+        for s in res.steps:
+            mi, di = st[s.src]
+            mj, dj = st[s.dst]
+            assert s.src != s.dst and not sl[s.src].intake and not sl[s.dst].intake
+            assert di == s.k - 1 and s.k >= last and (mj <= EPS or dj == s.k)             # без смешивания проходов
+            assert s.m_in <= mi + 0.01 and abs(s.m_out - s.m_in * f[s.k - 1]) < 0.01
+            assert mj + s.m_out <= sl[s.dst].cap + 0.01
+            st[s.src] = (mi - s.m_in, di) if mi - s.m_in > EPS else (0.0, 0)
+            st[s.dst] = (mj + s.m_out, s.k)
+            assert all(abs(a[0] - b[0]) < 0.01 for a, b in zip(st, s.after))
+            last = s.k
+        return st
+
+    f3 = [0.93, 0.93, 0.93]
+    # 1100 т в два силоса из четырёх, три прохода, в конце — в С1 и С2: шесть переключений
+    sl = silos([600] * 4, {1, 2})
+    r = plan_silos(sl, 1100.0, 3, f3, rates=[18.0, 20.0, 22.0], overhead_h=2.0, start=datetime(2026, 11, 13, 8, 0))
+    st = check(sl, 1100.0, 3, r, f3)
+    assert r.ok and len(r.steps) == 6 and st[2][0] <= EPS and st[3][0] <= EPS and all(d == 3 for m, d in st if m > EPS)
+    assert abs(sum(m for m, _d in st) - 1100.0 * 0.93 ** 3) < 0.05
+    assert abs(r.hours - (sum(s.hours for s in r.steps) + 3 * 2.0)) < 1e-6 and r.steps[0].start == datetime(2026, 11, 13, 8, 0)
+    assert r.steps[-1].end > r.steps[0].start and abs(r.steps[0].hours - r.steps[0].m_out / 18.0) < 1e-9
+    # от числа проходов зависит, где зерно окажется: при двух проходах план другой, но цель та же
+    r2 = plan_silos(silos([600] * 4, {1, 2}), 1100.0, 2, f3)
+    assert r2.ok and len(r2.steps) == 4
+    # три силоса из четырёх заняты — один пустой, план есть; заняты все четыре — сушить некуда
+    sl = silos([600] * 4, {1, 2, 3})
+    r = plan_silos(sl, 1700.0, 3, f3)
+    check(sl, 1700.0, 3, r, f3)
+    assert r.ok and len(r.steps) == 9
+    r = plan_silos(silos([600] * 4, {1, 2, 3, 4}), 2400.0, 3, f3)
+    assert not r.ok and not r.steps and "пустой" in r.reason
+    assert "не помещается" in plan_silos(silos([600] * 4, {1}), 2500.0, 3, f3).reason
+    # зерно уже лежит: сырое в С1, после первого прохода в С2; ещё 300 т принять; в конце — в С3 и С4
+    sl = silos([600] * 4, {3, 4}, (500, 400, 0, 0), (0, 1, 0, 0))
+    r = plan_silos(sl, 300.0, 3, f3)
+    st = check(sl, 300.0, 3, r, f3)
+    assert r.ok and st[0][0] <= EPS and st[1][0] <= EPS and all(i != 1 for i, _m in r.placement)   # к подсушенному — нет
+    # отмеченных силосов мало: ближайший план и причина
+    r = plan_silos(silos([600] * 4, {1}), 1100.0, 3, f3)
+    assert not r.ok and r.steps and r.misplaced > 100 and "помещается 600" in r.reason
+    # силос приёмки с поля в плане не участвует; места в нём до конца плана не хватит — предупреждение
+    sl = silos([600] * 4, {1, 2}, intake=4)
+    r = plan_silos(sl, 1100.0, 3, f3, rates=[18.0, 20.0, 22.0], inflow_tpd=300.0)
+    check(sl, 1100.0, 3, r, f3)
+    assert r.ok and all(s.src != 3 and s.dst != 3 for s in r.steps) and "заполнится через 48 ч" in r.warnings[0]
+    assert not plan_silos(sl, 1100.0, 3, f3, rates=[18.0, 20.0, 22.0], inflow_tpd=10.0).warnings
+    assert "не выбран силос приёмки" in plan_silos(silos([600] * 4, {1, 2}), 1100.0, 3, f3, inflow_tpd=100.0).warnings[0]
+    # нечего планировать / не отмечен конечный силос
+    assert "Нет зерна" in plan_silos(silos([600] * 4, {1}), 0.0, 3, f3).reason
+    assert "Отметьте" in plan_silos(silos([600] * 4, set()), 500.0, 3, f3).reason
+    # окно
+    from PySide6.QtCore import Qt
+    from app import pages, tab_silos as ts
+    win = _window("silos110.db")
+    tab = win.tab_silos
+    assert win.tabs.indexOfText(pages.SILOS) >= 0 and pages.SILOS not in pages.OPERATOR_PAGES
+    tab.new_mass.setValue(1100.0)
+    tab.w0.setValue(30.0)
+    tab.wk.setValue(14.0)
+    for i in range(4):
+        tab.tbl.item(i, ts.COL_CAP).setText("600")
+    tab.tbl.item(0, ts.COL_TARGET).setCheckState(Qt.Checked)
+    tab.tbl.item(1, ts.COL_TARGET).setCheckState(Qt.Checked)
+    tab.recalc()
+    n = len(tab._drying_plan.passes)
+    assert tab.result.ok and "План есть" in tab.head.text() and tab.steps.rowCount() == len(tab.result.steps) + 1
+    assert len(tab.result.steps) == 2 * n and not tab.cap_note.isVisibleTo(tab)
+    tab.tbl.item(3, ts.COL_INTAKE).setCheckState(Qt.Checked)                # силос приёмки — один и не конечный
+    tab.tbl.item(2, ts.COL_INTAKE).setCheckState(Qt.Checked)
+    assert [s.intake for s in tab.silos()] == [False, False, True, False]
+    saved = win.storage.get_json("ui_silos")
+    assert saved["new"] == 1100.0 and saved["silos"][0]["cap"] == 600.0 and saved["silos"][0]["target"]
+    tab._load()
+    assert tab.silos()[1].target and tab.new_mass.value() == 1100.0 and tab.result is None
+    win.close()
+
+
 def test_long_texts_are_collapsed():
     """Длинные пояснения свёрнуты и открываются щелчком; отчёт калибровки раскрывается, когда появился."""
     app = _qapp()

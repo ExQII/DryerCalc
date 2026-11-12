@@ -19,8 +19,8 @@ from .calibration import FIELDS, TEXT_FIELDS
 from .model import DryerParams
 
 # настройки, которые у каждой культуры свои
-CROP_KEYS = frozenset(("params", "ui", "ui_simple", "ui_live", "ui_weekend", "ui_queue", "batches", "queue",
-                       "meter_pairs"))
+CROP_KEYS = frozenset(("params", "ui", "ui_simple", "ui_live", "ui_weekend", "ui_queue", "ui_silos", "batches",
+                       "queue", "meter_pairs"))
 
 
 def default_dir() -> Path:

@@ -82,6 +82,20 @@ def _weekend(p: QPainter, c: QColor) -> None:
             p.drawRoundedRect(QRectF(x - 1.45, y - 1.45, 2.9, 2.9), 0.6, 0.6)
 
 
+def _silos(p: QPainter, c: QColor) -> None:
+    """Два силоса с конусными крышами и стрелка между ними."""
+    _pen(p, c)
+    for x in (3.5, 14.0):
+        p.drawLine(QPointF(x, 9.0), QPointF(x, 20.0))
+        p.drawLine(QPointF(x + 6.5, 9.0), QPointF(x + 6.5, 20.0))
+        p.drawLine(QPointF(x, 20.0), QPointF(x + 6.5, 20.0))
+        p.drawLine(QPointF(x, 9.0), QPointF(x + 3.25, 5.0))
+        p.drawLine(QPointF(x + 3.25, 5.0), QPointF(x + 6.5, 9.0))
+    p.drawLine(QPointF(8.4, 3.2), QPointF(15.6, 3.2))
+    p.drawLine(QPointF(13.6, 1.4), QPointF(15.6, 3.2))
+    p.drawLine(QPointF(13.6, 5.0), QPointF(15.6, 3.2))
+
+
 def _quick(p: QPainter, c: QColor) -> None:
     _pen(p, c)
     p.drawEllipse(QPointF(12, 13.5), 7.5, 7.5)
@@ -203,6 +217,7 @@ def _kernel(p: QPainter, c: QColor) -> None:
 
 _DRAW: Dict[str, Callable[[QPainter, QColor], None]] = {
     "journal": _journal, "live": _live, "recirc": _recirc, "plan": _plan, "weekend": _weekend, "quick": _quick,
+    "silos": _silos,
     "batches": _batches,
     "data": _data, "check": _check, "settings": _settings, "help": _help, "chev_right": _chev_right,
     "chev_down": _chev_down, "kernel": _kernel, "sun": _sun, "moon": _moon, "auto": _auto,

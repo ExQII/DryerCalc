@@ -40,6 +40,7 @@ from .tab_data import DataTab
 from .tab_help import HelpTab
 from .tab_live import LiveTab
 from .tab_recirc import RecircTab
+from .tab_silos import SilosTab
 from .tab_weekend import WeekendTab
 from .reminders import ReminderCfg, check as reminders_check, live_numbers
 from . import pilot
@@ -130,6 +131,7 @@ class MainWindow(QMainWindow):
         built[pg.JOURNAL] = self._build_journal_tab()
         self.tab_batches = built[pg.BATCHES] = BatchesTab(self)
         self.tab_weekend = built[pg.WEEKEND] = WeekendTab(self)      # после очереди и журнала: берёт из них начало
+        self.tab_silos = built[pg.SILOS] = SilosTab(self)
         self.tab_data = built[pg.DATA] = DataTab(self)
         self.tab_check = built[pg.CHECK] = CheckTab(self)
         built[pg.SETTINGS] = self._build_settings_tab()
@@ -525,6 +527,7 @@ class MainWindow(QMainWindow):
         self._save_simple_state()
         self.tab_live._save()
         self.tab_weekend._save()
+        self.tab_silos._save()
         first = self.storage.set_crop(key)
         self._reload_all()
         self.storage.log_event("crop", {"from": old.key, "to": new.key, "first": first})
@@ -2389,6 +2392,7 @@ class MainWindow(QMainWindow):
         self.tab_batches._load()
         self.tab_live._load()
         self.tab_weekend._load()
+        self.tab_silos._load()
         self.report.clear()
         self.plot_cal.clear()
         self._rem_state.clear()
