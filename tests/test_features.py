@@ -3322,6 +3322,29 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     assert r.ok and all(s.src != 3 and s.dst != 3 for s in r.steps) and "заполнится через 48 ч" in r.warnings[0]
     assert not plan_silos(sl, 1100.0, 3, f3, rates=[18.0, 20.0, 22.0], inflow_tpd=10.0).warnings
     assert "не выбран силос приёмки" in plan_silos(silos([600] * 4, {1, 2}), 1100.0, 3, f3, inflow_tpd=100.0).warnings[0]
+    # очерёдность: в новом проходе первым сушится зерно, которое лежит дольше (наполнили С3, потом С4 — берём из С3)
+    r2 = plan_silos(silos([600] * 4, {1, 2}), 1100.0, 2, f3)
+    assert r2.fifo_breaks == 0 and not any(s.out_of_turn for s in r2.steps)
+    first, second = r2.steps[0].dst, r2.steps[1].dst
+    assert first != second and [s.src for s in r2.steps[2:]] == [first, second]
+    # варианты: все планы до отмеченных силосов, лучший первым — по очереди, меньше переключений, меньше занятых силосов
+    from app.silos import SHOW_VARIANTS, used_silos
+    r = plan_silos(silos([600] * 4, {1, 2}, intake=4), 1100.0, 3, f3)
+    assert r.variants[0] is r and r.n_variants == 64 and len(r.variants) == SHOW_VARIANTS and not r.variants_capped
+    ranks = [(v.fifo_breaks, len(v.steps)) for v in r.variants]
+    assert ranks == sorted(ranks) and ranks[0] == (0, 6) and any(b > 0 for b, _n in ranks)
+    sigs = {(tuple(v.placement), tuple((s.src, s.dst) for s in v.steps)) for v in r.variants}
+    assert len(sigs) == len(r.variants) and all(v.ok and check(silos([600] * 4, {1, 2}, intake=4), 1100.0, 3, v, f3)
+                                                for v in r.variants)
+    big = plan_silos(silos([600] * 4, {1, 2}), 1100.0, 3, f3)
+    assert big.variants_capped and big.n_variants >= 1000 and len(used_silos(big)) == 3      # четвёртый силос свободен
+    assert all(len(used_silos(v)) >= 3 for v in big.variants)
+    # с очерёдностью в отмеченные силосы не прийти — правило нарушается, шаг помечен
+    sl = silos([600, 500, 400, 300], {1, 3}, (0, 300, 400, 100), (0, 2, 1, 0))
+    r = plan_silos(sl, 200.0, 3, f3)
+    check(sl, 200.0, 3, r, f3)
+    assert r.ok and r.fifo_breaks == 1 and sum(1 for s in r.steps if s.out_of_turn) == 1
+    assert all(v.fifo_breaks >= 1 for v in r.variants)
     # нечего планировать / не отмечен конечный силос
     assert "Нет зерна" in plan_silos(silos([600] * 4, {1}), 0.0, 3, f3).reason
     assert "Отметьте" in plan_silos(silos([600] * 4, set()), 500.0, 3, f3).reason
@@ -3351,6 +3374,14 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     png = _tmp("silos.png")
     assert tab.flow.save_png(png) and os.path.getsize(png) > 5000
     win.grab()                                                              # отрисовка схемы не падает
+    # варианты: список лучших, выбор другого перерисовывает схему и таблицу
+    assert tab.var_row.isVisibleTo(tab) and tab.variant.count() == len(tab.result.variants) > 1
+    assert "по очереди" in tab.variant.itemText(0) and "свободен" in tab.variant.itemText(0)
+    assert tab.current_plan() is tab.result and "лучших из" in tab.var_note.text()
+    tab.variant.setCurrentIndex(3)
+    assert tab.current_plan() is tab.result.variants[3] and tab.flow.plan is tab.result.variants[3]
+    assert tab.steps.rowCount() == len(tab.result.variants[3].steps) + 1
+    tab.variant.setCurrentIndex(0)
     tab.tbl.item(3, ts.COL_INTAKE).setCheckState(Qt.Checked)                # силос приёмки — один и не конечный
     tab.tbl.item(2, ts.COL_INTAKE).setCheckState(Qt.Checked)
     assert [s.intake for s in tab.silos()] == [False, False, True, False]

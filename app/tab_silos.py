@@ -13,13 +13,13 @@ from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
 from PySide6.QtCore import QDateTime, Qt
-from PySide6.QtWidgets import (QDateTimeEdit, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+from PySide6.QtWidgets import (QComboBox, QDateTimeEdit, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
                                QPushButton, QScrollArea, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
 from . import model as mdl
 from .silo_flow import SiloFlow
-from .silos import EPS, Silo, SiloPlan, plan_silos
+from .silos import EPS, Silo, SiloPlan, plan_silos, used_silos
 from .ui_common import Collapsible, Tile, dspin, fmt_hours, item, mute, scroll_wrap, set_role, table, to_num
 
 if TYPE_CHECKING:
@@ -34,8 +34,13 @@ ABOUT = (
     "другой. Сыпать можно только в пустой силос или к зерну того же прохода — сырое с подсушенным не смешивается. "
     "Зерно идёт проход за проходом. Силос, который опустел в ходе прохода, в этом же проходе может принять зерно."
     "<br><br><b>Что выбирает программа.</b> В какие силосы принять сырое зерно и в каком порядке переключать "
-    "маршруты, чтобы после последнего прохода зерно оказалось в отмеченных силосах. Из всех подходящих планов "
-    "берётся план с наименьшим числом переключений маршрута."
+    "маршруты, чтобы после последнего прохода зерно оказалось в отмеченных силосах."
+    "<br><br><b>Очерёдность.</b> В новом проходе первым сушится зерно, которое лежит дольше: наполнили сначала "
+    "С 3, потом С 4 — сушим сначала из С 3. Если с этим правилом в отмеченные силосы не прийти, программа его "
+    "нарушает и пишет, в каких шагах."
+    "<br><br><b>Варианты.</b> Подходящих планов обычно много. В списке «Вариант» — лучшие: сначала те, где "
+    "очередь соблюдена, затем с меньшим числом переключений и с меньшим числом занятых силосов (свободный силос "
+    "— запас под приход с поля)."
     "<br><br><b>Почему нужен пустой силос.</b> Без смешивания первый шаг можно сделать только в пустой силос. "
     "Если заняты все четыре, сушить некуда — программа так и скажет."
     "<br><br><b>Масса.</b> После каждого прохода зерна становится меньше: уходит вода. Тонны «в приёмник» — уже "
@@ -161,6 +166,23 @@ class SilosTab(QWidget):
         rv.addLayout(tiles)
         # Схема (главный вид): шаг за шагом силосы с уровнем зерна и стрелка «откуда → сушилка → куда». Таблица с теми
         # же шагами — второй вкладкой, для точных цифр и переписывания.
+        vb = QHBoxLayout()
+        self.var_label = QLabel("Вариант")
+        self.variant = QComboBox()
+        self.variant.setToolTip("Все найденные планы, лучший первым: сначала те, где зерно сушится по очереди (что "
+                                "дольше лежит — то раньше), затем с меньшим числом переключений и занятых силосов.")
+        self.variant.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.variant.setMinimumContentsLength(12)
+        self.variant.currentIndexChanged.connect(self._variant_changed)
+        self.var_note = mute(QLabel(""))
+        vb.addWidget(self.var_label)
+        vb.addWidget(self.variant, 1)
+        vb.addWidget(self.var_note)
+        self.var_row = QWidget()
+        self.var_row.setLayout(vb)
+        vb.setContentsMargins(0, 0, 0, 0)
+        self.var_row.setVisible(False)
+        rv.addWidget(self.var_row)
         self.views = QTabWidget()
         self.flow = SiloFlow()
         sc = QScrollArea()
@@ -253,12 +275,46 @@ class SilosTab(QWidget):
         rates = [ps.q for ps in pl.passes]
         start = self.start.dateTime().toPython()
         res = plan_silos(silos, new, n, factors, rates, self.win.params.overhead_h, start, self.inflow.value())
-        self.result, self._drying_plan = res, pl
+        self.result, self._drying_plan, self._silos = res, pl, silos
+        self._fill_variants(res, silos)
         self._show(res, pl, silos)
         self._save()
 
+    def _fill_variants(self, res: SiloPlan, silos: List[Silo]) -> None:
+        names = [s.name for s in silos]
+        self.variant.blockSignals(True)
+        self.variant.clear()
+        for k, v in enumerate(res.variants, 1):
+            idle = [names[i] for i, s in enumerate(silos) if not s.intake and i not in used_silos(v)]
+            end = v.steps[-1].end if v.steps else None
+            self.variant.addItem(
+                f"{k}.  {len(v.steps)} перекл."
+                + (" · по очереди" if v.fifo_breaks == 0 else f" · не по очереди: {v.fifo_breaks}")
+                + (f" · свободен {', '.join(idle)}" if idle else " · заняты все")
+                + (" · приём: " + ", ".join(f"{names[i]} {_t(m)}" for i, m in v.placement) if v.placement else "")
+                + (f" · конец {_when(end)}" if end else ""))
+        self.variant.blockSignals(False)
+        self.var_row.setVisible(len(res.variants) > 1)
+        shown = len(res.variants)
+        if res.n_variants > shown:
+            self.var_note.setText(f"{shown} лучших из {res.n_variants}" + ("+" if res.variants_capped else ""))
+        else:
+            self.var_note.setText(f"всего {shown}")
+
+    def _variant_changed(self, idx: int) -> None:
+        if self.result is None or not 0 <= idx < len(self.result.variants):
+            return
+        self._show(self.result.variants[idx], self._drying_plan, self._silos)
+
+    def current_plan(self) -> Optional[SiloPlan]:
+        """План, который сейчас показан (выбранный вариант)."""
+        if self.result is None or not self.result.variants:
+            return self.result
+        return self.result.variants[max(self.variant.currentIndex(), 0)]
+
     def _show_error(self, text: str) -> None:
         self.result = None
+        self.var_row.setVisible(False)
         self.head.setText(text)
         self.sub.setText("")
         self.steps.setRowCount(0)
@@ -274,6 +330,7 @@ class SilosTab(QWidget):
             self._show_error(res.reason)
             self.result = res
             return
+        best = self.result
         tg = ", ".join(s.name for s in silos if s.target and not s.intake)
         if res.ok:
             self.head.setText(f"План есть: после {n}-го прохода всё зерно — в {tg}.")
@@ -286,6 +343,11 @@ class SilosTab(QWidget):
             notes.append("Сырое зерно принять: " + ", ".join(f"{names[i]} — {_t(m)} т" for i, m in res.placement) + ".")
         if not pl.reaches_target:
             notes.append(f"За {n} прох. модель даёт {pl.w_final:.1f} %, а цель {self.wk.value():.1f} % — добавьте проход.")
+        if res.ok and res.fifo_breaks:
+            only = best is not None and best.fifo_breaks > 0
+            notes.append(f"В {res.fifo_breaks} шаг. зерно сушится не по очереди (в другом силосе зерно того же прохода "
+                         "лежит дольше)" + (" — иначе в отмеченные силосы не прийти." if only else
+                                            " — есть варианты, где очередь соблюдена."))
         notes += res.warnings
         self.sub.setText("  ".join(notes))
         end = res.steps[-1].end if res.steps else None
@@ -302,7 +364,8 @@ class SilosTab(QWidget):
             rows.append(("приём", "с поля → " + ", ".join(names[i] for i, _m in res.placement),
                          _t(sum(m for _i, m in res.placement)), "", "", res.start_state, -1))
         for s in res.steps:
-            rows.append((f"{s.k}-й", f"{names[s.src]} → {names[s.dst]}" + (" (часть)" if s.split else ""),
+            rows.append((f"{s.k}-й", f"{names[s.src]} → {names[s.dst]}" + (" (часть)" if s.split else "")
+                         + (" · не по очереди" if s.out_of_turn else ""),
                          f"{_t(s.m_in)} → {_t(s.m_out)}", _when(s.start), _when(s.end), s.after, s.dst))
         self.steps.setRowCount(len(rows))
         for r, row in enumerate(rows):
@@ -359,6 +422,7 @@ class SilosTab(QWidget):
         self.steps.setRowCount(0)
         self.flow.set_plan(None, [])
         self.btn_png.setEnabled(False)
+        self.var_row.setVisible(False)
         self.head.setText("Впишите зерно и силосы и нажмите «Построить план».")
         self.sub.setText("")
         for x in (self.t_steps, self.t_time, self.t_mass, self.t_regime):

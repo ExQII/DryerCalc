@@ -268,6 +268,8 @@ class SiloFlow(QWidget):
             p.setFont(base)
             p.setPen(ink2)
             lines = [f"{_t(s.m_in)} т → {_t(s.m_out)} т" + (" (часть)" if s.split else "")]
+            if s.out_of_turn:
+                lines.append("не по очереди")
             if s.start and s.end:
                 lines.append(f"{s.start:%d.%m %H:%M} – {s.end:%d.%m %H:%M}")
                 lines.append(f"{s.hours:.0f} ч")
