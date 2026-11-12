@@ -3,9 +3,9 @@
 
 Слева — зерно (сколько сырого принять, влажность, цель, число проходов, начало), таблица оперативных силосов
 (вместимость, что лежит сейчас и сколько проходов прошло, где зерно должно оказаться, силос приёмки с поля) и приход
-с поля. Справа — вывод крупно, плитки и таблица шагов: проход, маршрут «откуда → куда», тонны, время и что лежит в
-каждом силосе после шага. Расчёт — silos.plan_silos; съём, D и тонны в час по проходам — из модели сушилки
-(model.plan_by_passes), как в «Плане сушки партии».
+с поля. Справа — вывод крупно, плитки и схема (silo_flow.SiloFlow): на каждый шаг силосы с уровнем зерна и стрелка
+«откуда → сушилка → куда»; второй вкладкой — таблица тех же шагов. Схему можно сохранить картинкой. Расчёт —
+silos.plan_silos; съём, D и тонны в час по проходам — из модели сушилки (model.plan_by_passes).
 """
 from __future__ import annotations
 
@@ -13,10 +13,12 @@ from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
 from PySide6.QtCore import QDateTime, Qt
-from PySide6.QtWidgets import (QDateTimeEdit, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                               QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QDateTimeEdit, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+                               QPushButton, QScrollArea, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from . import model as mdl
+from .silo_flow import SiloFlow
 from .silos import EPS, Silo, SiloPlan, plan_silos
 from .ui_common import Collapsible, Tile, dspin, fmt_hours, item, mute, scroll_wrap, set_role, table, to_num
 
@@ -127,7 +129,15 @@ class SilosTab(QWidget):
 
         self.btn = set_role(QPushButton("Построить план"), "primary")
         self.btn.clicked.connect(self.recalc)
-        lv.addWidget(self.btn, 0, Qt.AlignLeft)
+        self.btn_png = QPushButton("Сохранить схему…")
+        self.btn_png.setToolTip("Вся схема одной картинкой (PNG) — распечатать или передать сушильщикам.")
+        self.btn_png.clicked.connect(self._save_png)
+        self.btn_png.setEnabled(False)
+        hb = QHBoxLayout()
+        hb.addWidget(self.btn)
+        hb.addWidget(self.btn_png)
+        hb.addStretch(1)
+        lv.addLayout(hb)
         lv.addWidget(Collapsible("Как строится план", ABOUT))
         lv.addStretch(1)
         lay.addWidget(scroll_wrap(left, 470), 0)
@@ -149,14 +159,30 @@ class SilosTab(QWidget):
         for x in (self.t_steps, self.t_time, self.t_mass, self.t_regime):
             tiles.addWidget(x, 1)
         rv.addLayout(tiles)
+        # Схема (главный вид): шаг за шагом силосы с уровнем зерна и стрелка «откуда → сушилка → куда». Таблица с теми
+        # же шагами — второй вкладкой, для точных цифр и переписывания.
+        self.views = QTabWidget()
+        self.flow = SiloFlow()
+        sc = QScrollArea()
+        sc.setWidget(self.flow)
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.flow_scroll = sc
+        self.views.addTab(sc, "Схема")
+        tab_t = QWidget()
+        tv = QVBoxLayout(tab_t)
+        tv.setContentsMargins(0, 6, 0, 0)
         self.steps = table(["Проход", "Маршрут", "Тонн", "Начало", "Конец"] + list(NAMES), stretch_last=False)
         self.steps.setEditTriggers(QTableWidget.NoEditTriggers)
-        rv.addWidget(self.steps, 1)
+        tv.addWidget(self.steps, 1)
         self.legend = mute(QLabel("«Тонн» — сколько взято из источника → сколько пришло в приёмник после сушки. В "
                                   "столбцах силосов — что лежит после шага: тонны и, в скобках, сколько проходов "
                                   "прошло зерно (0 — сырое). Жирным — силос, который на этом шаге наполняется."))
         self.legend.setWordWrap(True)
-        rv.addWidget(self.legend)
+        tv.addWidget(self.legend)
+        self.views.addTab(tab_t, "Таблица")
+        rv.addWidget(self.views, 1)
         lay.addWidget(right, 1)
         for w in (self.new_mass, self.w0, self.wk, self.inflow):
             w.valueChanged.connect(self._changed)
@@ -236,6 +262,8 @@ class SilosTab(QWidget):
         self.head.setText(text)
         self.sub.setText("")
         self.steps.setRowCount(0)
+        self.flow.set_plan(None, [])
+        self.btn_png.setEnabled(False)
         for x in (self.t_steps, self.t_time, self.t_mass, self.t_regime):
             x.set("—")
 
@@ -261,14 +289,14 @@ class SilosTab(QWidget):
         notes += res.warnings
         self.sub.setText("  ".join(notes))
         end = res.steps[-1].end if res.steps else None
-        self.t_steps.set(str(len(res.steps)), f"{n} прох.; каждое переключение — смена маршрута на пульте")
-        self.t_time.set(_when(end), (f"{DOW[end.weekday()]}; " if end else "") + f"всего {fmt_hours(res.hours)}, "
-                        f"накладные {self.win.params.overhead_h:g} ч на проход")
+        self.t_steps.set(str(len(res.steps)), "смен маршрута на пульте")
+        self.t_time.set(_when(end), (f"{DOW[end.weekday()]}, " if end else "") + f"всего {fmt_hours(res.hours)}",
+                        f"С накладными {self.win.params.overhead_h:g} ч на проход («Настройки сушилки»).")
         dry = sum(m for (m, _d), s in zip(res.final, silos) if not s.intake)
         self.t_mass.set(f"{_t(dry)} т", "  ".join(f"{names[i]}: {_t(m)}" for i, (m, _d) in enumerate(res.final)
                                                    if m > EPS and not silos[i].intake))
-        self.t_regime.set(f"{n}", "  ".join(f"{ps.k}-й: {ps.w_in:.1f}→{ps.w_out:.1f} %, D {ps.d:.0f}"
-                                             for ps in pl.passes))
+        self.t_regime.set(f"{n}", f"{pl.passes[0].w_in:.1f} → {pl.w_final:.1f} %, съём до {pl.max_dw:.1f} п.п.",
+                          "  ".join(f"{ps.k}-й: {ps.w_in:.1f}→{ps.w_out:.1f} %, D {ps.d:.0f}" for ps in pl.passes))
         rows = []
         if res.placement:
             rows.append(("приём", "с поля → " + ", ".join(names[i] for i, _m in res.placement),
@@ -297,6 +325,16 @@ class SilosTab(QWidget):
                     it.setForeground(self.palette().placeholderText())
                 self.steps.setItem(r, 5 + i, it)
         self.steps.resizeColumnsToContents()
+        self.flow.set_plan(res, silos, pl.passes)
+        self.flow_scroll.verticalScrollBar().setValue(0)
+        self.btn_png.setEnabled(bool(res.steps))
+
+    def _save_png(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        path, _f = QFileDialog.getSaveFileName(self, "Сохранить схему", "Размещение по силосам.png", "Картинка (*.png)")
+        if path:
+            ok = self.flow.save_png(path)
+            self.win.statusBar().showMessage(("Схема сохранена: " + path) if ok else "Не удалось сохранить схему.", 12000)
 
     # ---------------------------------------------------------------- состояние
     def _load(self) -> None:
@@ -319,6 +357,8 @@ class SilosTab(QWidget):
         self.cap_note.setVisible(not self._caps_set)
         self.result = None
         self.steps.setRowCount(0)
+        self.flow.set_plan(None, [])
+        self.btn_png.setEnabled(False)
         self.head.setText("Впишите зерно и силосы и нажмите «Построить план».")
         self.sub.setText("")
         for x in (self.t_steps, self.t_time, self.t_mass, self.t_regime):

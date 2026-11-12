@@ -3342,6 +3342,15 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     n = len(tab._drying_plan.passes)
     assert tab.result.ok and "План есть" in tab.head.text() and tab.steps.rowCount() == len(tab.result.steps) + 1
     assert len(tab.result.steps) == 2 * n and not tab.cap_note.isVisibleTo(tab)
+    # схема: главный вид — силосы и стрелки по шагам; высота растёт с числом шагов; сохраняется картинкой
+    from app.silo_flow import BAND_H, ROW_H
+    assert tab.views.tabText(0) == "Схема" and tab.views.currentIndex() == 0 and tab.flow.plan is tab.result
+    kinds = [k for k, _x in tab.flow._rows()]
+    assert kinds.count("step") == 2 * n and kinds.count("band") == n and kinds[0] == "intake"
+    assert tab.flow.minimumHeight() >= (2 * n + 1) * ROW_H + n * BAND_H and tab.btn_png.isEnabled()
+    png = _tmp("silos.png")
+    assert tab.flow.save_png(png) and os.path.getsize(png) > 5000
+    win.grab()                                                              # отрисовка схемы не падает
     tab.tbl.item(3, ts.COL_INTAKE).setCheckState(Qt.Checked)                # силос приёмки — один и не конечный
     tab.tbl.item(2, ts.COL_INTAKE).setCheckState(Qt.Checked)
     assert [s.intake for s in tab.silos()] == [False, False, True, False]
@@ -3349,6 +3358,7 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     assert saved["new"] == 1100.0 and saved["silos"][0]["cap"] == 600.0 and saved["silos"][0]["target"]
     tab._load()
     assert tab.silos()[1].target and tab.new_mass.value() == 1100.0 and tab.result is None
+    assert tab.flow.plan is None and not tab.btn_png.isEnabled()
     win.close()
 
 
