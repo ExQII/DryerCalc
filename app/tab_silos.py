@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 NAMES = ("С\u00a01", "С\u00a02", "С\u00a03", "С\u00a04")
 DOW = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 COL_NAME, COL_CAP, COL_MASS, COL_DONE, COL_RAW, COL_TARGET, COL_NEXT = range(7)
+MAX_NEXT = 2                    # сколько силосов можно отметить под следующую партию
 DEFAULT_CAP = 500.0             # т — стартовая вместимость оперативного силоса, пока не вписана своя
 
 ABOUT = (
@@ -48,9 +49,10 @@ ABOUT = (
     "после сушки; съём влаги, D и тонны в час по проходам — из модели сушилки, как в «Плане сушки партии»."
     "<br><br><b>Под сырое.</b> Отметьте силосы, в которые принимаете сырое зерно этой партии, — с них начнётся "
     "сушка. Если не отмечать, программа выберет сама."
-    "<br><br><b>Следующая партия.</b> Отмеченный силос к началу последнего прохода будет пуст и в последнем "
-    "проходе не участвует: пока досушивается эта партия, в него принимают следующую с поля. В ранних проходах он "
-    "работает как все. Программа напишет, с какого времени он свободен."
+    "<br><br><b>Следующая партия.</b> Отмеченные силосы (один или два) к началу последнего прохода будут пусты и "
+    "в последнем проходе не участвуют: пока досушивается эта партия, в них принимают следующую с поля. В ранних "
+    "проходах они работают как все. Если отмечено два, а оба к последнему проходу освободить нельзя, пустым будет "
+    "один, второй освободится по ходу последнего прохода. Программа напишет, с какого времени свободен каждый."
     "<br><br><b>Чего план не знает.</b> Зерна в самой сушилке (оно уходит в приёмник в конце шага) и силосов "
     "хранения С 5 – С 8. Вместимости в тоннах зависят от культуры и натуры — впишите свои.")
 
@@ -125,9 +127,9 @@ class SilosTab(QWidget):
                                                       "прохода.")
         t.horizontalHeaderItem(COL_RAW).setToolTip("Силосы, в которые принимаете сырое зерно этой партии, — с них "
                                                    "начинается сушка. Не отмечено — программа выберет сама.")
-        t.horizontalHeaderItem(COL_NEXT).setToolTip("Силос под следующую партию: к началу последнего прохода он будет "
-                                                    "пуст, и пока досушивается эта партия, в него можно принимать "
-                                                    "зерно с поля. В ранних проходах он работает как все.")
+        t.horizontalHeaderItem(COL_NEXT).setToolTip("Силосы под следующую партию (один или два): к началу последнего "
+                                                    "прохода они будут пусты, и пока досушивается эта партия, в них "
+                                                    "можно принимать зерно с поля. В ранних проходах работают как все.")
         self.tbl = t
         gv.addWidget(t)
         self.cap_note = mute(QLabel("Вместимости стоят условные (500 т) — впишите свои: от них зависит весь план."))
@@ -242,12 +244,14 @@ class SilosTab(QWidget):
     def _table_changed(self, it: QTableWidgetItem) -> None:
         if self._loading:
             return
-        if it.column() == COL_NEXT and it.checkState() == Qt.Checked:         # силос под следующую партию один
+        if it.column() == COL_NEXT and it.checkState() == Qt.Checked:         # под следующую партию — не больше двух
             self._loading = True
-            for r in range(self.tbl.rowCount()):
-                if r != it.row():
-                    self.tbl.item(r, COL_NEXT).setCheckState(Qt.Unchecked)
             self.tbl.item(it.row(), COL_TARGET).setCheckState(Qt.Unchecked)   # и не конечный
+            marked = [r for r in range(self.tbl.rowCount()) if self.tbl.item(r, COL_NEXT).checkState() == Qt.Checked]
+            if len(marked) > MAX_NEXT:
+                it.setCheckState(Qt.Unchecked)
+                self.win.statusBar().showMessage(
+                    f"Под следующую партию — не больше {MAX_NEXT} силосов: иначе сушить эту партию будет негде.", 10000)
             self._loading = False
         if it.column() == COL_TARGET and it.checkState() == Qt.Checked:
             self._loading = True
@@ -350,7 +354,9 @@ class SilosTab(QWidget):
         if res.ok:
             self.head.setText(f"План есть: после {n}-го прохода всё зерно — в {tg}.")
         elif res.hold_broken:
-            self.head.setText(f"{names[res.hold]} к последнему проходу не освобождается — план без этого условия ниже.")
+            self.head.setText(", ".join(names[h] for h in res.marked) + " к последнему проходу не "
+                              + ("освобождается" if len(res.marked) == 1 else "освобождаются")
+                              + " — план без этого условия ниже.")
         else:
             self.head.setText("Полностью в отмеченные силосы зерно не приходит — ближайший план ниже.")
         notes = []
@@ -360,10 +366,16 @@ class SilosTab(QWidget):
             notes.append("Сырое зерно принять: " + ", ".join(f"{names[i]} — {_t(m)} т" for i, m in res.placement) + ".")
         if not pl.reaches_target:
             notes.append(f"За {n} прох. модель даёт {pl.w_final:.1f} %, а цель {self.wk.value():.1f} % — добавьте проход.")
-        if res.hold is not None and not res.hold_broken and res.steps:
-            if res.hold_from is not None:
-                notes.append(f"Следующую партию можно принимать в {names[res.hold]} с {_when(res.hold_from)} — "
-                             f"за {fmt_hours(res.hold_hours)} до конца сушки.")
+        if res.marked and not res.hold_broken and res.steps and res.hold_free_h:
+            order = sorted(res.hold_free_h, key=res.hold_free_h.get)
+            end_h = res.steps[-1].h1
+            parts = []
+            for h in order:
+                left = end_h - res.hold_free_h[h]
+                when = f"с {_when(res.hold_free[h])}" if res.hold_free[h] else ""
+                tail = f"за {fmt_hours(left)} до конца сушки" if left > 0.05 else "с концом сушки"
+                parts.append(f"в {names[h]} — " + (f"{when}, {tail}" if when and left > 0.05 else (when or tail)))
+            notes.append("Следующую партию можно принимать: " + "; ".join(parts) + ".")
         if res.ok and res.fifo_breaks:
             only = best is not None and best.fifo_breaks > 0
             notes.append(f"В {res.fifo_breaks} шаг. зерно сушится не по очереди (в другом силосе зерно того же прохода "

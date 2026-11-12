@@ -234,10 +234,10 @@ class SiloFlow(QWidget):
                 continue
             s = obj
             idx = self.plan.steps.index(s) + 1
-            hold = self.plan.hold if not self.plan.hold_broken else None
+            freed = self.plan.hold_step if not self.plan.hold_broken else {}   # силос → после какого шага свободен
             for i in range(ns):
                 silo(i, y, s.after[i], was=prev_state[i][0] if i == s.src else None, accent=i == s.dst,
-                     receiving=i == hold and s.k >= n and s.after[i][0] <= EPS)
+                     receiving=i in freed and idx >= freed[i] and s.after[i][0] <= EPS)
             # стрелка: из источника вверх, по дорожке через сушилку, вниз в приёмник
             col = QColor(t.ink2)
             p.setPen(QPen(col, 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))

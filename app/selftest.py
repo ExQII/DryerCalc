@@ -506,12 +506,16 @@ def run(out_path: str) -> int:
         _sp = _plan_silos(_sl, 1100.0, 3, [0.93, 0.93, 0.93], rates=[18.0, 20.0, 22.0], overhead_h=2.0)
         _sl3 = [_Silo(f"С{i + 1}", 500.0, 0.0, 0, i >= 2, i < 2, i == 0) for i in range(4)]      # сырое С1, С2; след. — С1
         _sp3 = _plan_silos(_sl3, 900.0, 3, [0.93, 0.93, 0.93])
+        _sl4 = [_Silo(f"С{i + 1}", 500.0, 0.0, 0, i >= 2, i < 2, i < 2) for i in range(4)]       # след. — С1 и С2
+        _sp4 = _plan_silos(_sl4, 900.0, 3, [0.93, 0.93, 0.93])
         check(_sp.ok and len(_sp.steps) == 6 and _sp.final[2][0] < 0.05 and _sp.final[3][0] < 0.05
               and not _plan_silos(_sl, 2400.0, 3, [0.93] * 3).ok and hasattr(win, "tab_silos")
               and _sp3.ok and _sp3.hold == 0 and sorted(i for i, _m in _sp3.placement) == [0, 1]
-              and all(0 not in (x.src, x.dst) for x in _sp3.steps if x.k == 3),
+              and all(0 not in (x.src, x.dst) for x in _sp3.steps if x.k == 3)
+              and len(_sp4.holds) == 1 and _sp4.marked == [0, 1] and _sp4.ok and set(_sp4.hold_step) == {0, 1},
               f"силосы: 1100 т, 3 прохода, в конце в С1 и С2 — {len(_sp.steps)} переключений, {_sp.hours:.0f} ч; "
-              "все четыре заняты — сушить некуда; силос под следующую партию на последнем проходе свободен")
+              "все четыре заняты — сушить некуда; силос под следующую партию на последнем проходе свободен; "
+              "из двух отмеченных пуст один, второй освобождается по ходу")
         # --- v1.9.2: часы, натура зерна, номер прохода из журнала ---
         from datetime import datetime as _dt92
         _pn = mdl.set_natura(win.params, win.params.natura * 1.1, _dt92(2030, 1, 1))

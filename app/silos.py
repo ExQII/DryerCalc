@@ -11,8 +11,10 @@
 * силос, освободившийся в ходе прохода, в этом же проходе может стать приёмником;
 * масса после прохода меньше: m · (100 − W до) / (100 − W после) — в силос помещается больше высушенного зерна;
 * сырое зерно принимают в силосы, отмеченные «под сырое» (если не отмечены — программа выбирает сама);
-* силос «под следующую партию» к началу последнего прохода должен быть пуст и в последнем проходе не участвует:
-  пока досушивается эта партия, в него принимают следующую с поля. В ранних проходах он работает как все.
+* силосы «под следующую партию» (один или два) к началу последнего прохода должны быть пусты и в последнем
+  проходе не участвуют: пока досушивается эта партия, в них принимают следующую с поля. В ранних проходах они
+  работают как все. Отмечено два, а оба освободить нельзя — пуст один (с которым план лучше), второй
+  освобождается по ходу последнего прохода; нельзя и так — план без условия (hold_broken).
 
 Поиск. Состояние — (масса, пройдено проходов) по каждому силосу; шаг — «источник → приёмник» на всё, что есть в
 источнике, или сколько поместится в приёмник. Перебор по возрастанию числа шагов (кратчайший путь по состояниям,
@@ -95,7 +97,12 @@ class SiloPlan:
     variants: List["SiloPlan"] = field(default_factory=list)       # все найденные планы, лучший первым (сам план — [0])
     n_variants: int = 0                 # сколько вариантов найдено всего (показывается не больше SHOW_VARIANTS)
     variants_capped: bool = False       # перебор остановлен на MAX_VARIANTS
-    hold: Optional[int] = None          # силос под следующую партию
+    hold: Optional[int] = None          # первый из силосов под следующую партию (см. holds)
+    marked: List[int] = field(default_factory=list)         # силосы, отмеченные под следующую партию
+    holds: List[int] = field(default_factory=list)          # из них пусты уже к началу последнего прохода
+    hold_step: Dict[int, int] = field(default_factory=dict) # силос → после какого шага свободен (0 — с самого начала)
+    hold_free: Dict[int, Optional[datetime]] = field(default_factory=dict)     # силос → с какого момента свободен
+    hold_free_h: Dict[int, float] = field(default_factory=dict)                # то же в часах от начала плана
     hold_from: Optional[datetime] = None        # с какого момента он свободен (None — времени нет или не свободен)
     hold_hours: float = 0.0             # сколько часов от его освобождения до конца сушки
     hold_broken: bool = False           # освободить его к последнему проходу не удалось — план без этого условия
@@ -106,21 +113,21 @@ def _key(st: Sequence[Tuple[float, int]]) -> State:
 
 
 def _moves(st: Sequence[Tuple[float, int]], caps: Sequence[float], free: Sequence[bool], n: int,
-           factors: Sequence[float], hold: Optional[int] = None):
+           factors: Sequence[float], hold: Sequence[int] = ()):
     """Возможные шаги из состояния: (источник, приёмник, т из источника, т в приёмник, новое состояние)."""
     live = [d for (m, d), ok in zip(st, free) if ok and m > EPS and d < n]
     if not live:
         return
     cur = min(live)                                 # идёт проход cur + 1: остальное зерно ждёт
-    last = hold is not None and cur == n - 1        # последний проход: силос под следующую партию не трогаем
-    if last and st[hold][0] > EPS:
-        return                                      # он занят — принимать следующую партию некуда: тупик
+    last = bool(hold) and cur == n - 1              # последний проход: силосы под следующую партию не трогаем
+    if last and any(st[h][0] > EPS for h in hold):
+        return                                      # один из них занят — принимать следующую партию некуда: тупик
     f = factors[cur]
     for i, (mi, di) in enumerate(st):
         if not free[i] or mi <= EPS or di != cur:
             continue
         for j, (mj, dj) in enumerate(st):
-            if j == i or not free[j] or (last and j == hold):
+            if j == i or not free[j] or (last and j in hold):
                 continue
             if mj > EPS and dj != cur + 1:
                 continue                            # в приёмнике зерно другого прохода
@@ -137,7 +144,7 @@ def _moves(st: Sequence[Tuple[float, int]], caps: Sequence[float], free: Sequenc
 
 
 def _search(start: Sequence[Tuple[float, int]], caps: Sequence[float], free: Sequence[bool], targets: Sequence[bool],
-            n: int, factors: Sequence[float], hold: Optional[int] = None):
+            n: int, factors: Sequence[float], hold: Sequence[int] = ()):
     """Кратчайшая по числу шагов цепочка до «всё зерно прошло n проходов». Возвращает (масса вне заданных силосов,
     число шагов, цепочка) лучшего конца или None, если ни один конец недостижим."""
     def misplaced(st) -> float:
@@ -189,7 +196,7 @@ class _Dist:
     """Наименьшее число шагов от состояния до «всё зерно прошло n проходов и лежит в отмеченных силосах» (INF —
     недостижимо). С запоминанием: шаги только продвигают зерно вперёд, циклов нет."""
 
-    def __init__(self, caps, free, targets, n, factors, hold=None):
+    def __init__(self, caps, free, targets, n, factors, hold=()):
         self.caps, self.free, self.targets, self.n, self.factors = caps, free, targets, n, factors
         self.hold = hold
         self.memo: Dict[State, int] = {}
@@ -294,7 +301,7 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
     free = [True] * len(silos)
     targets = [s.target for s in silos]
     names = [s.name for s in silos]
-    hold = next((i for i, s in enumerate(silos) if s.next_batch), None)
+    hold = tuple(i for i, s in enumerate(silos) if s.next_batch)
     res = SiloPlan(ok=False)
     if n < 1 or len(factors) < n:
         res.reason = "Не задано число проходов."
@@ -302,8 +309,9 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
     if not any(targets):
         res.reason = "Отметьте хотя бы один конечный силос — где зерно должно лежать после сушки."
         return res
-    if hold is not None and targets[hold]:
-        res.reason = (f"{names[hold]} отмечен и конечным, и под следующую партию: на последнем проходе в конечный силос "
+    both = [h for h in hold if targets[h]]
+    if both:
+        res.reason = (f"{names[both[0]]} отмечен и конечным, и под следующую партию: на последнем проходе в конечный силос "
                       "идёт зерно, принимать в него следующую партию нельзя.")
         return res
     for s in silos:
@@ -384,40 +392,61 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
     # Все варианты, которые приводят зерно в отмеченные силосы: по каждому размещению сырого зерна — все цепочки не
     # длиннее кратчайшей + EXTRA_STEPS. Сортировка: сначала без нарушений очерёдности («что дольше лежит — то раньше
     # сушим»), затем меньше переключений, меньше дроблений, раньше конец.
-    exact: List[SiloPlan] = []
     starts = [(pl, start_of(pl)) for pl in places]
-    dist = _Dist(caps, free, targets, n, factors, hold)
-    shortest = min((dist(st) for _pl, st in starts), default=INF)
-    hold_broken = False
-    if shortest >= INF and hold is not None:
-        # с пустым силосом под следующую партию плана нет — показать план без этого условия и сказать об этом
-        dist = _Dist(caps, free, targets, n, factors, None)
+    marked = hold                      # всё, что отмечено под следующую партию
+
+    def variants_for(hs):
+        """Все варианты, в которых силосы hs пусты к началу последнего прохода: (варианты, обрезано ли)."""
+        out: List[SiloPlan] = []
+        dist = _Dist(caps, free, targets, n, factors, hs)
         shortest = min((dist(st) for _pl, st in starts), default=INF)
-        hold_broken = shortest < INF
-    seen = set()
-    capped = False
-    if shortest < INF:
+        if shortest >= INF:
+            return out, False
+        seen = set()
         # по очереди и кратчайшие — первыми; затем на одно переключение длиннее; затем те же без очерёдности
         for fifo, extra in ((True, 0), (True, EXTRA_STEPS), (False, 0), (False, EXTRA_STEPS)):
             for pl, st0 in starts:
-                if dist(st0) > shortest + extra or len(exact) >= MAX_VARIANTS:
+                if dist(st0) > shortest + extra or len(out) >= MAX_VARIANTS:
                     continue
                 for chain in _all_chains(st0, caps, free, n, factors, dist, shortest + extra,
-                                         MAX_VARIANTS - len(exact), fifo):
+                                         MAX_VARIANTS - len(out), fifo):
                     sig = (tuple(sorted((i, round(m, 1)) for i, m in pl)), tuple(mv[:2] for mv, _a in chain))
                     if sig not in seen:
                         seen.add(sig)
-                        exact.append(build(pl, st0, chain, 0.0))
-            if len(exact) >= MAX_VARIANTS:
-                capped = True
-                break
+                        out.append(build(pl, st0, chain, 0.0))
+            if len(out) >= MAX_VARIANTS:
+                return out, True
+        return out, False
+
+    def free_step(r) -> int:
+        """На каких шагах отмеченные под следующую партию силосы освобождаются окончательно (раньше — лучше)."""
+        return sum(max((k for k, x in enumerate(r.steps, 1) if h in (x.src, x.dst)), default=0) for h in marked)
+
+    def key(r):
+        return (r.fifo_breaks, len(r.steps), sum(1 for x in r.steps if x.split), free_step(r),
+                len(used_silos(r)), r.hours)
+
+    # Силосы под следующую партию: сначала — все отмеченные пусты к последнему проходу; не выходит и отмечено два —
+    # пуст хотя бы один из них (тот, с которым план лучше), второй освободится по ходу последнего прохода; не выходит
+    # и так — план без этого условия.
+    exact: List[SiloPlan] = []
+    capped = False
+    hold_broken = False
+    tries = [marked] + ([(h,) for h in marked] if len(marked) > 1 else []) + ([()] if marked else [])
+    best_try = None
+    for hs in tries:
+        if best_try is not None and len(hs) < len(best_try[0]):
+            break                                   # уже нашлось с более строгим условием
+        got, cp = variants_for(hs)
+        if not got:
+            continue
+        got.sort(key=key)
+        if best_try is None or key(got[0]) < key(best_try[1][0]):
+            best_try = (hs, got, cp)
+    if best_try is not None:
+        hold, exact, capped = best_try
+        hold_broken = bool(marked) and not hold
     if exact:
-        def free_step(r) -> int:
-            """На каком шаге силос под следующую партию освобождается окончательно (раньше — лучше)."""
-            return max((k for k, x in enumerate(r.steps, 1) if hold in (x.src, x.dst)), default=0)
-        exact.sort(key=lambda r: (r.fifo_breaks, len(r.steps), sum(1 for x in r.steps if x.split),
-                                  free_step(r) if hold is not None and not hold_broken else 0,
-                                  len(used_silos(r)), r.hours))
         res = exact[0]
         res.variants = exact[:SHOW_VARIANTS]
         res.n_variants = len(exact)
@@ -425,9 +454,9 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
     else:
         best = None
         for pl, st in starts:
-            found = _search(st, caps, free, targets, n, factors, hold)
-            if found is None and hold is not None:
-                found = _search(st, caps, free, targets, n, factors, None)
+            found = _search(st, caps, free, targets, n, factors, marked)
+            if found is None and marked:
+                found = _search(st, caps, free, targets, n, factors, ())
                 hold_broken = hold_broken or found is not None
             if found is None:
                 continue
@@ -445,30 +474,63 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
         res.variants, res.n_variants = [res], 1
     # Силос под следующую партию: с какого момента он свободен (после последнего шага, который его трогает) и хватит
     # ли его до конца сушки при заданном приходе.
+    held = ", ".join(names[h] for h in marked)
     for var in res.variants:
-        var.hold = hold
-        if hold is None:
+        var.marked = list(marked)
+        var.holds = list(hold) if not hold_broken else []
+        var.hold = marked[0] if marked else None
+        if not marked:
             if inflow_tpd > 0:
                 var.warnings.append("Указан приход с поля, но не отмечен силос под следующую партию.")
             continue
         if hold_broken:
             var.hold_broken = True
             var.ok = False
-            var.reason = (f"Освободить {names[hold]} к последнему проходу не получается: без него зерно в конечные "
-                          "силосы не приходит. Ниже — план без этого условия: следующую партию в "
-                          f"{names[hold]} принимать можно только после конца сушки. Отметьте под следующую партию "
-                          "другой силос или освободите ещё один.")
+            var.reason = (f"Освободить {held} к последнему проходу не получается: без "
+                          + ("него" if len(marked) == 1 else "них") + " зерно в конечные силосы не приходит. Ниже — "
+                          f"план без этого условия: следующую партию в {held} принимать можно только после конца "
+                          "сушки. Отметьте под следующую партию "
+                          + ("другой силос" if len(marked) == 1 else "другие силосы") + " или освободите ещё один.")
             continue
-        touch = [x for x in var.steps if hold in (x.src, x.dst)]
-        if var.start_state[hold][0] > EPS and not touch:
+        for h in marked:
+            touch = [x for x in var.steps if h in (x.src, x.dst)]
+            if var.final[h][0] > EPS:
+                continue                            # в нём осталось зерно — под следующую партию не свободен
+            var.hold_free[h] = touch[-1].end if touch else start
+            var.hold_free_h[h] = touch[-1].h1 if touch else 0.0
+            var.hold_step[h] = max((k for k, x in enumerate(var.steps, 1) if h in (x.src, x.dst)), default=0)
+        late = [h for h in marked if h not in hold]
+        if late:
+            var.warnings.append(
+                "К началу последнего прохода свободен только " + ", ".join(names[h] for h in hold) + ": "
+                + ", ".join(names[h] for h in late) + " занят зерном этой партии и освободится по ходу последнего "
+                "прохода.")
+        if not var.hold_free_h:
             continue
-        var.hold_from = touch[-1].end if touch else start
-        var.hold_hours = max(var.hours - (touch[-1].h1 if touch else 0.0), 0.0)
+        first = min(var.hold_free_h, key=var.hold_free_h.get)
+        var.hold_from = var.hold_free[first]
+        end_h = var.steps[-1].h1 if var.steps else 0.0          # конец сушки (без переключений после неё)
+        var.hold_hours = max(end_h - var.hold_free_h[first], 0.0)
         if inflow_tpd > 0:
-            h_full = silos[hold].cap / inflow_tpd * 24.0
-            if h_full < var.hold_hours:
-                var.warnings.append(
-                    f"{names[hold]} заполнится за {h_full:.0f} ч приёма ({silos[hold].cap:.0f} т при {inflow_tpd:.0f} "
-                    f"т/сут), а до конца сушки от его освобождения — {var.hold_hours:.0f} ч: приём придётся "
-                    "остановить или принимать куда-то ещё.")
+            # Приём идёт с момента, когда свободен первый силос; второй добавляет вместимость, когда освободится.
+            # Переполнение — первый момент, когда принятое больше вместимости уже свободных силосов.
+            order = sorted(var.hold_free_h.items(), key=lambda kv: kv[1])
+            rate = inflow_tpd / 24.0
+            t0, cap_sum = order[0][1], 0.0
+            for k, (h, _f) in enumerate(order):
+                cap_sum += silos[h].cap
+                t_full = t0 + cap_sum / rate
+                nxt = order[k + 1] if k + 1 < len(order) else None
+                if nxt is not None and t_full >= nxt[1]:
+                    continue                        # следующий силос освободится раньше, чем заполнятся эти
+                if t_full < end_h - 0.5:
+                    if nxt is not None:
+                        tail = (f"а {names[nxt[0]]} освободится только через {nxt[1] - t0:.0f} ч: на "
+                                f"{nxt[1] - t_full:.0f} ч приём придётся остановить или принимать куда-то ещё.")
+                    else:
+                        tail = (f"а до конца сушки от начала приёма — {end_h - t0:.0f} ч: приём придётся "
+                                "остановить или принимать куда-то ещё.")
+                    var.warnings.append(f"Под следующую партию места хватит на {t_full - t0:.0f} ч приёма "
+                                        f"({inflow_tpd:.0f} т/сут), " + tail)
+                break
     return res
