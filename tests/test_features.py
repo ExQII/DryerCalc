@@ -3263,8 +3263,9 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     оно лежало в отмеченных силосах; сыпать только в пустой силос или к зерну того же прохода."""
     from app.silos import EPS, Silo, plan_silos
 
-    def silos(caps, targets, masses=(0, 0, 0, 0), done=(0, 0, 0, 0), intake=None):
-        return [Silo(f"С{i + 1}", caps[i], masses[i], done[i], (i + 1) in targets, intake == i + 1) for i in range(4)]
+    def silos(caps, targets, masses=(0, 0, 0, 0), done=(0, 0, 0, 0), nxt=None, raw=()):
+        return [Silo(f"С{i + 1}", caps[i], masses[i], done[i], (i + 1) in targets, (i + 1) in raw, nxt == i + 1)
+                for i in range(4)]
 
     def check(sl, new, n, res, f):
         """Правила: приёмник пуст или с зерном того же прохода; масса сходится; проходы идут по порядку."""
@@ -3277,7 +3278,7 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
         for s in res.steps:
             mi, di = st[s.src]
             mj, dj = st[s.dst]
-            assert s.src != s.dst and not sl[s.src].intake and not sl[s.dst].intake
+            assert s.src != s.dst
             assert di == s.k - 1 and s.k >= last and (mj <= EPS or dj == s.k)             # без смешивания проходов
             assert s.m_in <= mi + 0.01 and abs(s.m_out - s.m_in * f[s.k - 1]) < 0.01
             assert mj + s.m_out <= sl[s.dst].cap + 0.01
@@ -3315,13 +3316,35 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     # отмеченных силосов мало: ближайший план и причина
     r = plan_silos(silos([600] * 4, {1}), 1100.0, 3, f3)
     assert not r.ok and r.steps and r.misplaced > 100 and "помещается 600" in r.reason
-    # силос приёмки с поля в плане не участвует; места в нём до конца плана не хватит — предупреждение
-    sl = silos([600] * 4, {1, 2}, intake=4)
+    # 1.10.3: сырое — только в отмеченные силосы; силос под следующую партию к последнему проходу пуст и в нём не
+    # участвует (в ранних проходах работает как все); программа пишет, с какого времени он свободен
+    t0 = datetime(2026, 11, 13, 8, 0)
+    sl = silos([500] * 4, {3, 4}, nxt=1, raw={1, 2})
+    r = plan_silos(sl, 900.0, 3, f3, rates=[18.0, 20.0, 22.0], overhead_h=2.0, start=t0)
+    st = check(sl, 900.0, 3, r, f3)
+    assert r.ok and sorted(i for i, _m in r.placement) == [0, 1] and st[0][0] <= EPS and st[1][0] <= EPS
+    assert r.hold == 0 and not r.hold_broken and any(0 in (s.src, s.dst) for s in r.steps if s.k < 3)
+    for v in r.variants:
+        last = [s for s in v.steps if s.k == 3]
+        assert all(0 not in (s.src, s.dst) for s in last) and all(s.after[0][0] <= EPS for s in last)
+    touch = [s for s in r.steps if 0 in (s.src, s.dst)]
+    assert r.hold_from == touch[-1].end and t0 < r.hold_from <= [s for s in r.steps if s.k == 3][0].start
+    assert abs(r.hold_hours - (r.hours - touch[-1].h1)) < 1e-9 and r.hold_hours > 30
+    # под следующую партию отмечен силос, без которого не обойтись — план без этого условия и причина
+    r1 = plan_silos(sl, 900.0, 1, f3)
+    assert not r1.ok and r1.hold_broken and r1.steps and r1.hold_from is None and "не получается" in r1.reason
+    # сырое в отмеченные силосы не помещается; силос и конечный, и под следующую партию; под сырое — с подсушенным
+    assert "Отметьте под сырое ещё один" in plan_silos(silos([500] * 4, {3, 4}, raw={1}), 900.0, 3, f3).reason
+    assert "и конечным, и под следующую" in plan_silos(silos([500] * 4, {3, 4}, nxt=3, raw={1, 2}), 900.0, 3, f3).reason
+    assert "к подсушенному" in plan_silos(silos([500] * 4, {3}, (300, 0, 0, 0), (1, 0, 0, 0), raw={1}), 100.0, 3, f3).reason
+    # приход следующей партии: её силос переполнится раньше конца сушки — предупреждение
+    sl = silos([600] * 4, {1, 2}, nxt=4, raw={1, 2})
     r = plan_silos(sl, 1100.0, 3, f3, rates=[18.0, 20.0, 22.0], inflow_tpd=300.0)
     check(sl, 1100.0, 3, r, f3)
-    assert r.ok and all(s.src != 3 and s.dst != 3 for s in r.steps) and "заполнится через 48 ч" in r.warnings[0]
+    assert r.ok and r.hold_hours == r.hours and "заполнится за 48 ч" in r.warnings[0]     # С4 не нужен — свободен сразу
     assert not plan_silos(sl, 1100.0, 3, f3, rates=[18.0, 20.0, 22.0], inflow_tpd=10.0).warnings
-    assert "не выбран силос приёмки" in plan_silos(silos([600] * 4, {1, 2}), 1100.0, 3, f3, inflow_tpd=100.0).warnings[0]
+    assert "не отмечен силос под следующую" in plan_silos(silos([600] * 4, {1, 2}), 1100.0, 3, f3,
+                                                          inflow_tpd=100.0).warnings[0]
     # очерёдность: в новом проходе первым сушится зерно, которое лежит дольше (наполнили С3, потом С4 — берём из С3)
     r2 = plan_silos(silos([600] * 4, {1, 2}), 1100.0, 2, f3)
     assert r2.fifo_breaks == 0 and not any(s.out_of_turn for s in r2.steps)
@@ -3329,13 +3352,13 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     assert first != second and [s.src for s in r2.steps[2:]] == [first, second]
     # варианты: все планы до отмеченных силосов, лучший первым — по очереди, меньше переключений, меньше занятых силосов
     from app.silos import SHOW_VARIANTS, used_silos
-    r = plan_silos(silos([600] * 4, {1, 2}, intake=4), 1100.0, 3, f3)
-    assert r.variants[0] is r and r.n_variants == 64 and len(r.variants) == SHOW_VARIANTS and not r.variants_capped
+    r = plan_silos(silos([500] * 4, {3, 4}, nxt=1, raw={1, 2}), 900.0, 3, f3)
+    assert r.variants[0] is r and r.n_variants == 160 and len(r.variants) == SHOW_VARIANTS and not r.variants_capped
     ranks = [(v.fifo_breaks, len(v.steps)) for v in r.variants]
-    assert ranks == sorted(ranks) and ranks[0] == (0, 6) and any(b > 0 for b, _n in ranks)
+    assert ranks == sorted(ranks) and ranks[0] == (0, 6)
     sigs = {(tuple(v.placement), tuple((s.src, s.dst) for s in v.steps)) for v in r.variants}
-    assert len(sigs) == len(r.variants) and all(v.ok and check(silos([600] * 4, {1, 2}, intake=4), 1100.0, 3, v, f3)
-                                                for v in r.variants)
+    assert len(sigs) == len(r.variants) and all(v.ok and check(silos([500] * 4, {3, 4}, nxt=1, raw={1, 2}), 900.0, 3,
+                                                               v, f3) for v in r.variants)
     big = plan_silos(silos([600] * 4, {1, 2}), 1100.0, 3, f3)
     assert big.variants_capped and big.n_variants >= 1000 and len(used_silos(big)) == 3      # четвёртый силос свободен
     assert all(len(used_silos(v)) >= 3 for v in big.variants)
@@ -3353,6 +3376,7 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     from app import pages, tab_silos as ts
     win = _window("silos110.db")
     tab = win.tab_silos
+    assert [s.cap for s in tab.silos()] == [500.0] * 4 and not tab.cap_note.isHidden()      # 500 т, пока не вписаны свои
     assert win.tabs.indexOfText(pages.SILOS) >= 0 and pages.SILOS not in pages.OPERATOR_PAGES
     tab.new_mass.setValue(1100.0)
     tab.w0.setValue(30.0)
@@ -3382,11 +3406,22 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     assert tab.current_plan() is tab.result.variants[3] and tab.flow.plan is tab.result.variants[3]
     assert tab.steps.rowCount() == len(tab.result.variants[3].steps) + 1
     tab.variant.setCurrentIndex(0)
-    tab.tbl.item(3, ts.COL_INTAKE).setCheckState(Qt.Checked)                # силос приёмки — один и не конечный
-    tab.tbl.item(2, ts.COL_INTAKE).setCheckState(Qt.Checked)
-    assert [s.intake for s in tab.silos()] == [False, False, True, False]
+    tab.tbl.item(3, ts.COL_NEXT).setCheckState(Qt.Checked)                  # под следующую партию — один и не конечный
+    tab.tbl.item(2, ts.COL_NEXT).setCheckState(Qt.Checked)
+    assert [s.next_batch for s in tab.silos()] == [False, False, True, False]
+    tab.tbl.item(2, ts.COL_TARGET).setCheckState(Qt.Checked)
+    assert not tab.silos()[2].next_batch
+    tab.tbl.item(2, ts.COL_TARGET).setCheckState(Qt.Unchecked)
+    tab.tbl.item(2, ts.COL_NEXT).setCheckState(Qt.Checked)
+    tab.tbl.item(0, ts.COL_RAW).setCheckState(Qt.Checked)                   # сырое — в С1 и С2, как и было в плане
+    tab.tbl.item(1, ts.COL_RAW).setCheckState(Qt.Checked)
+    cur = tab.current_plan()
+    assert cur.ok and cur.hold == 2 and sorted(i for i, _m in cur.placement) == [0, 1]
+    assert "Следующую партию можно принимать в" in tab.sub.text()
+    win.grab()
     saved = win.storage.get_json("ui_silos")
     assert saved["new"] == 1100.0 and saved["silos"][0]["cap"] == 600.0 and saved["silos"][0]["target"]
+    assert saved["silos"][0]["raw"] and saved["silos"][2]["next"] and not saved["silos"][3]["next"]
     tab._load()
     assert tab.silos()[1].target and tab.new_mass.value() == 1100.0 and tab.result is None
     assert tab.flow.plan is None and not tab.btn_png.isEnabled()

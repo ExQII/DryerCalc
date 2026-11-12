@@ -3,7 +3,8 @@
 
 Каждая строка — одно переключение маршрута. Силосы нарисованы после шага: высота заливки — доля вместимости, цвет —
 сколько проходов прошло зерно (от сырого к готовому). В силосе-источнике пунктиром показано, сколько из него ушло;
-силос-приёмник обведён. Перед шагами каждого прохода — полоса с режимом прохода (влажность, D). Первая строка —
+силос-приёмник обведён; на последнем проходе силос под следующую партию —
+синим пунктиром со стрелкой. Перед шагами каждого прохода — полоса с режимом прохода (влажность, D). Первая строка —
 приём сырого зерна с поля. Данные — silos.SiloPlan; цвета — токены оформления (светлая и тёмная тема).
 """
 from __future__ import annotations
@@ -132,8 +133,14 @@ class SiloFlow(QWidget):
         y = float(LEGEND_H + PAD)
         prev_state = [(s.mass, s.done if s.mass > EPS else 0) for s in self.silos]
 
-        def silo(i: int, top: float, state, was=None, accent: bool = False) -> None:
-            """Силос i в строке с верхом top: уровень state=(масса, проходов); was — масса до шага (ушедшее пунктиром)."""
+        def arrow_head(x_: float, y_: float, color: QColor) -> None:
+            p.setPen(Qt.NoPen)
+            p.setBrush(color)
+            p.drawPolygon(QPolygonF([QPointF(x_, y_), QPointF(x_ - 6, y_ - 10), QPointF(x_ + 6, y_ - 10)]))
+
+        def silo(i: int, top: float, state, was=None, accent: bool = False, receiving: bool = False) -> None:
+            """Силос i в строке с верхом top: уровень state=(масса, проходов); was — масса до шага (ушедшее пунктиром);
+            receiving — свободен под следующую партию (идёт последний проход)."""
             s = self.silos[i]
             m, d = state
             x0 = cx[i] - body_w / 2
@@ -148,41 +155,40 @@ class SiloFlow(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(t.surface_alt if hasattr(t, "surface_alt") else t.paper))
             p.drawPath(path)
-            if s.intake:
-                p.setBrush(QColor(t.line_soft))
-                p.drawPath(path)
             cap = max(s.cap, 1.0)
-            if m > EPS and not s.intake:
+            if m > EPS:
                 fh = body_h * min(m / cap, 1.0)
                 p.setBrush(self._grain(th, d, n))
                 p.drawRect(QRectF(x0 + 1, body_top + body_h - fh, body_w - 2, fh))
-            if was is not None and was - m > EPS and not s.intake:          # сколько ушло из источника
+            if was is not None and was - m > EPS:                           # сколько ушло из источника
                 h0, h1 = body_h * min(was / cap, 1.0), body_h * min(max(m, 0.0) / cap, 1.0)
                 pen = QPen(muted, 1.2, Qt.DashLine)
                 p.setPen(pen)
                 p.setBrush(Qt.NoBrush)
                 p.drawRect(QRectF(x0 + 4, body_top + body_h - h0, body_w - 8, h0 - h1))
             p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(t.accent_edge) if accent else line, 2.4 if accent else 1.4))
-            p.drawPath(path)
+            if receiving:                       # ждёт следующую партию: синий пунктир и стрелка сверху
+                p.setPen(QPen(QColor(t.steel), 2.0, Qt.DashLine))
+                p.drawPath(path)
+                p.setPen(QPen(QColor(t.steel), 2.0))
+                p.drawLine(QPointF(cx[i], roof - 26), QPointF(cx[i], roof - 8))
+                arrow_head(cx[i], roof - 2, QColor(t.steel))
+            else:
+                p.setPen(QPen(QColor(t.accent_edge) if accent else line, 2.4 if accent else 1.4))
+                p.drawPath(path)
             p.setFont(bold)
             p.setPen(ink)
             p.drawText(QRectF(cx[i] - col_w / 2, body_top + body_h + 4, col_w, fm.height()), Qt.AlignHCenter, s.name)
             p.setFont(small)
-            p.setPen(ink2 if (m > EPS or s.intake) else muted)
-            if s.intake:
-                txt = "приёмка с поля"
+            p.setPen(ink2 if (m > EPS or receiving) else muted)
+            if receiving and m <= EPS:
+                txt = "след. партия"
             elif m <= EPS:
                 txt = "пусто"
             else:
                 txt = f"{_t(m)} т · " + ("сырое" if d == 0 else ("готовое" if d >= n else f"{d} пр."))
             p.drawText(QRectF(cx[i] - col_w / 2, body_top + body_h + 4 + fm.height(), col_w, fm.height()),
                        Qt.AlignHCenter, txt)
-
-        def arrow_head(x_: float, y_: float, color: QColor) -> None:
-            p.setPen(Qt.NoPen)
-            p.setBrush(color)
-            p.drawPolygon(QPolygonF([QPointF(x_, y_), QPointF(x_ - 6, y_ - 10), QPointF(x_ + 6, y_ - 10)]))
 
         for kind, obj in self._rows():
             if kind == "band":
@@ -228,8 +234,10 @@ class SiloFlow(QWidget):
                 continue
             s = obj
             idx = self.plan.steps.index(s) + 1
+            hold = self.plan.hold if not self.plan.hold_broken else None
             for i in range(ns):
-                silo(i, y, s.after[i], was=prev_state[i][0] if i == s.src else None, accent=i == s.dst)
+                silo(i, y, s.after[i], was=prev_state[i][0] if i == s.src else None, accent=i == s.dst,
+                     receiving=i == hold and s.k >= n and s.after[i][0] <= EPS)
             # стрелка: из источника вверх, по дорожке через сушилку, вниз в приёмник
             col = QColor(t.ink2)
             p.setPen(QPen(col, 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))

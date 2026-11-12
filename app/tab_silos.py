@@ -2,8 +2,8 @@
 сушки, чтобы после последнего прохода оно лежало в нужных силосах.
 
 Слева — зерно (сколько сырого принять, влажность, цель, число проходов, начало), таблица оперативных силосов
-(вместимость, что лежит сейчас и сколько проходов прошло, где зерно должно оказаться, силос приёмки с поля) и приход
-с поля. Справа — вывод крупно, плитки и схема (silo_flow.SiloFlow): на каждый шаг силосы с уровнем зерна и стрелка
+(вместимость, что лежит сейчас и сколько проходов прошло, силосы под сырое, конечные, силос под следующую партию) и
+приход следующей партии. Справа — вывод крупно, плитки и схема (silo_flow.SiloFlow): на каждый шаг силосы с уровнем зерна и стрелка
 «откуда → сушилка → куда»; второй вкладкой — таблица тех же шагов. Схему можно сохранить картинкой. Расчёт —
 silos.plan_silos; съём, D и тонны в час по проходам — из модели сушилки (model.plan_by_passes).
 """
@@ -27,7 +27,8 @@ if TYPE_CHECKING:
 
 NAMES = ("С\u00a01", "С\u00a02", "С\u00a03", "С\u00a04")
 DOW = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
-COL_NAME, COL_CAP, COL_MASS, COL_DONE, COL_TARGET, COL_INTAKE = range(6)
+COL_NAME, COL_CAP, COL_MASS, COL_DONE, COL_RAW, COL_TARGET, COL_NEXT = range(7)
+DEFAULT_CAP = 500.0             # т — стартовая вместимость оперативного силоса, пока не вписана своя
 
 ABOUT = (
     "<b>Правила, по которым строится план.</b> Сушилка берёт зерно из одного оперативного силоса и сыплет в "
@@ -45,8 +46,11 @@ ABOUT = (
     "Если заняты все четыре, сушить некуда — программа так и скажет."
     "<br><br><b>Масса.</b> После каждого прохода зерна становится меньше: уходит вода. Тонны «в приёмник» — уже "
     "после сушки; съём влаги, D и тонны в час по проходам — из модели сушилки, как в «Плане сушки партии»."
-    "<br><br><b>Приход с поля.</b> Силос приёмки в плане не участвует — он занят приходом. Программа проверит, "
-    "хватит ли в нём места до конца плана. Сушка того, что в него пришло, — следующим планом."
+    "<br><br><b>Под сырое.</b> Отметьте силосы, в которые принимаете сырое зерно этой партии, — с них начнётся "
+    "сушка. Если не отмечать, программа выберет сама."
+    "<br><br><b>Следующая партия.</b> Отмеченный силос к началу последнего прохода будет пуст и в последнем "
+    "проходе не участвует: пока досушивается эта партия, в него принимают следующую с поля. В ранних проходах он "
+    "работает как все. Программа напишет, с какого времени он свободен."
     "<br><br><b>Чего план не знает.</b> Зерна в самой сушилке (оно уходит в приёмник в конце шага) и силосов "
     "хранения С 5 – С 8. Вместимости в тоннах зависят от культуры и натуры — впишите свои.")
 
@@ -94,17 +98,20 @@ class SilosTab(QWidget):
 
         gb = QGroupBox("Оперативные силосы")
         gv = QVBoxLayout(gb)
-        t = QTableWidget(len(NAMES), 6)
-        t.setHorizontalHeaderLabels(["Силос", "Ёмкость,\nт", "Лежит,\nт", "Прошло\nпрох.", "Конеч-\nный", "Приём-\nка"])
+        t = QTableWidget(len(NAMES), 7)
+        t.setHorizontalHeaderLabels(["Силос", "Ёмк.,\nт", "Лежит,\nт", "Прош.\nпрох.", "Под\nсырое", "Конеч-\nный",
+                                     "След.\nпарт."])
         t.verticalHeader().setVisible(False)
         t.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        t.horizontalHeader().setSectionResizeMode(COL_NAME, QHeaderView.ResizeToContents)
+        t.horizontalHeaderItem(COL_CAP).setToolTip("Вместимость силоса, т.")
         for i, name in enumerate(NAMES):
             it = QTableWidgetItem(name)
             it.setFlags(Qt.ItemIsEnabled)
             t.setItem(i, COL_NAME, it)
-            for c, v in ((COL_CAP, "1000"), (COL_MASS, ""), (COL_DONE, "")):
+            for c, v in ((COL_CAP, f"{DEFAULT_CAP:g}"), (COL_MASS, ""), (COL_DONE, "")):
                 t.setItem(i, c, QTableWidgetItem(v))
-            for c in (COL_TARGET, COL_INTAKE):
+            for c in (COL_RAW, COL_TARGET, COL_NEXT):
                 it = QTableWidgetItem()
                 it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
                 it.setCheckState(Qt.Unchecked)
@@ -116,19 +123,22 @@ class SilosTab(QWidget):
                                                     "силосе. Пусто или 0 — сырое.")
         t.horizontalHeaderItem(COL_TARGET).setToolTip("Отметьте силосы, где зерно должно лежать после последнего "
                                                       "прохода.")
-        t.horizontalHeaderItem(COL_INTAKE).setToolTip("Силос, в который продолжает идти зерно с поля. В плане он не "
-                                                      "участвует.")
+        t.horizontalHeaderItem(COL_RAW).setToolTip("Силосы, в которые принимаете сырое зерно этой партии, — с них "
+                                                   "начинается сушка. Не отмечено — программа выберет сама.")
+        t.horizontalHeaderItem(COL_NEXT).setToolTip("Силос под следующую партию: к началу последнего прохода он будет "
+                                                    "пуст, и пока досушивается эта партия, в него можно принимать "
+                                                    "зерно с поля. В ранних проходах он работает как все.")
         self.tbl = t
         gv.addWidget(t)
-        self.cap_note = mute(QLabel("Вместимости стоят условные (1000 т) — впишите свои: от них зависит весь план."))
+        self.cap_note = mute(QLabel("Вместимости стоят условные (500 т) — впишите свои: от них зависит весь план."))
         self.cap_note.setWordWrap(True)
         gv.addWidget(self.cap_note)
         f2 = QFormLayout()
         self.inflow = dspin(0, 5000, 0, 0, 50, " т/сут")
-        self.inflow.setSpecialValueText("нет — всё зерно уже принято")
-        self.inflow.setToolTip("Сколько сырого зерна в сутки продолжает приходить с поля в силос приёмки. Программа "
-                               "проверит, хватит ли в нём места до конца плана.")
-        f2.addRow("Приход с поля", self.inflow)
+        self.inflow.setSpecialValueText("не задан")
+        self.inflow.setToolTip("Сколько зерна следующей партии в сутки придёт с поля в силос «След. партия». Программа "
+                               "проверит, хватит ли его вместимости до конца сушки этой партии.")
+        f2.addRow("Приход следующей партии", self.inflow)
         gv.addLayout(f2)
         lv.addWidget(gb)
 
@@ -225,18 +235,23 @@ class SilosTab(QWidget):
             done = int(self._cell(i, COL_DONE) or 0)
             out.append(Silo(name, max(cap, 0.0), max(mass, 0.0), max(done, 0),
                             self.tbl.item(i, COL_TARGET).checkState() == Qt.Checked,
-                            self.tbl.item(i, COL_INTAKE).checkState() == Qt.Checked))
+                            self.tbl.item(i, COL_RAW).checkState() == Qt.Checked,
+                            self.tbl.item(i, COL_NEXT).checkState() == Qt.Checked))
         return out
 
     def _table_changed(self, it: QTableWidgetItem) -> None:
         if self._loading:
             return
-        if it.column() == COL_INTAKE and it.checkState() == Qt.Checked:       # силос приёмки один
+        if it.column() == COL_NEXT and it.checkState() == Qt.Checked:         # силос под следующую партию один
             self._loading = True
             for r in range(self.tbl.rowCount()):
                 if r != it.row():
-                    self.tbl.item(r, COL_INTAKE).setCheckState(Qt.Unchecked)
-            self.tbl.item(it.row(), COL_TARGET).setCheckState(Qt.Unchecked)
+                    self.tbl.item(r, COL_NEXT).setCheckState(Qt.Unchecked)
+            self.tbl.item(it.row(), COL_TARGET).setCheckState(Qt.Unchecked)   # и не конечный
+            self._loading = False
+        if it.column() == COL_TARGET and it.checkState() == Qt.Checked:
+            self._loading = True
+            self.tbl.item(it.row(), COL_NEXT).setCheckState(Qt.Unchecked)
             self._loading = False
         if it.column() == COL_CAP:
             self._caps_set = True
@@ -265,7 +280,7 @@ class SilosTab(QWidget):
     def recalc(self) -> None:
         silos = self.silos()
         new = self.new_mass.value()
-        total = new + sum(s.mass for s in silos if not s.intake)
+        total = new + sum(s.mass for s in silos)
         if self.w0.value() <= self.wk.value():
             self._show_error("Влажность с поля должна быть выше цели.")
             return
@@ -285,7 +300,7 @@ class SilosTab(QWidget):
         self.variant.blockSignals(True)
         self.variant.clear()
         for k, v in enumerate(res.variants, 1):
-            idle = [names[i] for i, s in enumerate(silos) if not s.intake and i not in used_silos(v)]
+            idle = [names[i] for i in range(len(silos)) if i not in used_silos(v)]
             end = v.steps[-1].end if v.steps else None
             self.variant.addItem(
                 f"{k}.  {len(v.steps)} перекл."
@@ -331,9 +346,11 @@ class SilosTab(QWidget):
             self.result = res
             return
         best = self.result
-        tg = ", ".join(s.name for s in silos if s.target and not s.intake)
+        tg = ", ".join(s.name for s in silos if s.target)
         if res.ok:
             self.head.setText(f"План есть: после {n}-го прохода всё зерно — в {tg}.")
+        elif res.hold_broken:
+            self.head.setText(f"{names[res.hold]} к последнему проходу не освобождается — план без этого условия ниже.")
         else:
             self.head.setText("Полностью в отмеченные силосы зерно не приходит — ближайший план ниже.")
         notes = []
@@ -343,6 +360,10 @@ class SilosTab(QWidget):
             notes.append("Сырое зерно принять: " + ", ".join(f"{names[i]} — {_t(m)} т" for i, m in res.placement) + ".")
         if not pl.reaches_target:
             notes.append(f"За {n} прох. модель даёт {pl.w_final:.1f} %, а цель {self.wk.value():.1f} % — добавьте проход.")
+        if res.hold is not None and not res.hold_broken and res.steps:
+            if res.hold_from is not None:
+                notes.append(f"Следующую партию можно принимать в {names[res.hold]} с {_when(res.hold_from)} — "
+                             f"за {fmt_hours(res.hold_hours)} до конца сушки.")
         if res.ok and res.fifo_breaks:
             only = best is not None and best.fifo_breaks > 0
             notes.append(f"В {res.fifo_breaks} шаг. зерно сушится не по очереди (в другом силосе зерно того же прохода "
@@ -354,9 +375,9 @@ class SilosTab(QWidget):
         self.t_steps.set(str(len(res.steps)), "смен маршрута на пульте")
         self.t_time.set(_when(end), (f"{DOW[end.weekday()]}, " if end else "") + f"всего {fmt_hours(res.hours)}",
                         f"С накладными {self.win.params.overhead_h:g} ч на проход («Настройки сушилки»).")
-        dry = sum(m for (m, _d), s in zip(res.final, silos) if not s.intake)
+        dry = sum(m for (m, _d) in res.final)
         self.t_mass.set(f"{_t(dry)} т", "  ".join(f"{names[i]}: {_t(m)}" for i, (m, _d) in enumerate(res.final)
-                                                   if m > EPS and not silos[i].intake))
+                                                   if m > EPS))
         self.t_regime.set(f"{n}", f"{pl.passes[0].w_in:.1f} → {pl.w_final:.1f} %, съём до {pl.max_dw:.1f} п.п.",
                           "  ".join(f"{ps.k}-й: {ps.w_in:.1f}→{ps.w_out:.1f} %, D {ps.d:.0f}" for ps in pl.passes))
         rows = []
@@ -373,9 +394,7 @@ class SilosTab(QWidget):
                 self.steps.setItem(r, c, item(v))
             state, dst = row[5], row[6]
             for i, (m, d) in enumerate(state):
-                if silos[i].intake:
-                    txt = "приёмка"
-                elif m <= EPS:
+                if m <= EPS:
                     txt = "—"
                 else:
                     txt = f"{_t(m)} ({d})"
@@ -384,7 +403,7 @@ class SilosTab(QWidget):
                     fnt = it.font()
                     fnt.setBold(True)
                     it.setFont(fnt)
-                if m <= EPS and not silos[i].intake:
+                if m <= EPS:
                     it.setForeground(self.palette().placeholderText())
                 self.steps.setItem(r, 5 + i, it)
         self.steps.resizeColumnsToContents()
@@ -412,11 +431,13 @@ class SilosTab(QWidget):
         self._caps_set = bool(d.get("caps_set"))
         for i in range(len(NAMES)):
             r = rows[i] if i < len(rows) else {}
-            self.tbl.item(i, COL_CAP).setText(f"{float(r.get('cap', 1000.0)):g}")
+            cap = float(r.get("cap", DEFAULT_CAP)) if self._caps_set else DEFAULT_CAP
+            self.tbl.item(i, COL_CAP).setText(f"{cap:g}")
             self.tbl.item(i, COL_MASS).setText(f"{float(r['mass']):g}" if r.get("mass") else "")
             self.tbl.item(i, COL_DONE).setText(str(int(r["done"])) if r.get("done") else "")
             self.tbl.item(i, COL_TARGET).setCheckState(Qt.Checked if r.get("target") else Qt.Unchecked)
-            self.tbl.item(i, COL_INTAKE).setCheckState(Qt.Checked if r.get("intake") else Qt.Unchecked)
+            self.tbl.item(i, COL_RAW).setCheckState(Qt.Checked if r.get("raw") else Qt.Unchecked)
+            self.tbl.item(i, COL_NEXT).setCheckState(Qt.Checked if r.get("next") else Qt.Unchecked)
         self.cap_note.setVisible(not self._caps_set)
         self.result = None
         self.steps.setRowCount(0)
@@ -433,7 +454,8 @@ class SilosTab(QWidget):
         self.win.storage.set_json("ui_silos", {
             "new": self.new_mass.value(), "w0": self.w0.value(), "wk": self.wk.value(), "npass": self.npass.value(),
             "inflow": self.inflow.value(), "caps_set": bool(getattr(self, "_caps_set", False)),
-            "silos": [{"cap": s.cap, "mass": s.mass, "done": s.done, "target": s.target, "intake": s.intake}
+            "silos": [{"cap": s.cap, "mass": s.mass, "done": s.done, "target": s.target, "raw": s.raw,
+                       "next": s.next_batch}
                       for s in self.silos()]})
 
     def on_show(self) -> None:

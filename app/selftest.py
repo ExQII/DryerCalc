@@ -504,10 +504,14 @@ def run(out_path: str) -> int:
         from .silos import Silo as _Silo, plan_silos as _plan_silos
         _sl = [_Silo(f"С{i + 1}", 600.0, 0.0, 0, i < 2) for i in range(4)]
         _sp = _plan_silos(_sl, 1100.0, 3, [0.93, 0.93, 0.93], rates=[18.0, 20.0, 22.0], overhead_h=2.0)
+        _sl3 = [_Silo(f"С{i + 1}", 500.0, 0.0, 0, i >= 2, i < 2, i == 0) for i in range(4)]      # сырое С1, С2; след. — С1
+        _sp3 = _plan_silos(_sl3, 900.0, 3, [0.93, 0.93, 0.93])
         check(_sp.ok and len(_sp.steps) == 6 and _sp.final[2][0] < 0.05 and _sp.final[3][0] < 0.05
-              and not _plan_silos(_sl, 2400.0, 3, [0.93] * 3).ok and hasattr(win, "tab_silos"),
+              and not _plan_silos(_sl, 2400.0, 3, [0.93] * 3).ok and hasattr(win, "tab_silos")
+              and _sp3.ok and _sp3.hold == 0 and sorted(i for i, _m in _sp3.placement) == [0, 1]
+              and all(0 not in (x.src, x.dst) for x in _sp3.steps if x.k == 3),
               f"силосы: 1100 т, 3 прохода, в конце в С1 и С2 — {len(_sp.steps)} переключений, {_sp.hours:.0f} ч; "
-              "все четыре заняты — сушить некуда")
+              "все четыре заняты — сушить некуда; силос под следующую партию на последнем проходе свободен")
         # --- v1.9.2: часы, натура зерна, номер прохода из журнала ---
         from datetime import datetime as _dt92
         _pn = mdl.set_natura(win.params, win.params.natura * 1.1, _dt92(2030, 1, 1))

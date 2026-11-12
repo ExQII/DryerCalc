@@ -10,7 +10,9 @@
 * зерно идёт проход за проходом: пока есть зерно, не прошедшее k-й проход, (k+1)-й не начинают;
 * силос, освободившийся в ходе прохода, в этом же проходе может стать приёмником;
 * масса после прохода меньше: m · (100 − W до) / (100 − W после) — в силос помещается больше высушенного зерна;
-* силос приёмки с поля (если зерно продолжает поступать) в плане не участвует — он занят приходом.
+* сырое зерно принимают в силосы, отмеченные «под сырое» (если не отмечены — программа выбирает сама);
+* силос «под следующую партию» к началу последнего прохода должен быть пуст и в последнем проходе не участвует:
+  пока досушивается эта партия, в него принимают следующую с поля. В ранних проходах он работает как все.
 
 Поиск. Состояние — (масса, пройдено проходов) по каждому силосу; шаг — «источник → приёмник» на всё, что есть в
 источнике, или сколько поместится в приёмник. Перебор по возрастанию числа шагов (кратчайший путь по состояниям,
@@ -57,7 +59,8 @@ class Silo:
     mass: float = 0.0           # лежит сейчас, т
     done: int = 0               # сколько проходов это зерно уже прошло
     target: bool = False        # здесь зерно должно лежать после последнего прохода
-    intake: bool = False        # силос приёмки с поля: в плане не участвует
+    raw: bool = False           # сюда принимают сырое зерно этой партии — отсюда начинается сушка
+    next_batch: bool = False    # к последнему проходу должен быть пуст: в него принимают следующую партию
 
 
 @dataclass
@@ -73,6 +76,8 @@ class Step:
     end: Optional[datetime] = None
     split: bool = False         # источник не опустел: приёмник полон, остаток уйдёт следующим шагом
     out_of_turn: bool = False   # не по очереди: в другом силосе зерно того же прохода лежит дольше
+    h0: float = 0.0             # часы от начала плана до начала шага и до его конца (с накладными между проходами)
+    h1: float = 0.0
 
 
 @dataclass
@@ -90,6 +95,10 @@ class SiloPlan:
     variants: List["SiloPlan"] = field(default_factory=list)       # все найденные планы, лучший первым (сам план — [0])
     n_variants: int = 0                 # сколько вариантов найдено всего (показывается не больше SHOW_VARIANTS)
     variants_capped: bool = False       # перебор остановлен на MAX_VARIANTS
+    hold: Optional[int] = None          # силос под следующую партию
+    hold_from: Optional[datetime] = None        # с какого момента он свободен (None — времени нет или не свободен)
+    hold_hours: float = 0.0             # сколько часов от его освобождения до конца сушки
+    hold_broken: bool = False           # освободить его к последнему проходу не удалось — план без этого условия
 
 
 def _key(st: Sequence[Tuple[float, int]]) -> State:
@@ -97,18 +106,21 @@ def _key(st: Sequence[Tuple[float, int]]) -> State:
 
 
 def _moves(st: Sequence[Tuple[float, int]], caps: Sequence[float], free: Sequence[bool], n: int,
-           factors: Sequence[float]):
+           factors: Sequence[float], hold: Optional[int] = None):
     """Возможные шаги из состояния: (источник, приёмник, т из источника, т в приёмник, новое состояние)."""
     live = [d for (m, d), ok in zip(st, free) if ok and m > EPS and d < n]
     if not live:
         return
     cur = min(live)                                 # идёт проход cur + 1: остальное зерно ждёт
+    last = hold is not None and cur == n - 1        # последний проход: силос под следующую партию не трогаем
+    if last and st[hold][0] > EPS:
+        return                                      # он занят — принимать следующую партию некуда: тупик
     f = factors[cur]
     for i, (mi, di) in enumerate(st):
         if not free[i] or mi <= EPS or di != cur:
             continue
         for j, (mj, dj) in enumerate(st):
-            if j == i or not free[j]:
+            if j == i or not free[j] or (last and j == hold):
                 continue
             if mj > EPS and dj != cur + 1:
                 continue                            # в приёмнике зерно другого прохода
@@ -125,7 +137,7 @@ def _moves(st: Sequence[Tuple[float, int]], caps: Sequence[float], free: Sequenc
 
 
 def _search(start: Sequence[Tuple[float, int]], caps: Sequence[float], free: Sequence[bool], targets: Sequence[bool],
-            n: int, factors: Sequence[float]):
+            n: int, factors: Sequence[float], hold: Optional[int] = None):
     """Кратчайшая по числу шагов цепочка до «всё зерно прошло n проходов». Возвращает (масса вне заданных силосов,
     число шагов, цепочка) лучшего конца или None, если ни один конец недостижим."""
     def misplaced(st) -> float:
@@ -152,7 +164,7 @@ def _search(start: Sequence[Tuple[float, int]], caps: Sequence[float], free: Seq
             if mis <= EPS:
                 break                               # первым найден самый короткий план без остатка
             continue
-        for i, j, take, out, new in _moves(st, caps, free, n, factors):
+        for i, j, take, out, new in _moves(st, caps, free, n, factors, hold):
             nk = _key(new)
             # шаг, после которого источник не опустел, чуть дороже: при прочих равных — без дробления
             c = cost + 1.0 + (0.01 if new[i][0] > EPS else 0.0)
@@ -177,8 +189,9 @@ class _Dist:
     """Наименьшее число шагов от состояния до «всё зерно прошло n проходов и лежит в отмеченных силосах» (INF —
     недостижимо). С запоминанием: шаги только продвигают зерно вперёд, циклов нет."""
 
-    def __init__(self, caps, free, targets, n, factors):
+    def __init__(self, caps, free, targets, n, factors, hold=None):
         self.caps, self.free, self.targets, self.n, self.factors = caps, free, targets, n, factors
+        self.hold = hold
         self.memo: Dict[State, int] = {}
 
     def done(self, st) -> bool:
@@ -193,7 +206,7 @@ class _Dist:
             best = 0 if self.done(st) else INF
         else:
             best = INF
-            for _i, _j, _take, _out, new in _moves(st, self.caps, self.free, self.n, self.factors):
+            for _i, _j, _take, _out, new in _moves(st, self.caps, self.free, self.n, self.factors, self.hold):
                 best = min(best, 1 + self(new))
         self.memo[key] = best
         return best
@@ -211,7 +224,7 @@ def _all_chains(start, caps, free, n, factors, dist: "_Dist", limit: int, cap: i
         if dist(st) == 0:
             out.append(list(chain))
             return
-        for i, j, take, o, new in _moves(st, caps, free, n, factors):
+        for i, j, take, o, new in _moves(st, caps, free, n, factors, dist.hold):
             if len(chain) + 1 + dist(new) > limit:
                 continue
             if fifo and any(x != i and free[x] and st[x][0] > EPS and st[x][1] == st[i][1] and stamp[x] < stamp[i]
@@ -239,10 +252,12 @@ def used_silos(plan: "SiloPlan") -> List[int]:
 
 
 def _placements(silos: Sequence[Silo], new_mass: float) -> List[List[Tuple[int, float]]]:
-    """Варианты приёма сырого зерна: порядок заполнения силосов, где сейчас пусто или лежит сырое (не приёмка)."""
+    """Варианты приёма сырого зерна: в каком порядке заполнять силосы. Если отмечены силосы под сырое (Silo.raw) —
+    только они; иначе программа выбирает сама из пустых и тех, где уже лежит сырое."""
     if new_mass <= EPS:
         return [[]]
-    cand = [i for i, s in enumerate(silos) if not s.intake and (s.mass <= EPS or s.done == 0)
+    marked = any(s.raw for s in silos)
+    cand = [i for i, s in enumerate(silos) if (s.raw or not marked) and (s.mass <= EPS or s.done == 0)
             and s.cap - s.mass > EPS]
     out, seen = [], set()
     for r in range(1, len(cand) + 1):
@@ -269,35 +284,50 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
                start: Optional[datetime] = None, inflow_tpd: float = 0.0) -> SiloPlan:
     """План перемещений.
 
-    silos — оперативные силосы с тем, что в них лежит; new_mass — сырого зерна ещё принять, т; n — проходов всего;
-    factors[k] — во сколько раз меняется масса на проходе k + 1 (меньше 1); rates[k] — выгрузка на проходе k + 1,
-    т/ч (для времени шагов); overhead_h — накладные на проход, ч; inflow_tpd — приход с поля в силос приёмки, т/сут.
+    silos — оперативные силосы с тем, что в них лежит, и отметками: raw — под сырое зерно этой партии, target —
+    конечный, next_batch — под следующую партию (к последнему проходу пуст и в нём не участвует); new_mass — сырого
+    зерна принять, т; n — проходов всего; factors[k] — во сколько раз меняется масса на проходе k + 1 (меньше 1);
+    rates[k] — выгрузка на проходе k + 1, т/ч (для времени шагов); overhead_h — накладные на проход, ч;
+    inflow_tpd — приход следующей партии с поля, т/сут (проверка, что её силос не переполнится до конца сушки).
     """
     caps = [s.cap for s in silos]
-    free = [not s.intake for s in silos]
+    free = [True] * len(silos)
     targets = [s.target for s in silos]
     names = [s.name for s in silos]
+    hold = next((i for i, s in enumerate(silos) if s.next_batch), None)
     res = SiloPlan(ok=False)
     if n < 1 or len(factors) < n:
         res.reason = "Не задано число проходов."
         return res
-    if not any(t and f for t, f in zip(targets, free)):
-        res.reason = "Отметьте хотя бы один силос, где зерно должно лежать после сушки (и это не силос приёмки)."
+    if not any(targets):
+        res.reason = "Отметьте хотя бы один конечный силос — где зерно должно лежать после сушки."
+        return res
+    if hold is not None and targets[hold]:
+        res.reason = (f"{names[hold]} отмечен и конечным, и под следующую партию: на последнем проходе в конечный силос "
+                      "идёт зерно, принимать в него следующую партию нельзя.")
         return res
     for s in silos:
         if s.mass > s.cap + EPS:
             res.reason = f"В {s.name} вписано {s.mass:.0f} т при вместимости {s.cap:.0f} т."
             return res
-    have = sum(s.mass for s in silos if not s.intake)
+    have = sum(s.mass for s in silos)
     if have + new_mass <= EPS:
         res.reason = "Нет зерна для плана: впишите, сколько сырого принять или что уже лежит в силосах."
         return res
+    for s in silos:
+        if s.raw and s.mass > EPS and s.done > 0:
+            res.reason = (f"{s.name} отмечен под сырое зерно, но в нём лежит зерно после {s.done}-го прохода — сырое к "
+                          "подсушенному не принимают.")
+            return res
     places = _placements(silos, new_mass)
     if not places:
-        room = sum(s.cap - s.mass for s in silos if not s.intake and (s.mass <= EPS or s.done == 0))
-        res.reason = (f"Сырое зерно ({new_mass:.0f} т) не помещается: в пустых силосах и силосах с сырым зерном "
-                      f"свободно {room:.0f} т.")
+        marked = any(s.raw for s in silos)
+        room = sum(s.cap - s.mass for s in silos if (s.raw or not marked) and (s.mass <= EPS or s.done == 0))
+        res.reason = (f"Сырое зерно ({new_mass:.0f} т) не помещается: "
+                      + ("в силосах, отмеченных под сырое," if marked else "в пустых силосах и силосах с сырым зерном")
+                      + f" свободно {room:.0f} т." + (" Отметьте под сырое ещё один силос." if marked else ""))
         return res
+
     def start_of(pl):
         st = [(s.mass, s.done if s.mass > EPS else 0) for s in silos]
         for i, put in pl:
@@ -324,7 +354,7 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
             h = out / rates[k - 1] if rates and len(rates) >= k and rates[k - 1] > 0 else 0.0
             r.steps.append(Step(k=k, src=i, dst=j, m_in=take, m_out=out, after=list(after), hours=h, start=t,
                                 end=t + timedelta(hours=h) if t else None, split=after[i][0] > EPS,
-                                out_of_turn=bool(older)))
+                                out_of_turn=bool(older), h0=total, h1=total + h))
             if cur[j][0] <= EPS:
                 stamp[j] = num
             if after[i][0] <= EPS:
@@ -356,8 +386,14 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
     # сушим»), затем меньше переключений, меньше дроблений, раньше конец.
     exact: List[SiloPlan] = []
     starts = [(pl, start_of(pl)) for pl in places]
-    dist = _Dist(caps, free, targets, n, factors)
+    dist = _Dist(caps, free, targets, n, factors, hold)
     shortest = min((dist(st) for _pl, st in starts), default=INF)
+    hold_broken = False
+    if shortest >= INF and hold is not None:
+        # с пустым силосом под следующую партию плана нет — показать план без этого условия и сказать об этом
+        dist = _Dist(caps, free, targets, n, factors, None)
+        shortest = min((dist(st) for _pl, st in starts), default=INF)
+        hold_broken = shortest < INF
     seen = set()
     capped = False
     if shortest < INF:
@@ -376,7 +412,11 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
                 capped = True
                 break
     if exact:
+        def free_step(r) -> int:
+            """На каком шаге силос под следующую партию освобождается окончательно (раньше — лучше)."""
+            return max((k for k, x in enumerate(r.steps, 1) if hold in (x.src, x.dst)), default=0)
         exact.sort(key=lambda r: (r.fifo_breaks, len(r.steps), sum(1 for x in r.steps if x.split),
+                                  free_step(r) if hold is not None and not hold_broken else 0,
                                   len(used_silos(r)), r.hours))
         res = exact[0]
         res.variants = exact[:SHOW_VARIANTS]
@@ -385,7 +425,10 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
     else:
         best = None
         for pl, st in starts:
-            found = _search(st, caps, free, targets, n, factors)
+            found = _search(st, caps, free, targets, n, factors, hold)
+            if found is None and hold is not None:
+                found = _search(st, caps, free, targets, n, factors, None)
+                hold_broken = hold_broken or found is not None
             if found is None:
                 continue
             mis, cost, chain = found
@@ -400,17 +443,32 @@ def plan_silos(silos: Sequence[Silo], new_mass: float, n: int, factors: Sequence
         _rank, pl, st0, chain, mis = best
         res = build(pl, st0, chain, mis)
         res.variants, res.n_variants = [res], 1
-    # приёмка с поля — предупреждения у каждого варианта свои (длительность разная)
+    # Силос под следующую партию: с какого момента он свободен (после последнего шага, который его трогает) и хватит
+    # ли его до конца сушки при заданном приходе.
     for var in res.variants:
-        for s in silos:
-            if s.intake and inflow_tpd > 0:
-                room = s.cap - s.mass
-                h_full = room / inflow_tpd * 24.0
-                if h_full < var.hours:
-                    var.warnings.append(
-                        f"Силос приёмки {s.name} заполнится через {h_full:.0f} ч ({room:.0f} т при {inflow_tpd:.0f} "
-                        f"т/сут), а план идёт {var.hours:.0f} ч: приход с поля придётся остановить или принимать "
-                        "куда-то ещё.")
-        if inflow_tpd > 0 and not any(s.intake for s in silos):
-            var.warnings.append("Указан приход с поля, но не выбран силос приёмки: место под приход план не держит.")
+        var.hold = hold
+        if hold is None:
+            if inflow_tpd > 0:
+                var.warnings.append("Указан приход с поля, но не отмечен силос под следующую партию.")
+            continue
+        if hold_broken:
+            var.hold_broken = True
+            var.ok = False
+            var.reason = (f"Освободить {names[hold]} к последнему проходу не получается: без него зерно в конечные "
+                          "силосы не приходит. Ниже — план без этого условия: следующую партию в "
+                          f"{names[hold]} принимать можно только после конца сушки. Отметьте под следующую партию "
+                          "другой силос или освободите ещё один.")
+            continue
+        touch = [x for x in var.steps if hold in (x.src, x.dst)]
+        if var.start_state[hold][0] > EPS and not touch:
+            continue
+        var.hold_from = touch[-1].end if touch else start
+        var.hold_hours = max(var.hours - (touch[-1].h1 if touch else 0.0), 0.0)
+        if inflow_tpd > 0:
+            h_full = silos[hold].cap / inflow_tpd * 24.0
+            if h_full < var.hold_hours:
+                var.warnings.append(
+                    f"{names[hold]} заполнится за {h_full:.0f} ч приёма ({silos[hold].cap:.0f} т при {inflow_tpd:.0f} "
+                    f"т/сут), а до конца сушки от его освобождения — {var.hold_hours:.0f} ч: приём придётся "
+                    "остановить или принимать куда-то ещё.")
     return res
