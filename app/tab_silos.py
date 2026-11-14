@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QComboBox, QDateTimeEdit, QFormLayout, QFrame, QG
 
 from . import model as mdl
 from .silo_flow import SiloFlow
-from .silos import EPS, Silo, SiloPlan, plan_silos, used_silos
+from .silos import EPS, Silo, SiloPlan, dryer_steps, plan_silos, used_silos
 from .ui_common import Collapsible, Tile, dspin, fmt_hours, item, mute, scroll_wrap, set_role, table, to_num
 
 if TYPE_CHECKING:
@@ -49,6 +49,13 @@ ABOUT = (
     "после сушки; съём влаги, D и тонны в час по проходам — из модели сушилки, как в «Плане сушки партии»."
     "<br><br><b>Под сырое.</b> Отметьте силосы, в которые принимаете сырое зерно этой партии, — с них начнётся "
     "сушка. Если не отмечать, программа выберет сама."
+    "<br><br><b>Партия больше силосов под сырое.</b> Сырого можно вписать больше, чем помещается в силосы под "
+    "сырое (например, 1200 т при двух силосах по 500 т). Сразу они заполняются доверху, а остаток принимается "
+    "позже — доприёмом в силос под сырое, как только тот опустеет по ходу 1-го прохода. На схеме и в таблице это "
+    "отдельный шаг «Доприём с поля» со временем, с которого силос свободен. 2-й проход начинается, когда весь 1-й "
+    "пройден, включая доприём."
+    "<br><br><b>Конечные силосы — по массе.</b> Всё зерно после сушки (с учётом усушки по проходам) должно "
+    "поместиться в конечные силосы. Если нет, программа сразу скажет, сколько будет зерна и сколько они вмещают."
     "<br><br><b>Следующая партия.</b> Отмеченные силосы (один или два) к началу последнего прохода будут пусты и "
     "в последнем проходе не участвуют: пока досушивается эта партия, в них принимают следующую с поля. В ранних "
     "проходах они работают как все. Если отмечено два, а оба к последнему проходу освободить нельзя, пустым будет "
@@ -78,8 +85,9 @@ class SilosTab(QWidget):
         gb = QGroupBox("Зерно")
         f = QFormLayout(gb)
         self.new_mass = dspin(0, 20000, 0, 0, 50, " т")
-        self.new_mass.setToolTip("Сколько сырого зерна ещё принять в оперативные силосы. Программа сама выберет, в "
-                                 "какие. Зерно, которое уже лежит, вписывается в таблицу силосов.")
+        self.new_mass.setToolTip("Сколько сырого зерна в партии ещё принять. Может быть больше, чем помещается в силосы "
+                                 "под сырое: остаток принимается позже — в силос под сырое, как только он опустеет по "
+                                 "ходу 1-го прохода. Зерно, которое уже лежит, вписывается в таблицу силосов.")
         self.w0 = dspin(6, 50, win.in_w0.value(), 1, 0.5, " %")
         self.wk = dspin(5, 30, win.in_wk.value(), 1, 0.5, " %")
         self.npass = QSpinBox()
@@ -307,10 +315,12 @@ class SilosTab(QWidget):
             idle = [names[i] for i in range(len(silos)) if i not in used_silos(v)]
             end = v.steps[-1].end if v.steps else None
             self.variant.addItem(
-                f"{k}.  {len(v.steps)} перекл."
+                f"{k}.  {dryer_steps(v)} перекл."
                 + (" · по очереди" if v.fifo_breaks == 0 else f" · не по очереди: {v.fifo_breaks}")
                 + (f" · свободен {', '.join(idle)}" if idle else " · заняты все")
                 + (" · приём: " + ", ".join(f"{names[i]} {_t(m)}" for i, m in v.placement) if v.placement else "")
+                + (" · доприём: " + ", ".join(f"{names[x.dst]} {_t(x.m_in)}" for x in v.steps if x.intake)
+                   if v.later > EPS else "")
                 + (f" · конец {_when(end)}" if end else ""))
         self.variant.blockSignals(False)
         self.var_row.setVisible(len(res.variants) > 1)
@@ -363,7 +373,17 @@ class SilosTab(QWidget):
         if res.reason:
             notes.append(res.reason)
         if res.placement:
-            notes.append("Сырое зерно принять: " + ", ".join(f"{names[i]} — {_t(m)} т" for i, m in res.placement) + ".")
+            notes.append(("Сразу принять: " if res.later > EPS else "Сырое зерно принять: ")
+                         + ", ".join(f"{names[i]} — {_t(m)} т" for i, m in res.placement) + ".")
+        if res.later > EPS:
+            parts, done = [], 0
+            for x in res.steps:
+                if not x.intake:
+                    done += 1
+                    continue
+                parts.append(f"{_t(x.m_in)} т в {names[x.dst]}" + (f" после шага {done}" if done else "")
+                             + (f" (с {_when(x.start)})" if x.start else ""))
+            notes.append(f"Остальные {_t(res.later)} т — доприёмом: " + "; ".join(parts) + ".")
         if not pl.reaches_target:
             notes.append(f"За {n} прох. модель даёт {pl.w_final:.1f} %, а цель {self.wk.value():.1f} % — добавьте проход.")
         if res.marked and not res.hold_broken and res.steps and res.hold_free_h:
@@ -384,7 +404,9 @@ class SilosTab(QWidget):
         notes += res.warnings
         self.sub.setText("  ".join(notes))
         end = res.steps[-1].end if res.steps else None
-        self.t_steps.set(str(len(res.steps)), "смен маршрута на пульте")
+        intakes = sum(1 for x in res.steps if x.intake)
+        self.t_steps.set(str(dryer_steps(res)), "смен маршрута на пульте"
+                         + (f", доприёмов с поля: {intakes}" if intakes else ""))
         self.t_time.set(_when(end), (f"{DOW[end.weekday()]}, " if end else "") + f"всего {fmt_hours(res.hours)}",
                         f"С накладными {self.win.params.overhead_h:g} ч на проход («Настройки сушилки»).")
         dry = sum(m for (m, _d) in res.final)
@@ -397,6 +419,9 @@ class SilosTab(QWidget):
             rows.append(("приём", "с поля → " + ", ".join(names[i] for i, _m in res.placement),
                          _t(sum(m for _i, m in res.placement)), "", "", res.start_state, -1))
         for s in res.steps:
+            if s.intake:
+                rows.append(("доприём", f"с поля → {names[s.dst]}", _t(s.m_in), _when(s.start), "", s.after, s.dst))
+                continue
             rows.append((f"{s.k}-й", f"{names[s.src]} → {names[s.dst]}" + (" (часть)" if s.split else "")
                          + (" · не по очереди" if s.out_of_turn else ""),
                          f"{_t(s.m_in)} → {_t(s.m_out)}", _when(s.start), _when(s.end), s.after, s.dst))

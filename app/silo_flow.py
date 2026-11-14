@@ -3,8 +3,9 @@
 
 Каждая строка — одно переключение маршрута. Силосы нарисованы после шага: высота заливки — доля вместимости, цвет —
 сколько проходов прошло зерно (от сырого к готовому). В силосе-источнике пунктиром показано, сколько из него ушло;
-силос-приёмник обведён; на последнем проходе силос под следующую партию —
-синим пунктиром со стрелкой. Перед шагами каждого прохода — полоса с режимом прохода (влажность, D). Первая строка —
+силос-приёмник обведён; силос под следующую партию с того шага, после которого он больше не нужен, — синим
+пунктиром со стрелкой. Доприём сырого с поля (партия больше силосов под сырое) — строка «Доприём с поля» со стрелкой
+сверху в силос. Перед шагами каждого прохода — полоса с режимом прохода (влажность, D). Первая строка —
 приём сырого зерна с поля. Данные — silos.SiloPlan; цвета — токены оформления (светлая и тёмная тема).
 """
 from __future__ import annotations
@@ -233,11 +234,32 @@ class SiloFlow(QWidget):
                 y += ROW_H
                 continue
             s = obj
-            idx = self.plan.steps.index(s) + 1
+            idx = self.plan.steps.index(s) + 1                  # номер в плане (для hold_step)
+            num = sum(1 for x in self.plan.steps[:idx] if not x.intake)    # номер переключения на пульте
             freed = self.plan.hold_step if not self.plan.hold_broken else {}   # силос → после какого шага свободен
             for i in range(ns):
                 silo(i, y, s.after[i], was=prev_state[i][0] if i == s.src else None, accent=i == s.dst,
                      receiving=i in freed and idx >= freed[i] and s.after[i][0] <= EPS)
+            if s.intake:                                        # доприём с поля: стрелка сверху в силос
+                col = QColor(t.steel)
+                p.setPen(QPen(col, 2.2))
+                p.drawLine(QPointF(cx[s.dst], y + 6), QPointF(cx[s.dst], y + 32))
+                arrow_head(cx[s.dst], y + 36, col)
+                p.setFont(small)
+                p.setPen(ink2)
+                p.drawText(QPointF(cx[s.dst] + 10, y + 20), f"+{_t(s.m_in)} т")
+                p.setFont(big)
+                p.setPen(ink)
+                p.drawText(QRectF(PAD, y + 26, LEFT - PAD, 28), Qt.AlignLeft | Qt.AlignVCenter, "Доприём с поля")
+                p.setFont(base)
+                p.setPen(ink2)
+                lines = [f"{_t(s.m_in)} т сырого в {self.silos[s.dst].name}"]
+                if s.start:
+                    lines.append(f"с {s.start:%d.%m %H:%M}")
+                p.drawText(QRectF(PAD, y + 60, LEFT - PAD - 6, 70), Qt.AlignLeft | Qt.TextWordWrap, "\n".join(lines))
+                prev_state = list(s.after)
+                y += ROW_H
+                continue
             # стрелка: из источника вверх, по дорожке через сушилку, вниз в приёмник
             col = QColor(t.ink2)
             p.setPen(QPen(col, 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
@@ -268,7 +290,7 @@ class SiloFlow(QWidget):
             p.drawEllipse(QRectF(PAD, y + 26, 28, 28))
             p.setFont(bold)
             p.setPen(QColor(t.accent_ink))
-            p.drawText(QRectF(PAD, y + 26, 28, 28), Qt.AlignCenter, str(idx))
+            p.drawText(QRectF(PAD, y + 26, 28, 28), Qt.AlignCenter, str(num))
             p.setFont(big)
             p.setPen(ink)
             p.drawText(QRectF(PAD + 36, y + 26, LEFT - PAD - 36, 28), Qt.AlignLeft | Qt.AlignVCenter,

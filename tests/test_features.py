@@ -3269,14 +3269,24 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
                 for i in range(4)]
 
     def check(sl, new, n, res, f):
-        """Правила: приёмник пуст или с зерном того же прохода; масса сходится; проходы идут по порядку."""
+        """Правила: приёмник пуст или с зерном того же прохода; масса сходится; проходы идут по порядку; доприём —
+        только в 1-м проходе, в пустой силос под сырое (или к сырому)."""
         st = [(s.mass, s.done) for s in sl]
         for i, put in res.placement:
             assert st[i][0] <= EPS or st[i][1] == 0
             st[i] = (st[i][0] + put, 0)
-        assert abs(sum(m for _i, m in res.placement) - new) < 0.01
+        taken = sum(m for _i, m in res.placement)
         last = 0
         for s in res.steps:
+            if s.intake:
+                mj, dj = st[s.dst]
+                assert s.src == -1 and s.k == 1 and last <= 1 and (mj <= EPS or dj == 0) and s.m_in == s.m_out
+                assert mj + s.m_in <= sl[s.dst].cap + 0.01 and (sl[s.dst].raw or not any(x.raw for x in sl))
+                assert s.hours == 0 and s.h0 == s.h1
+                st[s.dst] = (mj + s.m_in, 0)
+                taken += s.m_in
+                assert all(abs(a[0] - b[0]) < 0.01 for a, b in zip(st, s.after))
+                continue
             mi, di = st[s.src]
             mj, dj = st[s.dst]
             assert s.src != s.dst
@@ -3287,6 +3297,7 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
             st[s.dst] = (mj + s.m_out, s.k)
             assert all(abs(a[0] - b[0]) < 0.01 for a, b in zip(st, s.after))
             last = s.k
+        assert abs(taken - new) < 0.01 and abs(res.later - (taken - sum(m for _i, m in res.placement))) < 0.01
         return st
 
     f3 = [0.93, 0.93, 0.93]
@@ -3308,15 +3319,15 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     assert r.ok and len(r.steps) == 9
     r = plan_silos(silos([600] * 4, {1, 2, 3, 4}), 2400.0, 3, f3)
     assert not r.ok and not r.steps and "пустой" in r.reason
-    assert "не помещается" in plan_silos(silos([600] * 4, {1}), 2500.0, 3, f3).reason
+    assert "вмещают 600 т" in plan_silos(silos([600] * 4, {1}), 2500.0, 3, f3).reason
     # зерно уже лежит: сырое в С1, после первого прохода в С2; ещё 300 т принять; в конце — в С3 и С4
     sl = silos([600] * 4, {3, 4}, (500, 400, 0, 0), (0, 1, 0, 0))
     r = plan_silos(sl, 300.0, 3, f3)
     st = check(sl, 300.0, 3, r, f3)
     assert r.ok and st[0][0] <= EPS and st[1][0] <= EPS and all(i != 1 for i, _m in r.placement)   # к подсушенному — нет
-    # отмеченных силосов мало: ближайший план и причина
+    # 1.10.5: конечные силосы — по массе: высушенное зерно (с усушкой по проходам) в них не помещается — сразу причина
     r = plan_silos(silos([600] * 4, {1}), 1100.0, 3, f3)
-    assert not r.ok and r.steps and r.misplaced > 100 and "помещается 600" in r.reason
+    assert not r.ok and not r.steps and "После сушки будет 885 т" in r.reason and "вмещают 600 т" in r.reason
     # 1.10.3: сырое — только в отмеченные силосы; силос под следующую партию к последнему проходу пуст и в нём не
     # участвует (в ранних проходах работает как все); программа пишет, с какого времени он свободен
     t0 = datetime(2026, 11, 13, 8, 0)
@@ -3335,7 +3346,30 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     r1 = plan_silos(sl, 900.0, 1, f3)
     assert not r1.ok and r1.hold_broken and r1.steps and r1.hold_from is None and "не получается" in r1.reason
     # сырое в отмеченные силосы не помещается; силос и конечный, и под следующую партию; под сырое — с подсушенным
-    assert "Отметьте под сырое ещё один" in plan_silos(silos([500] * 4, {3, 4}, raw={1}), 900.0, 3, f3).reason
+    # 1.10.5: сырого больше, чем в силосах под сырое, — остаток доприёмом, когда силос под сырое опустеет
+    from app.silos import dryer_steps
+    sl = silos([500] * 4, {3, 4}, raw={1})
+    r = plan_silos(sl, 900.0, 3, f3, rates=[18.0, 20.0, 22.0], start=t0)
+    check(sl, 900.0, 3, r, f3)
+    assert r.ok and r.placement == [(0, 500.0)] and abs(r.later - 400.0) < 0.01
+    ins = [k for k, s in enumerate(r.steps) if s.intake]
+    assert ins and all(r.steps[k].dst == 0 and r.steps[k - 1].src == 0 for k in ins)        # в С1, как только опустел
+    assert all(r.steps[k].start == r.steps[k - 1].end for k in ins) and dryer_steps(r) == len(r.steps) - len(ins)
+    # партия 1200 т: в С1 и С2 по 500 т сразу, 200 т — доприёмом; в конце всё в С3 и С4 (965 т в 1000 т)
+    sl = silos([500] * 4, {3, 4}, raw={1, 2})
+    r = plan_silos(sl, 1200.0, 3, f3, rates=[18.0, 20.0, 22.0], overhead_h=2.0, start=t0)
+    st = check(sl, 1200.0, 3, r, f3)
+    assert r.ok and sorted(r.placement) == [(0, 500.0), (1, 500.0)] and abs(r.later - 200.0) < 0.01
+    assert st[0][0] <= EPS and st[1][0] <= EPS and abs(st[2][0] + st[3][0] - 1200.0 * 0.93 ** 3) < 0.05
+    first2 = min(k for k, s in enumerate(r.steps) if s.k == 2)
+    assert all(k < first2 for k, s in enumerate(r.steps) if s.intake)             # доприём — до начала 2-го прохода
+    assert all(v.ok and check(sl, 1200.0, 3, v, f3) for v in r.variants)
+    # 1300 т: после сушки 1046 т — в два силоса по 500 т не помещается, плана нет
+    r = plan_silos(sl, 1300.0, 3, f3)
+    assert not r.ok and not r.steps and "вмещают 1000 т" in r.reason
+    # партия не проходит через силосы: после 1-го прохода зерна больше, чем вмещают все четыре
+    r = plan_silos(silos([500] * 4, {1, 2, 3, 4}), 2300.0, 3, f3)
+    assert not r.ok and not r.steps and "не проходит" in r.reason and "вмещают 2000 т" in r.reason
     assert "и конечным, и под следующую" in plan_silos(silos([500] * 4, {3, 4}, nxt=3, raw={1, 2}), 900.0, 3, f3).reason
     assert "к подсушенному" in plan_silos(silos([500] * 4, {3}, (300, 0, 0, 0), (1, 0, 0, 0), raw={1}), 100.0, 3, f3).reason
     # приход следующей партии: её силос переполнится раньше конца сушки — предупреждение
@@ -3459,6 +3493,24 @@ def test_silo_plan_moves_grain_between_silos_without_mixing():
     tab._load()
     assert tab.silos()[1].target and tab.new_mass.value() == 1100.0 and tab.result is None
     assert tab.flow.plan is None and not tab.btn_png.isEnabled()
+    # 1.10.5: партия больше силосов под сырое — доприём в плане, в таблице шагов и на схеме
+    for i in range(4):
+        tab.tbl.item(i, ts.COL_CAP).setText("500")
+        tab.tbl.item(i, ts.COL_NEXT).setCheckState(Qt.Unchecked)
+        tab.tbl.item(i, ts.COL_TARGET).setCheckState(Qt.Checked if i >= 2 else Qt.Unchecked)
+        tab.tbl.item(i, ts.COL_RAW).setCheckState(Qt.Checked if i < 2 else Qt.Unchecked)
+    tab.new_mass.setValue(1200.0)
+    tab.npass.setValue(3)
+    tab.recalc()
+    res = tab.result
+    assert res.ok and "План есть" in tab.head.text() and res.later > 100
+    assert "Сразу принять" in tab.sub.text() and "доприёмом" in tab.sub.text()
+    labels = [tab.steps.item(r, 0).text() for r in range(tab.steps.rowCount())]
+    assert labels.count("доприём") == sum(1 for s in res.steps if s.intake) >= 1
+    assert "доприёмов с поля: " in tab.t_steps.lbl_sub.text()
+    assert "доприём:" in tab.variant.itemText(0)
+    assert sum(1 for k, x in tab.flow._rows() if k == "step" and x.intake) >= 1
+    win.grab()
     win.close()
 
 
